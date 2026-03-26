@@ -1,0 +1,21 @@
+node_modules/
+dist/
+
+src-tauri/target/
+src-tauri/gen/
+NorthStar/NorthStar/target/
+
+NorthStar/NorthStar-ui/frontend/node_modules/
+NorthStar/NorthStar-ui/frontend/dist/
+*.tsbuildinfo
+
+*.log
+*.tmp
+*.bak
+*.download
+
+.DS_Store
+Thumbs.db
+
+Youniverse/
+lmstudio developer log.txt

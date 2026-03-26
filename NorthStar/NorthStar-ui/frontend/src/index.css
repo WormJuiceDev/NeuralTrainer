@@ -1,0 +1,56 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", Inter, system-ui, sans-serif;
+  line-height: 1.5;
+  font-weight: 400;
+  color: #e8edf7;
+  background:
+    radial-gradient(circle at top, rgba(37, 99, 235, 0.2), transparent 30%),
+    radial-gradient(circle at 20% 20%, rgba(14, 165, 233, 0.12), transparent 25%),
+    linear-gradient(180deg, #09111f 0%, #0d1526 42%, #101828 100%);
+  --panel: rgba(12, 20, 35, 0.88);
+  --panel-strong: rgba(17, 26, 45, 0.94);
+  --panel-soft: rgba(10, 17, 30, 0.76);
+  --ink: #dce6f8;
+  --ink-strong: #f7fbff;
+  --muted: #9ca8bd;
+  --muted-strong: #b9c5d9;
+  --accent: #2f6bff;
+  --accent-strong: #1d4ed8;
+  --accent-soft: rgba(47, 107, 255, 0.14);
+  --line: rgba(148, 163, 184, 0.16);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  color: var(--ink);
+  background: transparent;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+a {
+  color: inherit;
+}

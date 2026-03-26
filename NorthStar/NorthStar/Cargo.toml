@@ -1,0 +1,22 @@
+[package]
+name = "NorthStar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["macros", "ws"] }
+tokio = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tower-http = { version = "0.5", features = ["cors", "fs"] }
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.10", features = ["v4", "serde"] }
+tokio-stream = "0.1"
+futures = "0.3"
+p256 = { version = "0.13", features = ["ecdsa", "ecdh"] }
+base64 = "0.21"
+reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+aes-gcm = "0.10"
+hkdf = "0.12"
+sha2 = "0.10"
+rand = "0.8"
