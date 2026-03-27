@@ -98,6 +98,17 @@ export type NorthStarCallTurn = {
   completedAt: string | null;
 };
 
+export type NorthStarWebRtcSignal = {
+  signalId: string;
+  callId: string;
+  userHandle: string;
+  source: string;
+  target: string;
+  signalKind: string;
+  payloadJson: string;
+  createdAt: string;
+};
+
 export type NorthStarSnapshot = {
   configured: boolean;
   sessionReady: boolean;

@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import {
   bindNorthStarDesktop,
   createPlace,
@@ -20,6 +20,7 @@ import {
   getNorthStarSnapshot,
   importNorthStarCallReviews,
   processNextNorthStarCallTurn,
+  processNorthStarLiveTurn,
   getPassiveContextSnapshot,
   getPhaseOneSnapshot,
   getPhaseThreeSnapshot,
@@ -57,10 +58,12 @@ import {
   synthesizeVoicePreview,
   logoutTelegramUser,
   pullNorthStarLocationEvents,
+  pullNorthStarWebRtcSignals,
   updateMemoryItem,
   updatePlace,
   updateRule,
   getSpeechStreamSnapshot,
+  sendNorthStarWebRtcSignal,
 } from "./tauri";
 import type {
   AppSettings,
@@ -83,6 +86,7 @@ import type {
   MvpRealityCheckSnapshot,
   NorthStarSnapshot,
   NorthStarTurnProcessingResult,
+  NorthStarWebRtcSignal,
   SettingsEntry,
   SimulationRunResult,
   SimulationScenario,
@@ -109,6 +113,7 @@ type ContextSectionId = "ingest" | "timeline" | "patterns";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
 type TelegramSectionId = "controls" | "outbound" | "inbound" | "feedback";
 type ReviewSectionId = "places" | "rules" | "moments" | "outreach" | "calls";
+const NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE = 48_000;
 
 type TabDefinition = {
   id: TabId;
@@ -384,6 +389,25 @@ function App() {
   const [busyPanel, setBusyPanel] = useState<"place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "telegramSend" | "telegramPoll" | "telegramUserRuntime" | "telegramCallRuntime" | "telegramUserCode" | "telegramUserLogin" | "telegramUserLogout" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "dispatch" | "feedback" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const missingAcceptedNorthStarPollsRef = useRef(0);
+  const northStarWebRtcPeerRef = useRef<RTCPeerConnection | null>(null);
+  const northStarWebRtcChannelRef = useRef<RTCDataChannel | null>(null);
+  const northStarWebRtcCallIdRef = useRef<string | null>(null);
+  const processedNorthStarSignalIdsRef = useRef<Set<string>>(new Set());
+  const northStarLiveTurnChunksRef = useRef<Map<string, string[]>>(new Map());
+  const northStarPeerAudioContextRef = useRef<AudioContext | null>(null);
+  const northStarPeerAudioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const northStarIncomingMediaStreamRef = useRef<MediaStream | null>(null);
+  const northStarIncomingRecorderRef = useRef<MediaRecorder | null>(null);
+  const northStarIncomingChunksRef = useRef<Blob[]>([]);
+  const northStarIncomingAudioContextRef = useRef<AudioContext | null>(null);
+  const northStarIncomingProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const northStarIncomingSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const northStarIncomingSinkRef = useRef<GainNode | null>(null);
+  const northStarIncomingSpeechDetectedRef = useRef(false);
+  const northStarIncomingSpeechFramesRef = useRef(0);
+  const northStarIncomingSilenceFramesRef = useRef(0);
+  const northStarIncomingProcessingRef = useRef(false);
 
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
   const unresolvedMomentCount = phaseThreeSnapshot?.savedMoments.filter((moment) => !moment.resolvedAt).length ?? 0;
@@ -415,9 +439,422 @@ function App() {
   const latestAcceptedNorthStarCall =
     northStarSnapshot?.callSessions.find((call) => call.status === "accepted")
     ?? null;
+  const activeNorthStarSession =
+    callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
+    && callSessionSnapshot.activeSession.sessionState === "active"
+      ? callSessionSnapshot.activeSession
+      : null;
+  const activeNorthStarRemoteCallId = activeNorthStarSession?.notes.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? null;
+  const activeNorthStarRemoteCall =
+    activeNorthStarRemoteCallId
+      ? northStarSnapshot?.callSessions.find((call) => call.callId === activeNorthStarRemoteCallId) ?? null
+      : null;
   const northStarSessionReady = northStarSnapshot?.sessionReady ?? false;
   const northStarDesktopBound = northStarSnapshot?.desktopBound ?? false;
   const northStarReadyForCalls = northStarSnapshot?.configured && northStarSessionReady && northStarDesktopBound;
+  const northStarLiveChannelReady =
+    Boolean(
+      activeNorthStarSession
+      && northStarWebRtcCallIdRef.current === activeNorthStarRemoteCallId
+      && northStarWebRtcChannelRef.current
+      && northStarWebRtcChannelRef.current.readyState === "open",
+    );
+
+  function teardownNorthStarWebRtc() {
+    northStarWebRtcChannelRef.current?.close();
+    northStarWebRtcPeerRef.current?.close();
+    northStarPeerAudioContextRef.current?.close().catch(() => undefined);
+    northStarIncomingProcessorRef.current?.disconnect();
+    northStarIncomingSourceRef.current?.disconnect();
+    northStarIncomingSinkRef.current?.disconnect();
+    northStarIncomingAudioContextRef.current?.close().catch(() => undefined);
+    if (northStarIncomingRecorderRef.current?.state === "recording") {
+      northStarIncomingRecorderRef.current.stop();
+    }
+    northStarWebRtcChannelRef.current = null;
+    northStarWebRtcPeerRef.current = null;
+    northStarWebRtcCallIdRef.current = null;
+    processedNorthStarSignalIdsRef.current = new Set();
+    northStarLiveTurnChunksRef.current = new Map();
+    northStarPeerAudioContextRef.current = null;
+    northStarPeerAudioDestinationRef.current = null;
+    northStarIncomingMediaStreamRef.current = null;
+    northStarIncomingRecorderRef.current = null;
+    northStarIncomingChunksRef.current = [];
+    northStarIncomingAudioContextRef.current = null;
+    northStarIncomingProcessorRef.current = null;
+    northStarIncomingSourceRef.current = null;
+    northStarIncomingSinkRef.current = null;
+    northStarIncomingSpeechDetectedRef.current = false;
+    northStarIncomingSpeechFramesRef.current = 0;
+    northStarIncomingSilenceFramesRef.current = 0;
+    northStarIncomingProcessingRef.current = false;
+  }
+
+  function decodeBase64ToArrayBuffer(base64: string) {
+    const binary = window.atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let index = 0; index < binary.length; index += 1) {
+      bytes[index] = binary.charCodeAt(index);
+    }
+    return bytes.buffer;
+  }
+
+  function ensureNorthStarPeerAudio() {
+    if (northStarPeerAudioContextRef.current && northStarPeerAudioDestinationRef.current) {
+      return {
+        context: northStarPeerAudioContextRef.current,
+        destination: northStarPeerAudioDestinationRef.current,
+      };
+    }
+    const context = new AudioContext();
+    const destination = context.createMediaStreamDestination();
+    northStarPeerAudioContextRef.current = context;
+    northStarPeerAudioDestinationRef.current = destination;
+    return { context, destination };
+  }
+
+  function blobToBase64(blob: Blob) {
+    return new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const result = reader.result;
+        if (typeof result !== "string") {
+          reject(new Error("Could not read audio data."));
+          return;
+        }
+        const commaIndex = result.indexOf(",");
+        resolve(commaIndex >= 0 ? result.slice(commaIndex + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error ?? new Error("Could not read audio data."));
+      reader.readAsDataURL(blob);
+    });
+  }
+
+  function resetNorthStarIncomingDetection() {
+    northStarIncomingSpeechDetectedRef.current = false;
+    northStarIncomingSpeechFramesRef.current = 0;
+    northStarIncomingSilenceFramesRef.current = 0;
+  }
+
+  async function processNorthStarIncomingBlob(blob: Blob) {
+    if (!activeNorthStarSession?.id || northStarIncomingProcessingRef.current) {
+      return;
+    }
+    northStarIncomingProcessingRef.current = true;
+    try {
+      const audioBase64 = await blobToBase64(blob);
+      const result = await processNorthStarLiveTurn(activeNorthStarSession.id, audioBase64);
+      setCallTurnResult(result);
+      setCallTranscriptSummary(result.transcriptText);
+      await playNorthStarReplyOverPeer(result.replyAudioBase64);
+      await Promise.all([refreshCallSessionSnapshot(), refreshDiagnostics()]);
+    } catch {
+      setMessage("North Star had trouble processing the live microphone track.");
+    } finally {
+      northStarIncomingProcessingRef.current = false;
+      resetNorthStarIncomingDetection();
+      if (northStarIncomingRecorderRef.current && northStarIncomingRecorderRef.current.state === "inactive") {
+        northStarIncomingChunksRef.current = [];
+        northStarIncomingRecorderRef.current.start();
+      }
+    }
+  }
+
+  function startNorthStarIncomingTrackLoop(stream: MediaStream) {
+    if (northStarIncomingRecorderRef.current || northStarIncomingProcessingRef.current) {
+      return;
+    }
+
+    const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    northStarIncomingRecorderRef.current = recorder;
+    northStarIncomingChunksRef.current = [];
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        northStarIncomingChunksRef.current.push(event.data);
+      }
+    };
+    recorder.onstop = () => {
+      const blob = new Blob(northStarIncomingChunksRef.current, { type: "audio/webm" });
+      northStarIncomingChunksRef.current = [];
+      if (blob.size > 0) {
+        void processNorthStarIncomingBlob(blob);
+      }
+    };
+    recorder.start();
+
+    const context = new AudioContext({ sampleRate: 16000 });
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(2048, 1, 1);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(context.destination);
+    northStarIncomingAudioContextRef.current = context;
+    northStarIncomingSourceRef.current = source;
+    northStarIncomingProcessorRef.current = processor;
+    northStarIncomingSinkRef.current = sink;
+
+    processor.onaudioprocess = (event) => {
+      if (!activeNorthStarSession || northStarIncomingProcessingRef.current) {
+        return;
+      }
+
+      const chunk = event.inputBuffer.getChannelData(0);
+      let sum = 0;
+      for (let index = 0; index < chunk.length; index += 1) {
+        sum += chunk[index] * chunk[index];
+      }
+      const rms = Math.sqrt(sum / chunk.length);
+      const speaking = rms > 0.01;
+
+      if (speaking) {
+        northStarIncomingSpeechDetectedRef.current = true;
+        northStarIncomingSilenceFramesRef.current = 0;
+        northStarIncomingSpeechFramesRef.current += 1;
+        if (recorder.state === "inactive") {
+          northStarIncomingChunksRef.current = [];
+          recorder.start();
+        }
+        return;
+      }
+
+      if (!northStarIncomingSpeechDetectedRef.current) {
+        return;
+      }
+
+      northStarIncomingSilenceFramesRef.current += 1;
+      if (
+        northStarIncomingSpeechFramesRef.current >= 3
+        && northStarIncomingSilenceFramesRef.current >= 10
+        && recorder.state === "recording"
+      ) {
+        recorder.stop();
+      }
+    };
+  }
+
+  async function playNorthStarReplyOverPeer(base64: string) {
+    const { context, destination } = ensureNorthStarPeerAudio();
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+    const audioBuffer = await context.decodeAudioData(decodeBase64ToArrayBuffer(base64).slice(0));
+    const source = context.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(destination);
+    source.start();
+    return Math.round(audioBuffer.duration * 1000);
+  }
+
+  function sendChunkedNorthStarReply(
+    channel: RTCDataChannel,
+    requestId: string,
+    result: CallTurnResult,
+  ) {
+    const payloadJson = JSON.stringify(result);
+    if (payloadJson.length <= NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE) {
+      channel.send(JSON.stringify({
+        type: "live_reply",
+        requestId,
+        result,
+      }));
+      return;
+    }
+
+    const total = Math.ceil(payloadJson.length / NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE);
+    for (let index = 0; index < total; index += 1) {
+      const slice = payloadJson.slice(
+        index * NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE,
+        (index + 1) * NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE,
+      );
+      channel.send(JSON.stringify({
+        type: "live_reply_chunk",
+        requestId,
+        index,
+        total,
+        payloadSlice: slice,
+      }));
+    }
+  }
+
+  function attachNorthStarDesktopPeer(callId: string, peer: RTCPeerConnection) {
+    northStarWebRtcCallIdRef.current = callId;
+    const { destination } = ensureNorthStarPeerAudio();
+    destination.stream.getAudioTracks().forEach((track) => {
+      peer.addTrack(track, destination.stream);
+    });
+    peer.onicecandidate = (event) => {
+      if (!event.candidate || northStarWebRtcCallIdRef.current !== callId) {
+        return;
+      }
+      void sendNorthStarWebRtcSignal(callId, "ice_candidate", JSON.stringify(event.candidate.toJSON())).catch(() => undefined);
+    };
+    peer.ondatachannel = (event) => {
+      northStarWebRtcChannelRef.current = event.channel;
+      event.channel.onopen = () => setMessage("North Star live call channel connected.");
+      event.channel.onmessage = (messageEvent) => {
+        const activeSessionId = activeNorthStarSession?.id;
+        if (!activeSessionId) {
+          return;
+        }
+        try {
+          const payload = JSON.parse(String(messageEvent.data)) as
+            | { type: "live_turn"; requestId: string; audioBase64: string }
+            | { type: "live_turn_chunk"; requestId: string; index: number; total: number; audioSlice: string }
+            | { type: string };
+          if (payload.type === "live_turn_chunk") {
+            const requestId = "requestId" in payload ? payload.requestId : "";
+            const index = "index" in payload ? payload.index : -1;
+            const total = "total" in payload ? payload.total : 0;
+            const audioSlice = "audioSlice" in payload ? payload.audioSlice : "";
+            if (!requestId || index < 0 || total <= 0 || !audioSlice) {
+              return;
+            }
+            const chunks = northStarLiveTurnChunksRef.current.get(requestId) ?? new Array(total).fill("");
+            chunks[index] = audioSlice;
+            northStarLiveTurnChunksRef.current.set(requestId, chunks);
+            if (chunks.filter(Boolean).length !== total) {
+              return;
+            }
+            northStarLiveTurnChunksRef.current.delete(requestId);
+            const mergedAudioBase64 = chunks.join("");
+          void processNorthStarLiveTurn(activeSessionId, mergedAudioBase64)
+            .then((result) => {
+              if (event.channel.readyState !== "open") {
+                return;
+              }
+              void playNorthStarReplyOverPeer(result.replyAudioBase64)
+                .then((replyDurationMs) => {
+                  event.channel.send(JSON.stringify({
+                    type: "live_reply",
+                    requestId,
+                    result: {
+                      transcriptText: result.transcriptText,
+                      replyText: result.replyText,
+                      remoteAudio: true,
+                      replyDurationMs,
+                    },
+                  }));
+                })
+                .catch(() => {
+                  sendChunkedNorthStarReply(event.channel, requestId, result);
+                });
+              void Promise.all([refreshCallSessionSnapshot(), refreshDiagnostics()]).catch(() => undefined);
+            })
+            .catch(() => {
+                if (event.channel.readyState !== "open") {
+                  return;
+                }
+                event.channel.send(JSON.stringify({
+                  type: "live_reply_error",
+                  requestId,
+                  message: "North Star could not process that spoken turn live.",
+                }));
+              });
+            return;
+          }
+
+          if (payload.type !== "live_turn") {
+            return;
+          }
+          const audioBase64 = "audioBase64" in payload ? payload.audioBase64 : "";
+          const requestId = "requestId" in payload ? payload.requestId : "";
+          if (!audioBase64 || !requestId) {
+            return;
+          }
+          void processNorthStarLiveTurn(activeSessionId, audioBase64)
+            .then((result) => {
+              if (event.channel.readyState !== "open") {
+                return;
+              }
+              void playNorthStarReplyOverPeer(result.replyAudioBase64)
+                .then((replyDurationMs) => {
+                  event.channel.send(JSON.stringify({
+                    type: "live_reply",
+                    requestId,
+                    result: {
+                      transcriptText: result.transcriptText,
+                      replyText: result.replyText,
+                      remoteAudio: true,
+                      replyDurationMs,
+                    },
+                  }));
+                })
+                .catch(() => {
+                  sendChunkedNorthStarReply(event.channel, requestId, result);
+                });
+              void Promise.all([refreshCallSessionSnapshot(), refreshDiagnostics()]).catch(() => undefined);
+            })
+            .catch(() => {
+              if (event.channel.readyState !== "open") {
+                return;
+              }
+              event.channel.send(JSON.stringify({
+                type: "live_reply_error",
+                requestId,
+                message: "North Star could not process that spoken turn live.",
+              }));
+            });
+        } catch {
+          return;
+        }
+      };
+      event.channel.onclose = () => {
+        if (northStarWebRtcChannelRef.current === event.channel) {
+          northStarWebRtcChannelRef.current = null;
+        }
+      };
+    };
+    peer.onconnectionstatechange = () => {
+      if (northStarWebRtcCallIdRef.current !== callId) {
+        return;
+      }
+      if (peer.connectionState === "connected") {
+        setMessage("North Star live call channel connected.");
+      } else if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+        setMessage("North Star live channel dropped back to fallback mode.");
+      }
+    };
+    peer.ontrack = (event) => {
+      if (!event.streams[0]) {
+        return;
+      }
+      northStarIncomingMediaStreamRef.current = event.streams[0];
+      startNorthStarIncomingTrackLoop(event.streams[0]);
+      setMessage("North Star live microphone track connected.");
+    };
+  }
+
+  async function handleNorthStarDesktopSignal(callId: string, signal: NorthStarWebRtcSignal) {
+    if (processedNorthStarSignalIdsRef.current.has(signal.signalId)) {
+      return;
+    }
+    processedNorthStarSignalIdsRef.current.add(signal.signalId);
+
+    if (signal.signalKind === "offer") {
+      teardownNorthStarWebRtc();
+      const peer = new RTCPeerConnection();
+      attachNorthStarDesktopPeer(callId, peer);
+      northStarWebRtcPeerRef.current = peer;
+      await peer.setRemoteDescription(JSON.parse(signal.payloadJson) as RTCSessionDescriptionInit);
+      const answer = await peer.createAnswer();
+      await peer.setLocalDescription(answer);
+      if (peer.localDescription) {
+        await sendNorthStarWebRtcSignal(callId, "answer", JSON.stringify(peer.localDescription));
+      }
+      return;
+    }
+
+    if (signal.signalKind === "ice_candidate") {
+      const peer = northStarWebRtcPeerRef.current;
+      if (!peer) {
+        return;
+      }
+      await peer.addIceCandidate(JSON.parse(signal.payloadJson) as RTCIceCandidateInit);
+    }
+  }
 
   async function refreshDiagnostics() { setDiagnostics(await getDiagnostics()); }
   async function refreshNorthStarSnapshot() { setNorthStarSnapshot(await getNorthStarSnapshot()); }
@@ -511,25 +948,99 @@ function App() {
   }, [northStarDesktopBound, busyPanel]);
 
   useEffect(() => {
-    const activeNorthStarSession =
-      callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
-      && callSessionSnapshot.activeSession.sessionState === "active";
     if (
       !latestAcceptedNorthStarCall
-      || activeNorthStarSession
-      || !!callSessionSnapshot?.activeSession
+      || (activeNorthStarSession && activeNorthStarRemoteCallId === latestAcceptedNorthStarCall.callId)
+      || (!!callSessionSnapshot?.activeSession && !activeNorthStarSession)
       || busyPanel === "northStarAcceptedCall"
       || busyPanel === "callStart"
+      || busyPanel === "callEnd"
     ) {
       return;
     }
-    void handleStartNorthStarAcceptedCall();
-  }, [latestAcceptedNorthStarCall?.callId, callSessionSnapshot?.activeSession?.id, callSessionSnapshot?.activeSession?.handoffKind, callSessionSnapshot?.activeSession?.sessionState, busyPanel]);
+    if (activeNorthStarSession && activeNorthStarRemoteCallId !== latestAcceptedNorthStarCall.callId) {
+      void (async () => {
+        await handleEndCallSession("interrupted");
+        await handleStartNorthStarAcceptedCall();
+      })();
+      return;
+    }
+    if (!callSessionSnapshot?.activeSession) {
+      void handleStartNorthStarAcceptedCall();
+    }
+  }, [latestAcceptedNorthStarCall?.callId, activeNorthStarRemoteCallId, activeNorthStarSession?.id, callSessionSnapshot?.activeSession?.id, busyPanel]);
 
   useEffect(() => {
-    const activeNorthStarSession =
-      callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
-      && callSessionSnapshot.activeSession.sessionState === "active";
+    if (!activeNorthStarSession) {
+      missingAcceptedNorthStarPollsRef.current = 0;
+      teardownNorthStarWebRtc();
+      return;
+    }
+    if (activeNorthStarRemoteCall?.status === "accepted") {
+      missingAcceptedNorthStarPollsRef.current = 0;
+      return;
+    }
+    if (!northStarSnapshot?.configured || busyPanel === "callEnd" || busyPanel === "northStarAcceptedCall") {
+      return;
+    }
+    if (activeNorthStarRemoteCall && activeNorthStarRemoteCall.status !== "accepted") {
+      missingAcceptedNorthStarPollsRef.current = 0;
+      const outcome =
+        activeNorthStarRemoteCall.status === "missed"
+          ? "missed"
+          : activeNorthStarRemoteCall.status === "declined"
+            ? "interrupted"
+            : "completed";
+      void handleEndCallSession(outcome);
+      return;
+    }
+    missingAcceptedNorthStarPollsRef.current += 1;
+    if (missingAcceptedNorthStarPollsRef.current < 2) {
+      return;
+    }
+    missingAcceptedNorthStarPollsRef.current = 0;
+    void handleEndCallSession("completed");
+  }, [activeNorthStarSession?.id, activeNorthStarRemoteCall?.callId, activeNorthStarRemoteCall?.status, northStarSnapshot?.configured, busyPanel]);
+
+  useEffect(() => {
+    if (!activeNorthStarSession || !activeNorthStarRemoteCallId) {
+      teardownNorthStarWebRtc();
+      return;
+    }
+
+    let cancelled = false;
+    const targetCallId = activeNorthStarRemoteCallId;
+    if (northStarWebRtcCallIdRef.current !== targetCallId) {
+      teardownNorthStarWebRtc();
+      northStarWebRtcCallIdRef.current = targetCallId;
+    }
+
+    async function pollSignals() {
+      try {
+        const signals = await pullNorthStarWebRtcSignals(targetCallId);
+        if (cancelled || northStarWebRtcCallIdRef.current !== targetCallId) {
+          return;
+        }
+        for (const signal of signals) {
+          await handleNorthStarDesktopSignal(targetCallId, signal);
+        }
+      } catch {
+        // Keep the existing turn-upload call path alive while live signaling is still being added.
+      }
+    }
+
+    void pollSignals();
+    const timer = window.setInterval(() => {
+      void pollSignals();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeNorthStarSession?.id, activeNorthStarRemoteCallId]);
+
+  useEffect(() => {
     if (!activeNorthStarSession || busyPanel === "northStarTurn" || busyPanel === "speechStreamStart" || busyPanel === "speechStreamStop") {
       return;
     }
@@ -1289,12 +1800,15 @@ function App() {
     setBusyPanel("northStarAcceptedCall");
     setError("");
     setMessage("");
+    setNorthStarTurnStatus(null);
+    setCallTurnResult(null);
+    setCallReplyAudioSrc(null);
+    setCallTranscriptSummary("");
+    setCallSessionNotes("");
+    setSpeechStream(null);
     try {
       const snapshot = await startNorthStarAcceptedCall();
       setCallSessionSnapshot(snapshot);
-      setCallTurnResult(null);
-      setCallReplyAudioSrc(null);
-      setSpeechStream(null);
       setMessage("Started a local call session from the accepted North Star request.");
       await Promise.all([refreshNorthStarSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
@@ -2214,6 +2728,9 @@ function App() {
                       {busyPanel === "northStarTurn"
                         ? "North Star is responding right now."
                         : "The line is open. North Star is listening for the next thing you say."}
+                    </p>
+                    <p className="memory-explanation">
+                      {northStarLiveChannelReady ? "Call path: live channel connected." : "Call path: fallback voice path."}
                     </p>
                     {northStarTurnStatus ? (
                       <p className="memory-explanation">

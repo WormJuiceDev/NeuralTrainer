@@ -18,6 +18,7 @@ import type {
   MvpRealityCheckSnapshot,
   NorthStarSnapshot,
   NorthStarTurnProcessingResult,
+  NorthStarWebRtcSignal,
   OutreachDispatchResult,
   SubmitFeedbackInput,
   SimulationRunInput,
@@ -82,6 +83,15 @@ export const importNorthStarCallReviews = () =>
 
 export const processNextNorthStarCallTurn = () =>
   invoke<NorthStarTurnProcessingResult>("process_next_north_star_call_turn");
+
+export const processNorthStarLiveTurn = (sessionId: number, audioBase64: string) =>
+  invoke<CallTurnResult>("process_north_star_live_turn", { sessionId, audioBase64 });
+
+export const sendNorthStarWebRtcSignal = (callId: string, signalKind: string, payloadJson: string) =>
+  invoke<void>("send_north_star_webrtc_signal", { callId, signalKind, payloadJson });
+
+export const pullNorthStarWebRtcSignals = (callId: string) =>
+  invoke<NorthStarWebRtcSignal[]>("pull_north_star_webrtc_signals", { callId });
 
 export const getVoiceSnapshot = () => invoke<VoiceSnapshot>("get_voice_snapshot");
 

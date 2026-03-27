@@ -86,6 +86,17 @@ type CompanionCallTurn = {
   completed_at: string | null;
 };
 
+type CompanionWebRtcSignal = {
+  signal_id: string;
+  call_id: string;
+  user_handle: string;
+  source: string;
+  target: string;
+  signal_kind: string;
+  payload_json: string;
+  created_at: string;
+};
+
 type PushCapability = {
   notificationSupported: boolean;
   serviceWorkerSupported: boolean;
@@ -187,6 +198,7 @@ const SESSION_STORAGE_KEY = "northstar.session";
 const DEVICE_STORAGE_KEY = "northstar.deviceToken";
 const LOCATION_QUEUE_KEY = "northstar.locationQueue";
 const CALL_REVIEW_QUEUE_KEY = "northstar.pendingCallReviews";
+const LIVE_CHANNEL_CHUNK_SIZE = 48_000;
 
 const CALL_STATUS_LABELS: Record<CallStatus, string> = {
   pending: "Ringing",
@@ -363,7 +375,8 @@ function audioBufferToWavBase64(channelData: Float32Array[], sampleRate: number)
   view.setUint32(40, totalSamples * bytesPerSample, true);
 
   let offset = 44;
-  for (const chunk of channelData) {
+  const normalizedChunks = normalizeCallAudio(channelData);
+  for (const chunk of normalizedChunks) {
     for (let index = 0; index < chunk.length; index += 1) {
       const sample = Math.max(-1, Math.min(1, chunk[index]));
       view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
@@ -377,6 +390,43 @@ function audioBufferToWavBase64(channelData: Float32Array[], sampleRate: number)
     binary += String.fromCharCode(bytes[index]);
   }
   return window.btoa(binary);
+}
+
+function normalizeCallAudio(channelData: Float32Array[]) {
+  let peak = 0;
+  let energy = 0;
+  let sampleCount = 0;
+
+  for (const chunk of channelData) {
+    for (let index = 0; index < chunk.length; index += 1) {
+      const sample = chunk[index];
+      const absSample = Math.abs(sample);
+      if (absSample > peak) {
+        peak = absSample;
+      }
+      energy += sample * sample;
+      sampleCount += 1;
+    }
+  }
+
+  if (sampleCount === 0 || peak === 0) {
+    return channelData;
+  }
+
+  const rms = Math.sqrt(energy / sampleCount);
+  const targetRms = 0.18;
+  const desiredGain = rms > 0 ? targetRms / rms : 1;
+  const peakLimitedGain = 0.92 / peak;
+  const gain = Math.max(0.7, Math.min(peakLimitedGain, desiredGain, 6));
+
+  return channelData.map((chunk) => {
+    const normalized = new Float32Array(chunk.length);
+    for (let index = 0; index < chunk.length; index += 1) {
+      const shaped = Math.tanh(chunk[index] * gain * 1.35);
+      normalized[index] = Math.max(-0.98, Math.min(0.98, shaped));
+    }
+    return normalized;
+  });
 }
 
 function App() {
@@ -436,6 +486,15 @@ function App() {
   const silenceFrameCountRef = useRef(0);
   const speechFrameCountRef = useRef(0);
   const sendingTurnRef = useRef(false);
+  const livePeerRef = useRef<RTCPeerConnection | null>(null);
+  const liveDataChannelRef = useRef<RTCDataChannel | null>(null);
+  const liveSignalCallIdRef = useRef<string | null>(null);
+  const processedLiveSignalIdsRef = useRef<Set<string>>(new Set());
+  const liveReplyChunksRef = useRef<Map<string, string[]>>(new Map());
+  const liveRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const liveRemoteStreamRef = useRef<MediaStream | null>(null);
+  const liveRemotePlaybackTimerRef = useRef<number | null>(null);
+  const livePeerInputStreamRef = useRef<MediaStream | null>(null);
   const wsBase = useMemo(() => apiBase.replace(/^http/i, "ws"), [apiBase]);
 
   useEffect(() => {
@@ -587,6 +646,239 @@ function App() {
     headers.set("Content-Type", headers.get("Content-Type") || "application/json");
     headers.set("x-northstar-session", sessionToken);
     return fetch(`${apiBase}${path}`, { ...init, headers });
+  }
+
+  function teardownLivePeerConnection() {
+    liveDataChannelRef.current?.close();
+    livePeerRef.current?.close();
+    if (liveRemotePlaybackTimerRef.current !== null) {
+      window.clearTimeout(liveRemotePlaybackTimerRef.current);
+      liveRemotePlaybackTimerRef.current = null;
+    }
+    if (liveRemoteAudioRef.current) {
+      liveRemoteAudioRef.current.srcObject = null;
+    }
+    livePeerInputStreamRef.current?.getTracks().forEach((track) => track.stop());
+    liveDataChannelRef.current = null;
+    livePeerRef.current = null;
+    liveSignalCallIdRef.current = null;
+    processedLiveSignalIdsRef.current = new Set();
+    liveReplyChunksRef.current = new Map();
+    liveRemoteStreamRef.current = null;
+    livePeerInputStreamRef.current = null;
+  }
+
+  function sendChunkedLiveTurn(channel: RTCDataChannel, requestId: string, audioBase64: string) {
+    if (audioBase64.length <= LIVE_CHANNEL_CHUNK_SIZE) {
+      channel.send(JSON.stringify({
+        type: "live_turn",
+        requestId,
+        audioBase64,
+      }));
+      return;
+    }
+
+    const total = Math.ceil(audioBase64.length / LIVE_CHANNEL_CHUNK_SIZE);
+    for (let index = 0; index < total; index += 1) {
+      const slice = audioBase64.slice(index * LIVE_CHANNEL_CHUNK_SIZE, (index + 1) * LIVE_CHANNEL_CHUNK_SIZE);
+      channel.send(JSON.stringify({
+        type: "live_turn_chunk",
+        requestId,
+        index,
+        total,
+        audioSlice: slice,
+      }));
+    }
+  }
+
+  async function sendMobileWebRtcSignal(callId: string, signalKind: string, payload: RTCSessionDescriptionInit | RTCIceCandidateInit) {
+    await authedFetch("/api/companion/webrtc-signals", {
+      method: "POST",
+      body: JSON.stringify({
+        call_id: callId,
+        signal_kind: signalKind,
+        payload_json: JSON.stringify(payload),
+      }),
+    });
+  }
+
+  async function pullMobileWebRtcSignals(callId: string) {
+    const response = await authedFetch(`/api/companion/webrtc-signals?call_id=${encodeURIComponent(callId)}`, { method: "GET" });
+    if (!response.ok) {
+      return [] as CompanionWebRtcSignal[];
+    }
+    const payload = (await response.json()) as { signals?: CompanionWebRtcSignal[] };
+    return payload.signals ?? [];
+  }
+
+  function attachLivePeer(callId: string, peer: RTCPeerConnection, channel?: RTCDataChannel) {
+    liveSignalCallIdRef.current = callId;
+    if (channel) {
+      liveDataChannelRef.current = channel;
+      channel.onopen = () => setMessage("North Star live call channel connected.");
+      channel.onmessage = (event) => {
+        try {
+          const payload = JSON.parse(String(event.data)) as
+            | {
+                type: "live_reply";
+                requestId: string;
+                result: {
+                  transcriptText: string;
+                  replyText: string;
+                  replyAudioBase64?: string;
+                  sampleRate?: number;
+                  remoteAudio?: boolean;
+                  replyDurationMs?: number;
+                };
+              }
+            | {
+                type: "live_reply_chunk";
+                requestId: string;
+                index: number;
+                total: number;
+                payloadSlice: string;
+              }
+            | { type: "live_reply_error"; message?: string }
+            | { type: string };
+          if (payload.type === "live_reply_chunk") {
+            const requestId = "requestId" in payload ? payload.requestId : "";
+            const index = "index" in payload ? payload.index : -1;
+            const total = "total" in payload ? payload.total : 0;
+            const payloadSlice = "payloadSlice" in payload ? payload.payloadSlice : "";
+            if (!requestId || index < 0 || total <= 0 || !payloadSlice) {
+              return;
+            }
+            const chunks = liveReplyChunksRef.current.get(requestId) ?? new Array(total).fill("");
+            chunks[index] = payloadSlice;
+            liveReplyChunksRef.current.set(requestId, chunks);
+            if (chunks.filter(Boolean).length !== total) {
+              return;
+            }
+            liveReplyChunksRef.current.delete(requestId);
+            const mergedPayload = JSON.parse(chunks.join("")) as {
+              transcriptText: string;
+              replyText: string;
+              replyAudioBase64: string;
+              sampleRate: number;
+            };
+            setCallLoopState("speaking");
+            setLiveReplyAudioSrc(replyAudioUrl(mergedPayload.replyAudioBase64));
+            setMessage("NeuralTrainer answered.");
+            void refreshCallSessions();
+            void refreshCallTurns(callId);
+            return;
+          }
+          if (payload.type === "live_reply") {
+            const result = "result" in payload ? payload.result : null;
+            if (!result) {
+              return;
+            }
+            setCallLoopState("speaking");
+            setMessage("NeuralTrainer answered.");
+            if (result.remoteAudio) {
+              setLiveReplyAudioSrc(null);
+              if (liveRemotePlaybackTimerRef.current !== null) {
+                window.clearTimeout(liveRemotePlaybackTimerRef.current);
+              }
+              liveRemotePlaybackTimerRef.current = window.setTimeout(() => {
+                liveRemotePlaybackTimerRef.current = null;
+                handleLiveReplyEnded();
+              }, result.replyDurationMs ?? 1500);
+            } else if (result.replyAudioBase64) {
+              setLiveReplyAudioSrc(replyAudioUrl(result.replyAudioBase64));
+            } else {
+              return;
+            }
+            void refreshCallSessions();
+            if (!result.remoteAudio) {
+              void refreshCallTurns(callId);
+            }
+            return;
+          }
+          if (payload.type === "live_reply_error") {
+            const errorMessage = "message" in payload ? payload.message : "";
+            setMessage(errorMessage || "North Star could not process that spoken turn live.");
+            if (!recordingTurn && activeAcceptedCall?.call_id === callId && !callLoopMuted) {
+              setCallLoopState("listening");
+              void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
+            }
+          }
+        } catch {
+          return;
+        }
+      };
+      channel.onclose = () => {
+        if (liveDataChannelRef.current === channel) {
+          liveDataChannelRef.current = null;
+        }
+      };
+    }
+    peer.onicecandidate = (event) => {
+      if (!event.candidate || liveSignalCallIdRef.current !== callId) {
+        return;
+      }
+      void sendMobileWebRtcSignal(callId, "ice_candidate", event.candidate.toJSON()).catch(() => undefined);
+    };
+    peer.onconnectionstatechange = () => {
+      if (liveSignalCallIdRef.current !== callId) return;
+      if (peer.connectionState === "connected") {
+        setMessage("North Star live call channel connected.");
+      } else if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+        setMessage("North Star fell back to the existing call path.");
+      }
+    };
+    peer.ontrack = (event) => {
+      const stream = event.streams[0];
+      if (!stream) {
+        return;
+      }
+      liveRemoteStreamRef.current = stream;
+      if (liveRemoteAudioRef.current) {
+        liveRemoteAudioRef.current.srcObject = stream;
+        void liveRemoteAudioRef.current.play().catch(() => undefined);
+      }
+    };
+  }
+
+  async function ensureLiveCallOffer(callId: string) {
+    if (liveSignalCallIdRef.current === callId && livePeerRef.current) {
+      return;
+    }
+    teardownLivePeerConnection();
+    const peer = new RTCPeerConnection();
+    const inputStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    livePeerInputStreamRef.current = inputStream;
+    inputStream.getTracks().forEach((track) => {
+      peer.addTrack(track, inputStream);
+    });
+    const channel = peer.createDataChannel("northstar-call");
+    attachLivePeer(callId, peer, channel);
+    livePeerRef.current = peer;
+    const offer = await peer.createOffer();
+    await peer.setLocalDescription(offer);
+    if (peer.localDescription) {
+      await sendMobileWebRtcSignal(callId, "offer", peer.localDescription);
+    }
+  }
+
+  async function handleMobileWebRtcSignal(callId: string, signal: CompanionWebRtcSignal) {
+    if (processedLiveSignalIdsRef.current.has(signal.signal_id)) {
+      return;
+    }
+    processedLiveSignalIdsRef.current.add(signal.signal_id);
+
+    if (signal.signal_kind === "answer") {
+      const peer = livePeerRef.current;
+      if (!peer) return;
+      await peer.setRemoteDescription(JSON.parse(signal.payload_json) as RTCSessionDescriptionInit);
+      return;
+    }
+
+    if (signal.signal_kind === "ice_candidate") {
+      const peer = livePeerRef.current;
+      if (!peer) return;
+      await peer.addIceCandidate(JSON.parse(signal.payload_json) as RTCIceCandidateInit);
+    }
   }
 
   async function refreshAll() {
@@ -800,6 +1092,51 @@ function App() {
     setMessageDraft("");
     setMessage("Message sent to NeuralTrainer.");
     await refreshMessages();
+  }
+
+  async function startCallFromPhone() {
+    if (!sessionToken) {
+      setMessage("Create a companion session first.");
+      return;
+    }
+    if (!deviceToken) {
+      setMessage("Link your desktop first.");
+      return;
+    }
+    if (activeAcceptedCall) {
+      setSelectedCallId(activeAcceptedCall.call_id);
+      setMessage("The line is already open.");
+      return;
+    }
+    if (incomingCall) {
+      setSelectedCallId(incomingCall.call_id);
+      setMessage("There is already an incoming call waiting.");
+      return;
+    }
+
+    const response = await authedFetch("/api/companion/call-sessions/from-mobile", {
+      method: "POST",
+      body: JSON.stringify({
+        note: "North Star is calling from your phone.",
+      }),
+    });
+    if (!response.ok) {
+      setMessage("North Star could not reach NeuralTrainer just then.");
+      return;
+    }
+
+    const call = (await response.json()) as CompanionCallSession;
+    stopRemoteTurnRecording();
+    setCallLoopMuted(false);
+    setCallLoopState("idle");
+    setLiveReplyAudioSrc(null);
+    lastPlayedReplyTurnIdRef.current = null;
+    setCallTurns([]);
+    setView("chats");
+    setSelectedCallId(call.call_id);
+    setMenuOpen(false);
+    setMessage("Calling NeuralTrainer now.");
+    await refreshCallSessions();
   }
 
   function queueCallReview(
@@ -1177,6 +1514,17 @@ function App() {
     setCallLoopState("processing");
 
     try {
+      if (
+        liveSignalCallIdRef.current === targetCall.call_id
+        && liveDataChannelRef.current
+        && liveDataChannelRef.current.readyState === "open"
+      ) {
+        const requestId = `${targetCall.call_id}-${Date.now()}`;
+        sendChunkedLiveTurn(liveDataChannelRef.current, requestId, audioBase64);
+        setMessage("Turn sent live. Waiting for NeuralTrainer's reply.");
+        return;
+      }
+
       const response = await authedFetch("/api/companion/call-turns/from-mobile", {
         method: "POST",
         body: JSON.stringify({
@@ -1251,12 +1599,20 @@ function App() {
     null;
   const callOverlayCall = activeAcceptedCall ?? incomingCall;
   const latestReplyTurn =
-    [...selectedCallTurns].reverse().find((turn) => Boolean(turn.reply_audio_base64)) ??
+    [...selectedCallTurns]
+      .reverse()
+      .find((turn) => turn.call_id === activeAcceptedCall?.call_id && Boolean(turn.reply_audio_base64)) ??
     null;
-  const meaningfulLiveTurns = selectedCallTurns.filter((turn) => Boolean(turn.transcript_text || turn.reply_text));
   const liveCallStatus = getLiveCallStatusCopy(callLoopState, callLoopMuted);
   const lastMessage = orderedMessages[0] ?? null;
   const activeCallCount = callSessions.filter((call) => call.status === "accepted" || call.status === "pending").length;
+  const livePathReady =
+    Boolean(
+      activeAcceptedCall
+      && liveSignalCallIdRef.current === activeAcceptedCall.call_id
+      && liveDataChannelRef.current
+      && liveDataChannelRef.current.readyState === "open",
+    );
   const locationReady = locationState.location_supported && locationState.permission_state !== "denied";
   const pushReady = Boolean(pushStatus?.push_supported && (pushStatus?.registered_subscriptions ?? 0) > 0);
   const sessionReady = Boolean(sessionToken);
@@ -1312,6 +1668,20 @@ function App() {
   }
 
   function toggleCallLoopMute() {
+    if (livePathReady && livePeerInputStreamRef.current) {
+      const nextMuted = !callLoopMuted;
+      livePeerInputStreamRef.current.getAudioTracks().forEach((track) => {
+        track.enabled = !nextMuted;
+      });
+      setCallLoopMuted(nextMuted);
+      if (nextMuted) {
+        setCallLoopState("idle");
+        stopRemoteTurnRecording();
+      } else {
+        setCallLoopState("listening");
+      }
+      return;
+    }
     if (callLoopMuted) {
       setCallLoopMuted(false);
       if (activeAcceptedCall && !recordingTurn) {
@@ -1331,7 +1701,7 @@ function App() {
       return;
     }
     setCallLoopState("listening");
-    if (!recordingTurn) {
+    if (!livePathReady && !recordingTurn) {
       void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
     }
   }
@@ -1356,13 +1726,60 @@ function App() {
       setCallLoopState("idle");
       setCallLoopMuted(false);
       stopRemoteTurnRecording();
+      teardownLivePeerConnection();
+      return;
+    }
+    if (livePathReady) {
+      setCallLoopState("listening");
+      stopRemoteTurnRecording();
       return;
     }
     if (callLoopMuted || recordingTurn || handsFreeCallIdRef.current === activeAcceptedCall.call_id || callLoopState === "processing" || callLoopState === "speaking") {
       return;
     }
     void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
-  }, [activeAcceptedCall?.call_id, callLoopMuted, recordingTurn, callLoopState]);
+  }, [activeAcceptedCall?.call_id, callLoopMuted, recordingTurn, callLoopState, livePathReady]);
+
+  useEffect(() => {
+    if (!activeAcceptedCall) {
+      teardownLivePeerConnection();
+      return;
+    }
+
+    let cancelled = false;
+    const callId = activeAcceptedCall.call_id;
+
+    async function syncSignals() {
+      try {
+        await ensureLiveCallOffer(callId);
+        const signals = await pullMobileWebRtcSignals(callId);
+        if (cancelled || liveSignalCallIdRef.current !== callId) {
+          return;
+        }
+        for (const signal of signals) {
+          await handleMobileWebRtcSignal(callId, signal);
+        }
+      } catch {
+        // Keep the current phone call loop working while live transport is being introduced.
+      }
+    }
+
+    void syncSignals();
+    const timer = window.setInterval(() => {
+      void syncSignals();
+    }, 1500);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [activeAcceptedCall?.call_id]);
+
+  useEffect(() => {
+    setLiveReplyAudioSrc(null);
+    lastPlayedReplyTurnIdRef.current = null;
+    setCallTurns([]);
+  }, [activeAcceptedCall?.call_id]);
 
   useEffect(() => {
     void refreshCallTurns(selectedCallId);
@@ -1393,6 +1810,7 @@ function App() {
   useEffect(() => {
     return () => {
       stopRemoteTurnRecording();
+      teardownLivePeerConnection();
     };
   }, []);
 
@@ -1425,6 +1843,14 @@ function App() {
     liveReplyAudioRef.current.currentTime = 0;
     void liveReplyAudioRef.current.play().catch(() => undefined);
   }, [liveReplyAudioSrc]);
+
+  useEffect(() => {
+    if (!liveRemoteAudioRef.current || !liveRemoteStreamRef.current) {
+      return;
+    }
+    liveRemoteAudioRef.current.srcObject = liveRemoteStreamRef.current;
+    void liveRemoteAudioRef.current.play().catch(() => undefined);
+  }, [activeAcceptedCall?.call_id]);
 
   const chatsView = (
     <section className="app-panel app-panel--chat">
@@ -1745,6 +2171,7 @@ function App() {
   const liveCallScreen = callOverlayCall ? (
     <section className={`call-overlay call-overlay--${callOverlayCall.status}`}>
       <audio ref={liveReplyAudioRef} autoPlay playsInline src={liveReplyAudioSrc ?? undefined} className="call-audio" onEnded={handleLiveReplyEnded} />
+      <audio ref={liveRemoteAudioRef} autoPlay playsInline className="call-audio" />
       <div className="call-overlay-backdrop" />
       <div className="call-overlay-panel">
         <div className="call-overlay-copy">
@@ -1777,23 +2204,18 @@ function App() {
         {callOverlayCall.status === "accepted" ? (
           <>
             <div className="call-live-feed">
-              {meaningfulLiveTurns.length > 0 ? (
-                meaningfulLiveTurns.slice(-4).map((turn) => (
-                  <article key={turn.turn_id} className={`call-live-chip call-live-chip--${turn.source === "mobile" ? "you" : "trainer"}`}>
-                    <strong>{turn.source === "mobile" ? "You said" : "North Star"}</strong>
-                    <p>{turn.source === "mobile" ? turn.transcript_text : turn.reply_text}</p>
-                  </article>
-                ))
-              ) : (
-                <div className="empty-state compact">
-                  <h3>Call is live</h3>
-                  <p>Speak naturally. NeuralTrainer will answer here and out loud.</p>
-                </div>
-              )}
               <article className="call-live-chip call-live-chip--trainer">
                 <strong>North Star</strong>
                 <p>{liveCallStatus.headline}</p>
               </article>
+              <article className="call-live-chip call-live-chip--trainer">
+                <strong>Call path</strong>
+                <p>{livePathReady ? "Live channel connected" : "Fallback voice path"}</p>
+              </article>
+              <div className="empty-state compact">
+                <h3>Call is live</h3>
+                <p>{liveCallStatus.detail}</p>
+              </div>
             </div>
 
             <div className="call-overlay-actions">
@@ -1829,6 +2251,17 @@ function App() {
           </div>
 
           <div className="topbar-actions">
+            {view === "chats" ? (
+              <button
+                className="icon-button"
+                onClick={() => void startCallFromPhone()}
+                aria-label="Call NeuralTrainer"
+                disabled={!desktopReady || activeCallCount > 0}
+                title={!desktopReady ? "Link your desktop first" : activeCallCount > 0 ? "A call is already active" : "Call NeuralTrainer"}
+              >
+                <PhoneIcon kind="accept" />
+              </button>
+            ) : null}
             <button className="icon-button" onClick={() => void refreshAll()}>Refresh</button>
             <button
               className="icon-button menu-button"
@@ -1847,6 +2280,9 @@ function App() {
               <button className="menu-scrim" onClick={() => setMenuOpen(false)} aria-label="Close menu" />
               <div className="overflow-menu">
                 <button onClick={() => goToView("chats")}>Chats</button>
+                <button onClick={() => void startCallFromPhone()} disabled={!desktopReady || activeCallCount > 0}>
+                  Call NeuralTrainer
+                </button>
                 <button onClick={() => openSettings("menu")}>Settings home</button>
                 {settingsMenuItems.map((item) => (
                   <button key={item.section} onClick={() => openSettings(item.section)}>

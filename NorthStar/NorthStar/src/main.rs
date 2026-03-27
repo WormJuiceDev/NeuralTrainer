@@ -381,6 +381,11 @@ struct DesktopCallRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct MobileCallRequest {
+    note: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct CallResponseRequest {
     call_id: String,
     action: String,
@@ -542,6 +547,7 @@ async fn main() {
         .route("/api/companion/location-events/desktop-pull", get(desktop_pull_location_events))
         .route("/api/companion/call-sessions", get(list_call_sessions))
         .route("/api/companion/call-sessions/from-desktop", post(create_desktop_call_request))
+        .route("/api/companion/call-sessions/from-mobile", post(create_mobile_call_request))
         .route("/api/companion/call-sessions/respond", post(respond_to_call_request))
         .route("/api/companion/call-reviews", get(list_call_reviews).post(create_call_review))
         .route("/api/companion/call-turns", get(list_call_turns))
@@ -973,6 +979,57 @@ async fn create_desktop_call_request(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn create_mobile_call_request(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<MobileCallRequest>,
+) -> Result<Json<CompanionCallSession>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let now = Utc::now();
+
+    let call = {
+        let mut store = state.store.write().await;
+        let desktop = store
+            .desktops
+            .values()
+            .filter(|desktop| desktop.user_handle == session.user_handle)
+            .max_by_key(|desktop| desktop.last_heartbeat_at.unwrap_or(desktop.bound_at))
+            .cloned()
+            .ok_or_else(|| AppError::not_found("No linked desktop is ready for North Star yet"))?;
+
+        let call = CompanionCallSession {
+            call_id: Uuid::new_v4(),
+            user_handle: session.user_handle.clone(),
+            desktop_id: desktop.desktop_id,
+            desktop_name: desktop.desktop_name.clone(),
+            device_token: desktop.device_token.clone(),
+            requested_at: now,
+            responded_at: Some(now),
+            status: CallStatus::Accepted,
+            note: request.note.trim().to_string(),
+        };
+
+        store.call_sessions.push(call.clone());
+        store
+            .call_sessions
+            .sort_by_key(|saved| std::cmp::Reverse(saved.requested_at));
+        if store.call_sessions.len() > 100 {
+            store.call_sessions.truncate(100);
+        }
+        persist_store(&state.state_path, &store)?;
+        call
+    };
+
+    let _ = state.broadcaster.send(CompanionEvent::CallUpdated {
+        call_id: call.call_id,
+        user_handle: call.user_handle.clone(),
+        status: CallStatus::Accepted,
+        at: now,
+    });
+
+    Ok(Json(call))
+}
+
 async fn respond_to_call_request(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1185,7 +1242,7 @@ async fn complete_desktop_call_turn(
 ) -> Result<StatusCode, AppError> {
     let turn_id =
         Uuid::parse_str(&request.turn_id).map_err(|_| AppError::not_found("Invalid turn id"))?;
-    let completed = {
+    {
         let mut store = state.store.write().await;
         let desktop = store
             .desktops
@@ -1205,20 +1262,8 @@ async fn complete_desktop_call_turn(
         turn.reply_audio_base64 = Some(request.reply_audio_base64.trim().to_string());
         turn.sample_rate = Some(request.sample_rate);
         turn.completed_at = Some(Utc::now());
-        let completed = turn.clone();
         persist_store(&state.state_path, &store)?;
-        completed
     };
-
-    let push_payload = notification_payload(
-        "Reply is ready",
-        "North Star answered your last spoken turn.",
-        "CALL",
-        completed.call_id,
-        &format!("northstar-call-{}", completed.call_id),
-        false,
-    );
-    send_notification_to_user(&completed.user_handle, &push_payload, &state).await;
 
     Ok(StatusCode::NO_CONTENT)
 }

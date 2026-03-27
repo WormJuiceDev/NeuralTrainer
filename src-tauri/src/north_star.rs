@@ -9,6 +9,7 @@ use crate::{
   models::{
     AppSettings, CallTurnResult, LocationEventInput, NorthStarCallReview, NorthStarCallSession, NorthStarCallTurn,
     NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarSnapshot, NorthStarTurnProcessingResult,
+    NorthStarWebRtcSignal,
   },
 };
 
@@ -84,6 +85,18 @@ struct RawNorthStarCallTurn {
 }
 
 #[derive(Debug, Deserialize)]
+struct RawNorthStarWebRtcSignal {
+  signal_id: String,
+  call_id: String,
+  user_handle: String,
+  source: String,
+  target: String,
+  signal_kind: String,
+  payload_json: String,
+  created_at: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SessionResponse {
   session_token: String,
   user_handle: String,
@@ -125,6 +138,11 @@ struct CallReviewsResponse {
 #[derive(Debug, Deserialize)]
 struct CallTurnsResponse {
   turns: Vec<RawNorthStarCallTurn>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WebRtcSignalsResponse {
+  signals: Vec<RawNorthStarWebRtcSignal>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,6 +199,14 @@ struct CompleteDesktopCallTurnRequest {
   reply_mode: String,
   reply_audio_base64: String,
   sample_rate: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct DesktopWebRtcSignalRequest {
+  device_token: String,
+  call_id: String,
+  signal_kind: String,
+  payload_json: String,
 }
 
 impl From<RawNorthStarDesktopBinding> for NorthStarDesktopBinding {
@@ -268,6 +294,21 @@ impl From<RawNorthStarCallTurn> for NorthStarCallTurn {
       reply_audio_base64: value.reply_audio_base64,
       sample_rate: value.sample_rate,
       completed_at: value.completed_at,
+    }
+  }
+}
+
+impl From<RawNorthStarWebRtcSignal> for NorthStarWebRtcSignal {
+  fn from(value: RawNorthStarWebRtcSignal) -> Self {
+    Self {
+      signal_id: value.signal_id,
+      call_id: value.call_id,
+      user_handle: value.user_handle,
+      source: value.source,
+      target: value.target,
+      signal_kind: value.signal_kind,
+      payload_json: value.payload_json,
+      created_at: value.created_at,
     }
   }
 }
@@ -657,6 +698,73 @@ pub fn complete_call_turn(
     .send()?
     .error_for_status()?;
   Ok(())
+}
+
+pub fn send_desktop_webrtc_signal(
+  settings: &AppSettings,
+  call_id: &str,
+  signal_kind: &str,
+  payload_json: &str,
+) -> Result<(), AppError> {
+  if settings.north_star_device_token.trim().is_empty() {
+    return Err(AppError::Message("Bind the desktop to North Star first.".into()));
+  }
+  let trimmed_call_id = call_id.trim();
+  if trimmed_call_id.is_empty() {
+    return Err(AppError::Message("North Star call id is missing.".into()));
+  }
+  let trimmed_signal_kind = signal_kind.trim();
+  if trimmed_signal_kind.is_empty() {
+    return Err(AppError::Message("North Star signal kind is missing.".into()));
+  }
+  let trimmed_payload = payload_json.trim();
+  if trimmed_payload.is_empty() {
+    return Err(AppError::Message("North Star signal payload is empty.".into()));
+  }
+
+  client()
+    .post(format!(
+      "{}/api/companion/webrtc-signals/from-desktop",
+      endpoint(settings)?
+    ))
+    .json(&DesktopWebRtcSignalRequest {
+      device_token: settings.north_star_device_token.clone(),
+      call_id: trimmed_call_id.to_string(),
+      signal_kind: trimmed_signal_kind.to_string(),
+      payload_json: trimmed_payload.to_string(),
+    })
+    .send()?
+    .error_for_status()?;
+
+  Ok(())
+}
+
+pub fn pull_desktop_webrtc_signals(
+  settings: &AppSettings,
+  call_id: &str,
+) -> Result<Vec<NorthStarWebRtcSignal>, AppError> {
+  if settings.north_star_device_token.trim().is_empty() {
+    return Err(AppError::Message("Bind the desktop to North Star first.".into()));
+  }
+  let trimmed_call_id = call_id.trim();
+  if trimmed_call_id.is_empty() {
+    return Err(AppError::Message("North Star call id is missing.".into()));
+  }
+
+  let url = format!(
+    "{}/api/companion/webrtc-signals/desktop-pull?device_token={}&call_id={}",
+    endpoint(settings)?,
+    settings.north_star_device_token,
+    trimmed_call_id,
+  );
+
+  let response = client()
+    .get(url)
+    .send()?
+    .error_for_status()?
+    .json::<WebRtcSignalsResponse>()?;
+
+  Ok(response.signals.into_iter().map(Into::into).collect())
 }
 
 pub fn process_next_pending_turn<F>(

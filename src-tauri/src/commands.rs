@@ -9,7 +9,7 @@ use crate::{
     AppSettings, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompleteTelegramUserLoginInput, DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
     MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
-    SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot,
+    SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, SubmitFeedbackInput, UpdateMemoryItemInput,
     TelegramCallActionResult, TelegramCallTransportSnapshot, TelegramConnectionSnapshot, TelegramSendResult, TelegramUserActionResult, TelegramUserSnapshot, UpdatePlaceInput, UpdateRuleInput,
@@ -217,6 +217,82 @@ pub fn process_next_north_star_call_turn(
   }
 
   Ok(result)
+}
+
+#[tauri::command]
+pub fn process_north_star_live_turn(
+  state: State<'_, AppState>,
+  session_id: i64,
+  audio_base64: String,
+) -> Result<CallTurnResult, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let session_snapshot = db::call_session_snapshot(&state.db_path, Some(session_id))?;
+  let session = session_snapshot
+    .active_session
+    .ok_or_else(|| AppError::Message("There is no active North Star live call session.".into()))?;
+
+  if session.handoff_kind != "north_star_companion" {
+    return Err(AppError::Message("The active session is not a North Star call.".into()));
+  }
+
+  let input_audio = base64::engine::general_purpose::STANDARD
+    .decode(audio_base64.as_bytes())
+    .map_err(|caught| AppError::Message(format!("North Star live audio was invalid: {caught}")))?;
+
+  let session_context = format!(
+    "handoff kind: {}\nnotes: {}\noutcome so far: {}\ntranscript summary so far: {}\nrecent exchange:\n{}",
+    session.handoff_kind,
+    session.notes,
+    session.outcome,
+    session.transcript_summary,
+    db::build_call_turn_context(&state.db_path, session.id, 3)?,
+  );
+
+  let result = voice::run_uploaded_call_turn(
+    state.app_data_dir.as_ref().as_path(),
+    &settings,
+    &state.voice_worker,
+    session.id,
+    &input_audio,
+    &session_context,
+  )?;
+
+  db::save_call_turn(
+    &state.db_path,
+    session.id,
+    &result.transcript_text,
+    &result.reply_text,
+    &result.reply_mode,
+  )?;
+
+  state.push_event(format!("Processed a live North Star turn for session {}.", session.id));
+  Ok(result)
+}
+
+#[tauri::command]
+pub fn send_north_star_webrtc_signal(
+  state: State<'_, AppState>,
+  call_id: String,
+  signal_kind: String,
+  payload_json: String,
+) -> Result<(), AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  north_star::send_desktop_webrtc_signal(&settings, &call_id, &signal_kind, &payload_json)?;
+  state.push_event(format!(
+    "Queued North Star WebRTC signal '{}' for call {}.",
+    signal_kind,
+    call_id
+  ));
+  Ok(())
+}
+
+#[tauri::command]
+pub fn pull_north_star_webrtc_signals(
+  state: State<'_, AppState>,
+  call_id: String,
+) -> Result<Vec<NorthStarWebRtcSignal>, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  north_star::pull_desktop_webrtc_signals(&settings, &call_id)
 }
 
 #[tauri::command]

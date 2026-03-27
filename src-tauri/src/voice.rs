@@ -1,7 +1,8 @@
 use std::{
   fs,
+  io::{BufRead, BufReader, Write},
   path::{Path, PathBuf},
-  process::Command,
+  process::{Child, ChildStdin, ChildStdout, Command, Stdio},
   sync::Mutex,
 };
 
@@ -43,7 +44,11 @@ const DEFAULT_CALL_REPLY_PLAYFUL: &str = "Maybe just a croak or two.";
 const DEFAULT_CALL_REPLY_POSITIVE: &str = "That sounds really nice.";
 const DEFAULT_CALL_REPLY_MODEL_ISSUE: &str = "I had a little trouble responding just then. Can you say that again?";
 
-pub struct VoiceWorker;
+pub struct VoiceWorker {
+  child: Child,
+  stdin: ChildStdin,
+  stdout: BufReader<ChildStdout>,
+}
 
 #[derive(Debug, Clone)]
 struct VoicePaths {
@@ -125,8 +130,7 @@ pub fn prepare_python_runtime(
     return Err(AppError::Message(String::from_utf8_lossy(&output.stderr).trim().to_string()));
   }
   let mut guard = worker_slot.lock().map_err(|_| AppError::Message("Voice worker mutex was poisoned.".into()))?;
-  *guard = Some(VoiceWorker);
-  let _ = settings;
+  let _ = ensure_voice_worker(app_data_dir, settings, &mut guard)?;
   Ok(())
 }
 
@@ -250,10 +254,10 @@ pub fn run_uploaded_call_turn(
 pub fn synthesize_test_phrase(
   app_data_dir: &Path,
   settings: &AppSettings,
-  _worker_slot: &Mutex<Option<VoiceWorker>>,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
 ) -> Result<VoiceSynthesisResult, AppError> {
   let voice_name = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
-  let audio_bytes = synthesize_text_once(app_data_dir, settings, DEFAULT_TEST_PHRASE, voice_name)?;
+  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, DEFAULT_TEST_PHRASE, voice_name)?;
   let output_path = resolve_voice_paths(app_data_dir, settings)
     .previews_dir
     .join(format!("voice-preview-{}.wav", Utc::now().timestamp_millis()));
@@ -295,6 +299,10 @@ pub fn shutdown_speech_worker(speech_worker_slot: &Mutex<Option<SpeechStreamWork
 
 pub fn shutdown_worker(worker_slot: &Mutex<Option<VoiceWorker>>) {
   if let Ok(mut guard) = worker_slot.lock() {
+    if let Some(worker) = guard.as_mut() {
+      let _ = worker.child.kill();
+      let _ = worker.child.wait();
+    }
     *guard = None;
   }
 }
@@ -302,14 +310,17 @@ pub fn shutdown_worker(worker_slot: &Mutex<Option<VoiceWorker>>) {
 fn build_call_turn_result(
   app_data_dir: &Path,
   settings: &AppSettings,
-  _worker_slot: &Mutex<Option<VoiceWorker>>,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
   session_id: i64,
   transcript_text: &str,
   session_context: &str,
 ) -> Result<CallTurnResult, AppError> {
-  let (reply_text, reply_mode) = choose_call_reply(settings, session_context, transcript_text)?;
+  let repaired_transcript = repair_call_transcript(settings, session_context, transcript_text)?
+    .filter(|candidate| !candidate.is_empty())
+    .unwrap_or_else(|| transcript_text.to_string());
+  let (reply_text, reply_mode) = choose_call_reply(settings, session_context, &repaired_transcript)?;
   let reply_voice = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
-  let audio_bytes = synthesize_text_once(app_data_dir, settings, &reply_text, reply_voice)?;
+  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, &reply_text, reply_voice)?;
   let output_path = resolve_voice_paths(app_data_dir, settings)
     .previews_dir
     .join(format!("call-reply-{}-{}.wav", session_id, Utc::now().timestamp_millis()));
@@ -319,7 +330,7 @@ fn build_call_turn_result(
   fs::write(&output_path, &audio_bytes)?;
   Ok(CallTurnResult {
     session_id,
-    transcript_text: transcript_text.to_string(),
+    transcript_text: repaired_transcript,
     reply_text: reply_text.clone(),
     reply_mode,
     reply_voice: reply_voice.to_string(),
@@ -330,6 +341,101 @@ fn build_call_turn_result(
 }
 
 fn synthesize_text_once(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  text: &str,
+  voice_name: &str,
+) -> Result<Vec<u8>, AppError> {
+  let cleaned_text = sanitize_text(text);
+  if cleaned_text.is_empty() {
+    return Err(AppError::Message("Voice synthesis text is empty.".into()));
+  }
+  match synthesize_text_with_worker(app_data_dir, settings, worker_slot, &cleaned_text, voice_name) {
+    Ok(audio_bytes) => Ok(audio_bytes),
+    Err(_) => synthesize_text_one_shot(app_data_dir, settings, &cleaned_text, voice_name),
+  }
+}
+
+fn synthesize_text_with_worker(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  text: &str,
+  voice_name: &str,
+) -> Result<Vec<u8>, AppError> {
+  let request_line = serde_json::to_string(&json!({
+    "text": text,
+    "voice": voice_name,
+  }))?;
+
+  let mut last_error: Option<AppError> = None;
+  for _ in 0..2 {
+    let mut guard = worker_slot.lock().map_err(|_| AppError::Message("Voice worker mutex was poisoned.".into()))?;
+    match ensure_voice_worker(app_data_dir, settings, &mut guard) {
+      Ok(worker) => {
+        let mut should_reset = false;
+        let synthesis_result = {
+          if writeln!(worker.stdin, "{request_line}").is_err() || worker.stdin.flush().is_err() {
+            should_reset = true;
+            Err(AppError::Message("Voice worker stopped before synthesis completed.".into()))
+          } else {
+            let mut response_line = String::new();
+            match worker.stdout.read_line(&mut response_line) {
+              Ok(0) => {
+                should_reset = true;
+                Err(AppError::Message("Voice worker closed unexpectedly.".into()))
+              }
+              Ok(_) => {
+                let payload: Value = serde_json::from_str(response_line.trim())?;
+                if payload.get("ok").and_then(|value| value.as_bool()).unwrap_or(false) {
+                  let audio_base64 = payload
+                    .get("audio_base64")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| AppError::Message("Voice worker returned no audio.".into()))?;
+                  STANDARD
+                    .decode(audio_base64)
+                    .map_err(|error| AppError::Message(format!("Voice worker returned invalid audio: {error}")))
+                } else {
+                  should_reset = true;
+                  Err(AppError::Message(
+                    payload
+                      .get("error")
+                      .and_then(|value| value.as_str())
+                      .unwrap_or("Voice worker synthesis failed.")
+                      .to_string(),
+                  ))
+                }
+              }
+              Err(error) => {
+                should_reset = true;
+                Err(AppError::from(error))
+              }
+            }
+          }
+        };
+
+        if should_reset {
+          *guard = None;
+        }
+        match synthesis_result {
+          Ok(audio_bytes) => return Ok(audio_bytes),
+          Err(error) => {
+            last_error = Some(error);
+            continue;
+          }
+        }
+      }
+      Err(error) => {
+        last_error = Some(error);
+      }
+    }
+  }
+
+  Err(last_error.unwrap_or_else(|| AppError::Message("Voice worker could not synthesize audio.".into())))
+}
+
+fn synthesize_text_one_shot(
   app_data_dir: &Path,
   settings: &AppSettings,
   text: &str,
@@ -354,7 +460,7 @@ fn synthesize_text_once(
     .arg("--voice")
     .arg(voice_name)
     .arg("--text")
-    .arg(sanitize_text(text))
+    .arg(text)
     .arg("--output")
     .arg(&output_path)
     .output()?;
@@ -364,6 +470,76 @@ fn synthesize_text_once(
   let audio_bytes = fs::read(&output_path)?;
   let _ = fs::remove_file(&output_path);
   Ok(audio_bytes)
+}
+
+fn ensure_voice_worker<'a>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &'a mut Option<VoiceWorker>,
+) -> Result<&'a mut VoiceWorker, AppError> {
+  let worker_is_running = match worker_slot.as_mut() {
+    Some(worker) => worker.child.try_wait()?.is_none(),
+    None => false,
+  };
+  if worker_is_running {
+    return worker_slot
+      .as_mut()
+      .ok_or_else(|| AppError::Message("Voice worker disappeared unexpectedly.".into()));
+  }
+
+  *worker_slot = None;
+  let paths = resolve_voice_paths(app_data_dir, settings);
+  if !paths.model_path.exists() || !paths.voices_path.exists() {
+    return Err(AppError::Message("Kokoro model files are missing. Download them first in Settings > Voice.".into()));
+  }
+
+  let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3.".into()))?;
+  let script_path = ensure_python_script(app_data_dir)?;
+  let mut child = hidden_command(&python)
+    .arg(&script_path)
+    .arg("--worker")
+    .arg("--model")
+    .arg(&paths.model_path)
+    .arg("--voices")
+    .arg(&paths.voices_path)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+
+  let stdin = child
+    .stdin
+    .take()
+    .ok_or_else(|| AppError::Message("Voice worker did not expose stdin.".into()))?;
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| AppError::Message("Voice worker did not expose stdout.".into()))?;
+  let mut stdout = BufReader::new(stdout);
+  let mut ready_line = String::new();
+  let read_count = stdout.read_line(&mut ready_line)?;
+  if read_count == 0 {
+    return Err(AppError::Message("Voice worker did not start correctly.".into()));
+  }
+
+  let ready_payload: Value = serde_json::from_str(ready_line.trim())?;
+  let is_ready =
+    ready_payload.get("ok").and_then(|value| value.as_bool()).unwrap_or(false)
+      && ready_payload.get("status").and_then(|value| value.as_str()) == Some("ready");
+  if !is_ready {
+    return Err(AppError::Message(
+      ready_payload
+        .get("error")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Voice worker failed to initialize.")
+        .to_string(),
+    ));
+  }
+
+  *worker_slot = Some(VoiceWorker { child, stdin, stdout });
+  worker_slot
+    .as_mut()
+    .ok_or_else(|| AppError::Message("Voice worker was not available after startup.".into()))
 }
 
 fn choose_call_reply(
@@ -383,6 +559,33 @@ fn choose_call_reply(
   Ok((fallback_call_reply(transcript_text), "fallback".into()))
 }
 
+fn repair_call_transcript(
+  settings: &AppSettings,
+  session_context: &str,
+  transcript_text: &str,
+) -> Result<Option<String>, AppError> {
+  if settings.lm_studio_endpoint.trim().is_empty()
+    || settings.lm_studio_model.trim().is_empty()
+    || settings.lm_studio_api_key.trim().is_empty()
+  {
+    return Ok(None);
+  }
+
+  let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
+  let repair_prompt = format!(
+    "You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative, but when a garbled phrase is obviously close to a common real-world phrase, instrument, activity, place, or request, restore the intended wording.\n\nRecent call context:\n{session_context}\n\nRaw transcript:\n{transcript_text}\n\nReturn only the cleaned transcript."
+  );
+
+  request_call_reply(
+    settings,
+    &endpoint,
+    "Rewrite rough speech recognition into the speaker's likely intended words. Output transcript text only.",
+    &repair_prompt,
+    0.2,
+    80,
+  )
+}
+
 fn generate_call_reply(
   settings: &AppSettings,
   session_context: &str,
@@ -396,10 +599,10 @@ fn generate_call_reply(
   }
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
   let primary_prompt = format!(
-    "You are responding inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully instead of staying vague.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
+    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
   );
   let fallback_prompt = format!(
-    "Answer this live phone-call question directly in 2 or 3 natural spoken sentences. No analysis. No tags. No hidden reasoning.\n\nUser asked: {transcript_text}"
+    "Answer this live phone-call question directly in 2 or 3 natural spoken sentences. No analysis. No tags. No hidden reasoning. Do not mention being an AI.\n\nUser asked: {transcript_text}"
   );
   if let Some(reply) = request_call_reply(settings, &endpoint, "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning.", &primary_prompt, 0.45, 180)? {
     return Ok(Some(reply));

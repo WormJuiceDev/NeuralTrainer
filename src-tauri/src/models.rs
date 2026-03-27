@@ -155,6 +155,19 @@ pub struct NorthStarCallTurn {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NorthStarWebRtcSignal {
+  pub signal_id: String,
+  pub call_id: String,
+  pub user_handle: String,
+  pub source: String,
+  pub target: String,
+  pub signal_kind: String,
+  pub payload_json: String,
+  pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NorthStarSnapshot {
   pub configured: bool,
   pub session_ready: bool,

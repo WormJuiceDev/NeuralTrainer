@@ -1,4 +1,4 @@
-self.__NORTHSTAR_SW_VERSION = "northstar-sw-v15";
+self.__NORTHSTAR_SW_VERSION = "northstar-sw-v21";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
