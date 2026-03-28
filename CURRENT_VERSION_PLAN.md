@@ -8,7 +8,7 @@ It is the active build plan from here forward.
 
 ## Aim
 
-Take the already-working North Star live companion baseline and make it feel consistently natural, stable, and trustworthy in real use.
+Move the desktop from a debug-heavy workspace into a companion-first application shell that reflects the philosophy directly and gives manual context a first-class place to live.
 
 ## Baseline we are starting from
 
@@ -25,46 +25,51 @@ So this plan starts after the hard architecture work, not before it.
 
 ## Current version goals
 
-### Goal 1: Make calls shape future behavior
-
-We want calls to matter to the companion over time.
+### Goal 1: Companion-first desktop shell
 
 Work:
 
-- strengthen post-call review flow
-- strengthen local memory updates from calls
-- reinforce what felt right
-- soften what felt mistimed or intrusive
+- make `Home` the default opening experience
+- make `Context` the direct teaching surface
+- move technical and debug-heavy tools behind `Settings`
+- keep existing operational surfaces intact while changing the presentation
 
-### Goal 2: Define the next bridge into broader companion intelligence
-
-We want the working live-call system to feed the larger life-companion system, not remain a separate island.
+### Goal 2: Dedicated manual context model
 
 Work:
 
-- decide what should be retained from calls
-- decide what should count as meaningful memory
-- decide how call outcomes should shape later outreach and companion behavior
+- store companion context in a dedicated backend model
+- support manual entry by category
+- support edit, archive, and reorder
+- use that model as the source of truth for the new Home screen
+
+### Goal 3: Prepare the ground for deeper memory work
+
+Work:
+
+- finish the UI/data layer that expresses the companion philosophy clearly
+- then define how post-call and post-review memory should grow from there
+- then bridge that memory into broader companion intelligence
 
 ## Suggested working order
 
 ### Step 1
 
-Define post-call memory and review growth clearly.
+Ship the new `Home`, `Context`, and `Settings` shell with persistent manual companion context.
 
 ### Step 2
 
-Define how that memory should shape future companion behavior.
+Refine the context model and decide which additional categories or entry affordances are still needed.
 
 ### Step 3
 
-Continue broader companion intelligence after the live experience feels strong.
+Use that clearer foundation to define post-call memory and future behavior shaping.
 
 ## Not the focus right now
 
 - reintroducing Telegram
 - reviving Youniverse dependencies
-- adding dashboard complexity
+- returning to a debug-console opening experience
 - prompt refinement as an engineering roadmap item
 - broad assistant features unrelated to the companion goal
 

@@ -808,3 +808,99 @@ pub struct RunCallTurnInput {
   pub session_id: i64,
   pub duration_seconds: i64,
 }
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionContextCategory {
+  pub key: String,
+  pub label: String,
+  pub description: String,
+  pub icon: String,
+  pub display_order: i64,
+  pub is_system: bool,
+  pub is_deleted: bool,
+  pub deleted_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionContextEntry {
+  pub id: i64,
+  pub category_key: String,
+  pub title: String,
+  pub body: String,
+  pub tags: Vec<String>,
+  pub notes: String,
+  pub display_order: i64,
+  pub is_active: bool,
+  pub created_at: String,
+  pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionContextSection {
+  pub category: CompanionContextCategory,
+  pub entries: Vec<CompanionContextEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionContextSnapshot {
+  pub categories: Vec<CompanionContextSection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CompanionHomeSnapshot {
+  pub categories: Vec<CompanionContextSection>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCompanionContextEntryInput {
+  pub category_key: String,
+  pub title: String,
+  pub body: String,
+  pub tags: Vec<String>,
+  pub notes: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCompanionContextEntryInput {
+  pub id: i64,
+  pub title: String,
+  pub body: String,
+  pub tags: Vec<String>,
+  pub notes: String,
+  pub is_active: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderCompanionContextEntriesInput {
+  pub category_key: String,
+  pub entry_ids: Vec<i64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteCompanionContextCategoryInput {
+  pub category_key: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateCompanionContextCategoryInput {
+  pub label: String,
+  pub description: String,
+  pub icon: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCompanionContextCategoryIconInput {
+  pub category_key: String,
+  pub icon: String,
+}

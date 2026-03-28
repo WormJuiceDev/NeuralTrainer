@@ -6,11 +6,12 @@ use crate::{
   error::AppError,
   models::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
+    CompanionContextCategory, CompanionContextEntry, CompanionContextSnapshot, CompanionHomeSnapshot, CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput,
     DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
     MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
     NorthStarRuntimeSnapshot, SimulationSuiteResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
-    ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateMemoryItemInput,
+    ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateCompanionContextEntryInput, UpdateMemoryItemInput,
     UpdatePlaceInput, UpdateRuleInput,
   },
   north_star,
@@ -98,6 +99,96 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticStatus, A
     state.last_initialized_at.as_str(),
     state.events(),
   )
+}
+
+#[tauri::command]
+pub fn get_companion_context_snapshot(
+  state: State<'_, AppState>,
+) -> Result<CompanionContextSnapshot, AppError> {
+  db::companion_context_snapshot(&state.db_path)
+}
+
+#[tauri::command]
+pub fn get_companion_home_snapshot(
+  state: State<'_, AppState>,
+) -> Result<CompanionHomeSnapshot, AppError> {
+  db::companion_home_snapshot(&state.db_path)
+}
+
+#[tauri::command]
+pub fn create_companion_context_entry(
+  state: State<'_, AppState>,
+  payload: CreateCompanionContextEntryInput,
+) -> Result<CompanionContextEntry, AppError> {
+  let entry = db::create_companion_context_entry(&state.db_path, &payload)?;
+  state.push_event(format!(
+    "Added companion context entry '{}' to {}.",
+    entry.title, entry.category_key
+  ));
+  Ok(entry)
+}
+
+#[tauri::command]
+pub fn create_companion_context_category(
+  state: State<'_, AppState>,
+  payload: CreateCompanionContextCategoryInput,
+) -> Result<CompanionContextCategory, AppError> {
+  let category = db::create_companion_context_category(&state.db_path, &payload)?;
+  state.push_event(format!("Added companion context category '{}'.", category.label));
+  Ok(category)
+}
+
+#[tauri::command]
+pub fn update_companion_context_category_icon(
+  state: State<'_, AppState>,
+  payload: UpdateCompanionContextCategoryIconInput,
+) -> Result<CompanionContextCategory, AppError> {
+  let category = db::update_companion_context_category_icon(&state.db_path, &payload)?;
+  state.push_event(format!("Updated companion context category icon for '{}'.", category.label));
+  Ok(category)
+}
+
+#[tauri::command]
+pub fn update_companion_context_entry(
+  state: State<'_, AppState>,
+  payload: UpdateCompanionContextEntryInput,
+) -> Result<CompanionContextEntry, AppError> {
+  let entry = db::update_companion_context_entry(&state.db_path, &payload)?;
+  state.push_event(format!("Updated companion context entry '{}'.", entry.title));
+  Ok(entry)
+}
+
+#[tauri::command]
+pub fn archive_companion_context_entry(
+  state: State<'_, AppState>,
+  id: i64,
+) -> Result<CompanionContextEntry, AppError> {
+  let entry = db::archive_companion_context_entry(&state.db_path, id)?;
+  state.push_event(format!("Archived companion context entry '{}'.", entry.title));
+  Ok(entry)
+}
+
+#[tauri::command]
+pub fn reorder_companion_context_entries(
+  state: State<'_, AppState>,
+  payload: ReorderCompanionContextEntriesInput,
+) -> Result<CompanionContextSnapshot, AppError> {
+  let snapshot = db::reorder_companion_context_entries(&state.db_path, &payload)?;
+  state.push_event(format!(
+    "Reordered companion context entries for {}.",
+    payload.category_key
+  ));
+  Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn delete_companion_context_category(
+  state: State<'_, AppState>,
+  payload: DeleteCompanionContextCategoryInput,
+) -> Result<CompanionContextSnapshot, AppError> {
+  let snapshot = db::delete_companion_context_category(&state.db_path, &payload)?;
+  state.push_event(format!("Deleted companion context category '{}'.", payload.category_key));
+  Ok(snapshot)
 }
 
 #[tauri::command]

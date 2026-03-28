@@ -1,6 +1,24 @@
-import { FormEvent, memo, startTransition, useEffect, useRef, useState } from "react";
+import { FormEvent, memo, startTransition, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
+  BriefcaseBusiness,
+  Compass,
+  Gamepad2,
+  Heart,
+  Home,
+  MapPinned,
+  Music4,
+  PawPrint,
+  Sparkles,
+  Target,
+  Users,
+  UtensilsCrossed,
+} from "lucide-react";
+import humanoidFigure from "../Designs/Humanoid.png";
+import {
+  archiveCompanionContextEntry,
   bindNorthStarDesktop,
+  createCompanionContextCategory,
+  createCompanionContextEntry,
   createPlace,
   createReflection,
   createRule,
@@ -10,6 +28,8 @@ import {
   downloadKokoroAssets,
   endCallSession,
   getCallTurnsForSession,
+  getCompanionContextSnapshot,
+  getCompanionHomeSnapshot,
   getDecisionSnapshot,
   getDiagnostics,
   getCallSessionSnapshot,
@@ -52,6 +72,10 @@ import {
   synthesizeVoicePreview,
   pullNorthStarLocationEvents,
   pullNorthStarWebRtcSignals,
+  deleteCompanionContextCategory,
+  reorderCompanionContextEntries,
+  updateCompanionContextCategoryIcon,
+  updateCompanionContextEntry,
   updateMemoryItem,
   updatePlace,
   updateRule,
@@ -64,6 +88,12 @@ import type {
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
+  CompanionContextCategory,
+  CompanionContextEntry,
+  CompanionContextSnapshot,
+  CompanionHomeSnapshot,
+  CreateCompanionContextCategoryInput,
+  CreateCompanionContextEntryInput,
   CreatePlaceInput,
   CreateReflectionInput,
   CreateRuleInput,
@@ -82,11 +112,14 @@ import type {
   NorthStarRuntimeSnapshot,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
+  ReorderCompanionContextEntriesInput,
   SettingsEntry,
   SimulationRunResult,
   SimulationScenario,
   SimulationSuiteResult,
   SpeechStreamSnapshot,
+  UpdateCompanionContextEntryInput,
+  UpdateCompanionContextCategoryIconInput,
   UpdateMemoryItemInput,
   UpdatePlaceInput,
   UpdateRuleInput,
@@ -94,10 +127,10 @@ import type {
   VoiceSynthesisResult,
 } from "./types";
 
-type TabId = "settings" | "memory" | "context" | "judgment" | "review";
-type SettingsSectionId = "core" | "connections" | "voice" | "diagnostics";
+type TabId = "home" | "context" | "settings";
+type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth";
-type ContextSectionId = "ingest" | "timeline" | "patterns";
+type ContextSectionId = string;
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
 type ReviewSectionId = "places" | "rules" | "moments" | "calls";
 const defaultCallTranscriptCleanupPrompt = `You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.
@@ -464,12 +497,29 @@ function describeIceServerKinds(servers: RTCIceServer[]) {
 }
 
 const tabs: TabDefinition[] = [
-  { id: "settings", label: "Settings", eyebrow: "Phase 0", title: "System setup", description: "Connections, thresholds, and diagnostics." },
-  { id: "memory", label: "Memory", eyebrow: "Phase 1", title: "Manual memory foundation", description: "Places, rules, reflections, and memory overview." },
-  { id: "context", label: "Context", eyebrow: "Phase 2", title: "Passive context capture", description: "Raw events, visits, repeated places, and sleep inference." },
-  { id: "judgment", label: "Judgment", eyebrow: "Phases 3-6", title: "Moments and messaging", description: "Saved moments, rhythm, decisions, and draft outreach." },
-  { id: "review", label: "Review", eyebrow: "Phase 8", title: "Corrections and inspection", description: "Correct significance, rules, and inspect detail." },
+  { id: "home", label: "Home", eyebrow: "Companion", title: "Life context at a glance", description: "A person-centered map of what matters, what is active, and what still needs to be taught." },
+  { id: "context", label: "Context", eyebrow: "Manual Context", title: "Teach the companion directly", description: "Enter the people, places, values, and living details the companion should actually know." },
+  { id: "settings", label: "Settings", eyebrow: "System", title: "Runtime and legacy tools", description: "Keep the operational surfaces close at hand without making them the app's identity." },
 ];
+
+const companionCategoryIconOptions = [
+  { value: "spark", label: "Sparkles", icon: Sparkles },
+  { value: "users", label: "People", icon: Users },
+  { value: "family", label: "Family", icon: Heart },
+  { value: "map", label: "Places", icon: MapPinned },
+  { value: "briefcase", label: "Career", icon: BriefcaseBusiness },
+  { value: "home", label: "Home", icon: Home },
+  { value: "target", label: "Goals", icon: Target },
+  { value: "food", label: "Food", icon: UtensilsCrossed },
+  { value: "paw", label: "Pet", icon: PawPrint },
+  { value: "music", label: "Music", icon: Music4 },
+  { value: "compass", label: "Principles", icon: Compass },
+  { value: "heart", label: "Heart", icon: Gamepad2 },
+] as const;
+
+const companionCategoryIcons = Object.fromEntries(
+  companionCategoryIconOptions.map((option) => [option.value, option.icon]),
+) as Record<string, (props: { className?: string; strokeWidth?: number }) => ReactNode>;
 
 const defaultSettings: AppSettings = {
   timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
@@ -548,6 +598,138 @@ const defaultLocationEvent: LocationEventInput = {
   source: "manual_test",
 };
 
+const defaultCompanionContextEntry: CreateCompanionContextEntryInput = {
+  categoryKey: "friends",
+  title: "",
+  body: "",
+  tags: [],
+  notes: "",
+};
+
+const defaultCompanionContextCategory: CreateCompanionContextCategoryInput = {
+  label: "",
+  description: "",
+  icon: "spark",
+};
+
+function renderCompanionCategoryIcon(icon: string, className?: string) {
+  const Icon = companionCategoryIcons[icon] ?? companionCategoryIcons.spark;
+  return <Icon className={className} strokeWidth={1.8} />;
+}
+
+function normalizeCompanionAngle(angle: number) {
+  let normalized = angle;
+  while (normalized < -180) normalized += 360;
+  while (normalized > 180) normalized -= 360;
+  return normalized;
+}
+
+function buildCompanionMapLayout(
+  categories: CompanionHomeSnapshot["categories"],
+): Array<{ key: string; style: CSSProperties; connectorClass: string }> {
+  const placements: Array<{ key: string; style: CSSProperties; connectorClass: string }> = [];
+  const occupied: Array<{ left: number; top: number; width: number; height: number }> = [];
+  const count = Math.max(categories.length, 1);
+  const width = 18.5;
+  const height = 15;
+  const margin = 4;
+  const centerX = 50;
+  const centerY = 50;
+  const protectedCenterRadius = 24;
+  const cardHalfDiagonal = Math.sqrt((width / 2) ** 2 + (height / 2) ** 2);
+
+  const overlaps = (left: number, top: number) =>
+    occupied.some((rect) => {
+      const horizontalOverlap = Math.abs(rect.left - left) < (rect.width + width) / 2 + 1.2;
+      const verticalOverlap = Math.abs(rect.top - top) < (rect.height + height) / 2 + 1.2;
+      return horizontalOverlap && verticalOverlap;
+    });
+
+  const overlapsProtectedCenter = (left: number, top: number) =>
+    Math.hypot(left - centerX, top - centerY) < protectedCenterRadius + cardHalfDiagonal;
+
+  for (let index = 0; index < categories.length; index += 1) {
+    const baseAngle = -90 + (360 / count) * index;
+    let fallbackAngle = (baseAngle * Math.PI) / 180;
+    let fallbackRadiusX = 33;
+    let fallbackRadiusY = 31;
+    let chosenLeft = Math.min(
+      100 - width / 2 - margin,
+      Math.max(width / 2 + margin, centerX + Math.cos(fallbackAngle) * fallbackRadiusX),
+    );
+    let chosenTop = Math.min(
+      100 - height / 2 - margin,
+      Math.max(height / 2 + margin, centerY + Math.sin(fallbackAngle) * fallbackRadiusY),
+    );
+    let connectorClass = "connector-right";
+    let placed = false;
+
+    for (let radiusStep = 0; radiusStep < 10 && !placed; radiusStep += 1) {
+      const radiusX = 33 + radiusStep * 4.8;
+      const radiusY = 31 + radiusStep * 4.1;
+      const angleOffsets = [0, -8, 8, -16, 16, -24, 24, -32, 32, -40, 40, -52, 52];
+      fallbackRadiusX = radiusX;
+      fallbackRadiusY = radiusY;
+
+      for (const angleOffset of angleOffsets) {
+        const angle = (baseAngle + angleOffset) * (Math.PI / 180);
+        fallbackAngle = angle;
+        const left = Math.min(100 - width / 2 - margin, Math.max(width / 2 + margin, centerX + Math.cos(angle) * radiusX));
+        const top = Math.min(100 - height / 2 - margin, Math.max(height / 2 + margin, centerY + Math.sin(angle) * radiusY));
+        if (overlaps(left, top) || overlapsProtectedCenter(left, top)) {
+          continue;
+        }
+
+        const horizontalDelta = left - centerX;
+        const normalizedAngle = normalizeCompanionAngle(baseAngle + angleOffset);
+        connectorClass =
+          Math.abs(horizontalDelta) < 7 || Math.abs(normalizedAngle) > 145
+            ? "connector-none"
+            : horizontalDelta < 0
+              ? "connector-right"
+              : "connector-left";
+        chosenLeft = left;
+        chosenTop = top;
+        placed = true;
+        break;
+      }
+    }
+
+    if (!placed) {
+      const forcedRadius = Math.max(fallbackRadiusX, protectedCenterRadius + cardHalfDiagonal + 4);
+      const forcedRadiusY = Math.max(fallbackRadiusY, protectedCenterRadius + cardHalfDiagonal + 4);
+      chosenLeft = Math.min(
+        100 - width / 2 - margin,
+        Math.max(width / 2 + margin, centerX + Math.cos(fallbackAngle) * forcedRadius),
+      );
+      chosenTop = Math.min(
+        100 - height / 2 - margin,
+        Math.max(height / 2 + margin, centerY + Math.sin(fallbackAngle) * forcedRadiusY),
+      );
+      const horizontalDelta = chosenLeft - centerX;
+      const normalizedAngle = normalizeCompanionAngle((fallbackAngle * 180) / Math.PI);
+      connectorClass =
+        Math.abs(horizontalDelta) < 7 || Math.abs(normalizedAngle) > 145
+          ? "connector-none"
+          : horizontalDelta < 0
+            ? "connector-right"
+            : "connector-left";
+    }
+
+    occupied.push({ left: chosenLeft, top: chosenTop, width, height });
+    placements.push({
+      key: categories[index].category.key,
+      connectorClass,
+      style: {
+        left: `${chosenLeft}%`,
+        top: `${chosenTop}%`,
+      },
+    });
+  }
+
+  return placements;
+}
+
 function formatDuration(seconds: number) {
   if (seconds < 60) return `${seconds}s`;
   if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
@@ -556,6 +738,17 @@ function formatDuration(seconds: number) {
 
 function formatDateTime(value: string) {
   return new Date(value).toLocaleString();
+}
+
+function parseTagList(value: string) {
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter(Boolean);
+}
+
+function formatTagList(tags: string[]) {
+  return tags.join(", ");
 }
 
 function formatStatus(value: string) {
@@ -793,9 +986,11 @@ const SelectedMomentPanel = memo(function SelectedMomentPanel({
 });
 
 function App() {
-  const [activeTab, setActiveTab] = useState<TabId>("settings");
+  const [activeTab, setActiveTab] = useState<TabId>("home");
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
   const [savedRows, setSavedRows] = useState<SettingsEntry[]>([]);
+  const [companionContextSnapshot, setCompanionContextSnapshot] = useState<CompanionContextSnapshot | null>(null);
+  const [companionHomeSnapshot, setCompanionHomeSnapshot] = useState<CompanionHomeSnapshot | null>(null);
   const [snapshot, setSnapshot] = useState<PhaseOneSnapshot | null>(null);
   const [passiveSnapshot, setPassiveSnapshot] = useState<PassiveContextSnapshot | null>(null);
   const [phaseThreeSnapshot, setPhaseThreeSnapshot] = useState<PhaseThreeSnapshot | null>(null);
@@ -810,13 +1005,18 @@ function App() {
   const [simulationResult, setSimulationResult] = useState<SimulationRunResult | null>(null);
   const [simulationSuiteResult, setSimulationSuiteResult] = useState<SimulationSuiteResult | null>(null);
   const [memoryGrowthSummary, setMemoryGrowthSummary] = useState<string[]>([]);
+  const [companionCategoryForm, setCompanionCategoryForm] = useState<CreateCompanionContextCategoryInput>(defaultCompanionContextCategory);
+  const [selectedCategoryIcon, setSelectedCategoryIcon] = useState("spark");
+  const [companionContextForm, setCompanionContextForm] = useState<CreateCompanionContextEntryInput>(defaultCompanionContextEntry);
+  const [companionContextTagsInput, setCompanionContextTagsInput] = useState("");
+  const [editingCompanionContextEntryId, setEditingCompanionContextEntryId] = useState<number | null>(null);
   const [selectedMemoryItemId, setSelectedMemoryItemId] = useState<number | null>(null);
   const [selectedSavedMomentId, setSelectedSavedMomentId] = useState<number | null>(null);
   const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
   const [selectedCallSessionId, setSelectedCallSessionId] = useState<number | null>(null);
-  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("core");
+  const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("overview");
   const [memorySection, setMemorySection] = useState<MemorySectionId>("places");
-  const [contextSection, setContextSection] = useState<ContextSectionId>("ingest");
+  const [contextSection, setContextSection] = useState<ContextSectionId>("friends");
   const [judgmentSection, setJudgmentSection] = useState<JudgmentSectionId>("reality");
   const [reviewSection, setReviewSection] = useState<ReviewSectionId>("places");
   const [diagnostics, setDiagnostics] = useState<DiagnosticStatus | null>(null);
@@ -841,7 +1041,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [northStarLiveDiagnostics, setNorthStarLiveDiagnostics] = useState<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
@@ -912,6 +1112,20 @@ function App() {
     ?? callSessionSnapshot?.activeSession
     ?? callSessionSnapshot?.recentSessions[0]
     ?? null;
+  const companionCategories = companionContextSnapshot?.categories ?? [];
+  const companionCategoryTabs = companionCategories.map((section) => section.category);
+  const selectedCompanionSection =
+    companionCategories.find((section) => section.category.key === contextSection)
+    ?? companionCategories[0]
+    ?? null;
+  const homeMapLayout = buildCompanionMapLayout(companionHomeSnapshot?.categories ?? []);
+  const visibleCompanionCategoryCount = companionCategories.length;
+  const companionContextEntryCount =
+    companionContextSnapshot?.categories.reduce((sum, section) => sum + section.entries.length, 0)
+    ?? 0;
+  const populatedCompanionCategoryCount =
+    companionHomeSnapshot?.categories.filter((section) => section.entries.length > 0).length
+    ?? 0;
   const latestAcceptedNorthStarCall =
     northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
     ?? null;
@@ -2325,6 +2539,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   async function refreshDiagnostics() { setDiagnostics(await getDiagnostics()); }
+  async function refreshCompanionContextSnapshot() { setCompanionContextSnapshot(await getCompanionContextSnapshot()); }
+  async function refreshCompanionHomeSnapshot() { setCompanionHomeSnapshot(await getCompanionHomeSnapshot()); }
   async function refreshNorthStarSnapshot() { commitNorthStarSnapshot(await getNorthStarSnapshot()); }
   async function refreshNorthStarRuntimeSnapshot() { commitNorthStarRuntimeSnapshot(await getNorthStarRuntimeSnapshot()); }
   async function refreshVoiceSnapshot() { setVoiceSnapshot(await getVoiceSnapshot()); }
@@ -2341,9 +2557,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
     let active = true;
     async function bootstrap() {
       try {
-        const [loadedSettings, loadedDiagnostics, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot] = await Promise.all([
+        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot] = await Promise.all([
           loadSettings(),
           getDiagnostics(),
+          getCompanionContextSnapshot(),
+          getCompanionHomeSnapshot(),
           getNorthStarSnapshot(),
           getVoiceSnapshot(),
           getSpeechStreamSnapshot(),
@@ -2359,6 +2577,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
         if (!active) return;
         setSettings(withPromptDefaults(loadedSettings));
         setDiagnostics(loadedDiagnostics);
+        setCompanionContextSnapshot(loadedCompanionContextSnapshot);
+        setCompanionHomeSnapshot(loadedCompanionHomeSnapshot);
         commitNorthStarSnapshot(loadedNorthStarSnapshot);
         setVoiceSnapshot(loadedVoiceSnapshot);
         setSpeechStream(loadedSpeechStream);
@@ -2619,6 +2839,192 @@ async function playNorthStarReplyOverPeer(base64: string) {
     void loadSelectedCallTurns();
     return () => { active = false; };
   }, [selectedCallSession?.id]);
+
+  useEffect(() => {
+    setCompanionContextForm((current) => ({ ...current, categoryKey: contextSection }));
+  }, [contextSection]);
+
+  useEffect(() => {
+    if (!companionCategories.length) {
+      return;
+    }
+    const exists = companionCategories.some((section) => section.category.key === contextSection);
+    if (!exists) {
+      setContextSection(companionCategories[0].category.key);
+    }
+  }, [companionCategories, contextSection]);
+
+  useEffect(() => {
+    if (selectedCompanionSection) {
+      setSelectedCategoryIcon(selectedCompanionSection.category.icon || "spark");
+    }
+  }, [selectedCompanionSection?.category.key, selectedCompanionSection?.category.icon]);
+
+  function resetCompanionContextForm(categoryKey = contextSection) {
+    setEditingCompanionContextEntryId(null);
+    setCompanionContextForm({
+      ...defaultCompanionContextEntry,
+      categoryKey,
+    });
+    setCompanionContextTagsInput("");
+  }
+
+  function beginEditingCompanionContextEntry(entry: CompanionContextEntry) {
+    setEditingCompanionContextEntryId(entry.id);
+    setContextSection(entry.categoryKey as ContextSectionId);
+    setCompanionContextForm({
+      categoryKey: entry.categoryKey,
+      title: entry.title,
+      body: entry.body,
+      tags: entry.tags,
+      notes: entry.notes,
+    });
+    setCompanionContextTagsInput(formatTagList(entry.tags));
+  }
+
+  async function handleCompanionContextSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusyPanel(editingCompanionContextEntryId ? "companionContextUpdate" : "companionContextCreate");
+    setError("");
+    setMessage("");
+    try {
+      const payloadBase = {
+        ...companionContextForm,
+        categoryKey: contextSection,
+        title: companionContextForm.title.trim(),
+        body: companionContextForm.body.trim(),
+        tags: parseTagList(companionContextTagsInput),
+        notes: companionContextForm.notes.trim(),
+      };
+
+      if (editingCompanionContextEntryId) {
+        await updateCompanionContextEntry({
+          id: editingCompanionContextEntryId,
+          title: payloadBase.title,
+          body: payloadBase.body,
+          tags: payloadBase.tags,
+          notes: payloadBase.notes,
+          isActive: true,
+        });
+        setMessage("Companion context entry updated.");
+      } else {
+        await createCompanionContextEntry(payloadBase);
+        setMessage("Companion context entry added.");
+      }
+
+      await Promise.all([refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+      resetCompanionContextForm(contextSection);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleArchiveCompanionContextEntry(id: number) {
+    setBusyPanel("companionContextArchive");
+    setError("");
+    setMessage("");
+    try {
+      await archiveCompanionContextEntry(id);
+      await Promise.all([refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+      if (editingCompanionContextEntryId === id) {
+        resetCompanionContextForm(contextSection);
+      }
+      setMessage("Companion context entry archived.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function moveCompanionContextEntry(entryId: number, direction: -1 | 1) {
+    if (!selectedCompanionSection) {
+      return;
+    }
+    const orderedIds = selectedCompanionSection.entries.map((entry) => entry.id);
+    const currentIndex = orderedIds.indexOf(entryId);
+    const nextIndex = currentIndex + direction;
+    if (currentIndex < 0 || nextIndex < 0 || nextIndex >= orderedIds.length) {
+      return;
+    }
+    const reorderedIds = [...orderedIds];
+    const [moved] = reorderedIds.splice(currentIndex, 1);
+    reorderedIds.splice(nextIndex, 0, moved);
+
+    setBusyPanel("companionContextReorder");
+    setError("");
+    setMessage("");
+    try {
+      const snapshot = await reorderCompanionContextEntries({
+        categoryKey: selectedCompanionSection.category.key,
+        entryIds: reorderedIds,
+      });
+      setCompanionContextSnapshot(snapshot);
+      await refreshCompanionHomeSnapshot();
+      setMessage("Companion context order updated.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleDeleteCompanionCategory(categoryKey: ContextSectionId) {
+    setBusyPanel("companionCategoryDelete");
+    setError("");
+    setMessage("");
+    try {
+      const snapshot = await deleteCompanionContextCategory({ categoryKey });
+      setCompanionContextSnapshot(snapshot);
+      await refreshCompanionHomeSnapshot();
+      setContextSection(snapshot.categories[0]?.category.key ?? "friends");
+      resetCompanionContextForm(snapshot.categories[0]?.category.key ?? "friends");
+      setMessage("Category deleted from active companion context.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleUpdateCompanionCategoryIcon(payload: UpdateCompanionContextCategoryIconInput) {
+    setBusyPanel("companionCategoryUpdate");
+    setError("");
+    setMessage("");
+    try {
+      await updateCompanionContextCategoryIcon(payload);
+      await Promise.all([refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+      setMessage("Category icon updated.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleCompanionCategorySubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusyPanel("companionCategoryCreate");
+    setError("");
+    setMessage("");
+    try {
+      const category = await createCompanionContextCategory({
+        label: companionCategoryForm.label.trim(),
+        description: companionCategoryForm.description.trim(),
+        icon: companionCategoryForm.icon,
+      });
+      await Promise.all([refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+      setContextSection(category.key);
+      setCompanionCategoryForm(defaultCompanionContextCategory);
+      setMessage("Companion context category added.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
 
   async function handleSettingsSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -3345,8 +3751,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   function renderSectionTabs<T extends string>(
-    items: Array<{ id: T; label: string }>,
-    current: T,
+    items: Array<{ id: T; label: ReactNode }>,
+    current: T | string,
     onChange: (next: T) => void,
   ) {
     return (
@@ -3369,20 +3775,20 @@ async function playNorthStarReplyOverPeer(base64: string) {
     return (
       <div className="content-stack">
         {renderSectionTabs([
-          { id: "core", label: "Core settings" },
+          { id: "companion", label: "Companion" },
           { id: "connections", label: "Connections" },
           { id: "voice", label: "Voice" },
           { id: "diagnostics", label: "Diagnostics" },
         ], settingsSection, setSettingsSection)}
 
-        {(settingsSection === "core" || settingsSection === "connections" || settingsSection === "voice") ? (
+        {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "voice") ? (
           <section className="panel">
             <form className="settings-form" onSubmit={handleSettingsSubmit}>
-              {settingsSection === "core" ? (
+              {(settingsSection === "companion" || settingsSection === "core") ? (
                 <>
                   <div className="panel-header">
-                    <h2>Core settings</h2>
-                    <p>Timezone, quiet hours, and decision posture.</p>
+                    <h2>Companion settings</h2>
+                    <p>Quiet hours, baseline outreach posture, and the small system choices that shape how the companion behaves around you.</p>
                   </div>
                   <label><span>Timezone</span><input value={settings.timezone} onChange={(event) => setSettings((current) => ({ ...current, timezone: event.target.value }))} /></label>
                   <div className="split">
@@ -4321,61 +4727,400 @@ async function playNorthStarReplyOverPeer(base64: string) {
     );
   }
 
+  function renderHomeTab() {
+    const homeSections = companionHomeSnapshot?.categories ?? [];
+    return (
+      <div className="screen-stack">
+        <section className="screen-panel screen-panel-hero screen-panel-hero-compact">
+          <div className="screen-panel-copy">
+            <p className="eyebrow">Home</p>
+            <h2>Life context at a glance</h2>
+            <p>A literal context map of the life the companion is learning.</p>
+            </div>
+            <div className="screen-kpis">
+              <div className="screen-kpi"><span>Active categories</span><strong>{populatedCompanionCategoryCount}/{visibleCompanionCategoryCount}</strong></div>
+              <div className="screen-kpi"><span>Manual entries</span><strong>{companionContextEntryCount}</strong></div>
+              <div className="screen-kpi"><span>Saved moments</span><strong>{phaseThreeSnapshot?.savedMoments.length ?? 0}</strong></div>
+            </div>
+        </section>
+
+        <section className="panel companion-map-panel literal-shell-panel">
+          <div className="companion-map">
+            <div className="companion-map-orbit">
+              <div className="companion-map-grid" />
+                <div className="companion-map-figure">
+                  <img src={humanoidFigure} alt="Humanoid context anchor" className="companion-humanoid" />
+                </div>
+                {homeSections.map((section, index) => {
+                  const placement = homeMapLayout[index];
+                  const topEntry = section.entries[0] ?? null;
+                  return (
+                    <button
+                      key={section.category.key}
+                      type="button"
+                      className={`companion-map-card ${placement?.connectorClass ?? "connector-right"} ${section.entries.length ? "is-populated" : "is-empty"}`}
+                      style={placement?.style}
+                      onClick={() => {
+                        setContextSection(section.category.key as ContextSectionId);
+                        setActiveTab("context");
+                      }}
+                    >
+                      <span className="companion-map-label">
+                        <span className="companion-map-icon">{renderCompanionCategoryIcon(section.category.icon, "companion-map-icon-svg")}</span>
+                        {section.category.label}
+                      </span>
+                      {section.entries.length ? (
+                        <>
+                        <strong>{topEntry?.title}</strong>
+                        <p>{topEntry?.body}</p>
+                        {topEntry?.tags.length ? <div className="tag-row">{topEntry.tags.slice(0, 3).map((tag) => <span key={tag} className="tag-chip">{tag}</span>)}</div> : null}
+                        <span className="companion-map-meta">
+                          {section.entries.length === 1 ? "1 active entry" : `${section.entries.length} active entries`}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <strong>Still waiting to be taught</strong>
+                        <p>{section.category.description}</p>
+                        <span className="companion-map-meta">Add context manually</span>
+                      </>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
+  function renderCompanionContextTab() {
+    return (
+      <div className="screen-stack">
+          <section className="screen-panel screen-panel-hero">
+            <div className="panel-header">
+              <h2>Manual companion context</h2>
+              <p>Feed the exact life details the home map should reflect. This is the direct teaching surface behind the companion view.</p>
+            </div>
+              {renderSectionTabs(
+                companionCategoryTabs.map((category) => ({
+                  id: category.key,
+                    label: <span className="section-tab-label">{renderCompanionCategoryIcon(category.icon, "section-tab-icon")}<span>{category.label}</span></span>,
+                  })),
+                contextSection,
+                (next) => setContextSection(next as ContextSectionId),
+            )}
+          </section>
+
+          <div className="companion-context-layout">
+            <div className="companion-context-left-column">
+              <section className="panel literal-shell-panel companion-context-half">
+                <div className="panel-header">
+                  <h2 className="companion-category-heading">{selectedCompanionSection ? <><span className="companion-category-heading-icon">{renderCompanionCategoryIcon(selectedCompanionSection.category.icon, "companion-category-heading-icon-svg")}</span><span>{selectedCompanionSection.category.label}</span></> : "Context category"}</h2>
+                  <p>{selectedCompanionSection?.category.description ?? "Pick a category to begin."}</p>
+                </div>
+                {selectedCompanionSection ? (
+                  <div className="button-row category-visibility-row">
+                    <span className="status-pill muted">
+                      {selectedCompanionSection.category.isSystem ? "System category" : "Custom category"}
+                    </span>
+                    <label className="companion-icon-picker">
+                      <span>Icon</span>
+                      <select
+                        value={selectedCategoryIcon}
+                        onChange={(event) => setSelectedCategoryIcon(event.target.value)}
+                      >
+                        {companionCategoryIconOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void handleUpdateCompanionCategoryIcon({
+                        categoryKey: selectedCompanionSection.category.key,
+                        icon: selectedCategoryIcon,
+                      })}
+                      disabled={busyPanel === "companionCategoryUpdate" || selectedCategoryIcon === selectedCompanionSection.category.icon}
+                    >
+                      {busyPanel === "companionCategoryUpdate" ? "Saving icon..." : "Save icon"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost danger"
+                      onClick={() => void handleDeleteCompanionCategory(
+                        selectedCompanionSection.category.key as ContextSectionId,
+                      )}
+                      disabled={busyPanel === "companionCategoryDelete"}
+                    >
+                      {busyPanel === "companionCategoryDelete" ? "Deleting..." : "Delete category"}
+                    </button>
+                  </div>
+                ) : null}
+                <div className="companion-entry-list">
+                  {selectedCompanionSection?.entries.length ? selectedCompanionSection.entries.map((entry, index) => (
+                    <article key={entry.id} className={`companion-entry-card ${entry.isActive ? "" : "is-archived"}`}>
+                      <div className="companion-entry-card-header">
+                        <div>
+                          <h3>{entry.title}</h3>
+                          <p>{entry.body}</p>
+                        </div>
+                        <span className={`status-pill ${entry.isActive ? "" : "muted"}`}>{entry.isActive ? "Active" : "Archived"}</span>
+                      </div>
+                      {entry.tags.length ? (
+                        <div className="tag-row">
+                          {entry.tags.map((tag) => <span key={tag} className="tag-chip">{tag}</span>)}
+                        </div>
+                      ) : null}
+                      {entry.notes ? <p className="memory-explanation"><strong>Notes</strong><br />{entry.notes}</p> : null}
+                      <div className="button-row">
+                        <button type="button" className="ghost" onClick={() => beginEditingCompanionContextEntry(entry)}>Edit</button>
+                        <button type="button" className="ghost" onClick={() => void moveCompanionContextEntry(entry.id, -1)} disabled={busyPanel === "companionContextReorder" || index === 0}>Move up</button>
+                        <button type="button" className="ghost" onClick={() => void moveCompanionContextEntry(entry.id, 1)} disabled={busyPanel === "companionContextReorder" || index === selectedCompanionSection.entries.length - 1}>Move down</button>
+                        {entry.isActive ? (
+                          <button type="button" className="ghost danger" onClick={() => void handleArchiveCompanionContextEntry(entry.id)} disabled={busyPanel === "companionContextArchive"}>Archive</button>
+                        ) : null}
+                      </div>
+                    </article>
+                  )) : (
+                    <div className="empty-context-state">
+                      <h3>No entries here yet</h3>
+                      <p>This category is still empty. Add the first grounded detail you want the companion to hold onto.</p>
+                    </div>
+                  )}
+                </div>
+              </section>
+
+              <section className="panel literal-shell-panel companion-context-half">
+                <form className="settings-form companion-category-form" onSubmit={handleCompanionCategorySubmit}>
+                  <div className="panel-header">
+                    <h2>Add category</h2>
+                    <p>Create a new context lane for anything that matters in your life. New categories automatically become companion context and can appear on Home.</p>
+                  </div>
+                  <label>
+                    <span>Category name</span>
+                    <input
+                      value={companionCategoryForm.label}
+                      onChange={(event) => setCompanionCategoryForm((current) => ({ ...current, label: event.target.value }))}
+                      placeholder="Examples: Spiritual life, Health, Inner tensions"
+                    />
+                  </label>
+                  <label>
+                    <span>Description</span>
+                    <textarea
+                      rows={4}
+                      value={companionCategoryForm.description}
+                      onChange={(event) => setCompanionCategoryForm((current) => ({ ...current, description: event.target.value }))}
+                      placeholder="Describe what belongs in this category when you teach the companion."
+                    />
+                  </label>
+                  <label>
+                    <span>Icon</span>
+                    <select
+                      value={companionCategoryForm.icon}
+                      onChange={(event) => setCompanionCategoryForm((current) => ({ ...current, icon: event.target.value }))}
+                    >
+                        {companionCategoryIconOptions.map((option) => (
+                          <option key={option.value} value={option.value}>{option.label}</option>
+                        ))}
+                      </select>
+                  </label>
+                  <div className="button-row">
+                    <button type="submit" disabled={busyPanel === "companionCategoryCreate"}>
+                      {busyPanel === "companionCategoryCreate" ? "Adding..." : "Add category"}
+                    </button>
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => setCompanionCategoryForm(defaultCompanionContextCategory)}
+                    >
+                      Clear
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+
+            <section className="panel literal-shell-panel">
+              <form className="settings-form" onSubmit={handleCompanionContextSubmit}>
+                <div className="panel-header">
+                  <h2>{editingCompanionContextEntryId ? "Edit context entry" : "Add context entry"}</h2>
+                  <p>Write this in direct human terms. This is not a debug payload. It is how the companion learns the shape of your life.</p>
+                </div>
+                <label>
+                  <span>Category</span>
+                  <select value={contextSection} onChange={(event) => setContextSection(event.target.value as ContextSectionId)}>
+                    {companionCategoryTabs.map((category) => (
+                      <option key={category.key} value={category.key}>{category.label}</option>
+                    ))}
+                  </select>
+                </label>
+              <label>
+                <span>Title</span>
+                <input
+                  value={companionContextForm.title}
+                  onChange={(event) => setCompanionContextForm((current) => ({ ...current, title: event.target.value }))}
+                  placeholder="Short anchor for this context"
+                />
+              </label>
+              <label>
+                <span>Details</span>
+                <textarea
+                  rows={6}
+                  value={companionContextForm.body}
+                  onChange={(event) => setCompanionContextForm((current) => ({ ...current, body: event.target.value }))}
+                  placeholder="Describe the person, place, principle, taste, or part of life in grounded language."
+                />
+              </label>
+              <label>
+                <span>Tags</span>
+                <input
+                  value={companionContextTagsInput}
+                  onChange={(event) => setCompanionContextTagsInput(event.target.value)}
+                  placeholder="comma, separated, tags"
+                />
+              </label>
+              <label>
+                <span>Notes</span>
+                <textarea
+                  rows={4}
+                  value={companionContextForm.notes}
+                  onChange={(event) => setCompanionContextForm((current) => ({ ...current, notes: event.target.value }))}
+                  placeholder="Optional nuance, caveats, or background that still matters."
+                />
+              </label>
+                <div className="button-row">
+                  <button type="submit" disabled={busyPanel === "companionContextCreate" || busyPanel === "companionContextUpdate"}>
+                    {busyPanel === "companionContextUpdate"
+                    ? "Saving..."
+                    : busyPanel === "companionContextCreate"
+                      ? "Adding..."
+                      : editingCompanionContextEntryId
+                        ? "Save entry"
+                        : "Add entry"}
+                </button>
+                  <button type="button" className="ghost" onClick={() => resetCompanionContextForm(contextSection)}>Clear form</button>
+                </div>
+              </form>
+            </section>
+        </div>
+      </div>
+    );
+  }
+
+  function renderSettingsExperience() {
+    return (
+      <div className="screen-stack">
+        {renderSectionTabs([
+          { id: "overview", label: "Overview" },
+          { id: "companion", label: "Companion" },
+          { id: "connections", label: "Connections" },
+          { id: "voice", label: "Voice" },
+          { id: "memory", label: "Memory" },
+          { id: "passive", label: "Passive Context" },
+          { id: "judgment", label: "Judgment" },
+          { id: "review", label: "Review" },
+          { id: "diagnostics", label: "Diagnostics" },
+        ], settingsSection, setSettingsSection)}
+
+        {settingsSection === "overview" ? (
+          <div className="grid two-up">
+            <section className="panel literal-shell-panel">
+              <div className="panel-header">
+                <h2>Companion-first shell</h2>
+                <p>The home screen now carries the philosophy. The technical tools still exist, but they live here instead of defining the opening mood.</p>
+              </div>
+              <div className="saved-state">
+                <ul>
+                  <li><strong>Manual context entries</strong><code>{companionContextEntryCount}</code></li>
+                  <li><strong>Categories carrying active context</strong><code>{populatedCompanionCategoryCount}</code></li>
+                  <li><strong>Places in legacy memory</strong><code>{snapshot?.places.length ?? 0}</code></li>
+                  <li><strong>Saved moments</strong><code>{phaseThreeSnapshot?.savedMoments.length ?? 0}</code></li>
+                </ul>
+              </div>
+              <div className="button-row">
+                <button type="button" onClick={() => setActiveTab("home")}>Return to Home</button>
+                <button type="button" className="ghost" onClick={() => setActiveTab("context")}>Edit companion context</button>
+              </div>
+            </section>
+            <section className="panel literal-shell-panel">
+              <div className="panel-header">
+                <h2>Legacy workspace still intact</h2>
+                <p>Nothing operational was removed in this phase. These areas are just relocated under Settings so the app opens like a companion instead of a debug console.</p>
+              </div>
+              <div className="saved-state">
+                <ul>
+                  <li><strong>Memory</strong><code>places, rules, reflections, memory growth</code></li>
+                  <li><strong>Passive context</strong><code>events, visits, repeated places, sleep inference</code></li>
+                  <li><strong>Judgment</strong><code>moments, simulation, runtime, live calls</code></li>
+                  <li><strong>Review</strong><code>corrections, call inspection, saved-moment detail</code></li>
+                </ul>
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "voice" || settingsSection === "diagnostics"
+          ? renderSettingsTab()
+          : null}
+        {settingsSection === "memory" ? renderMemoryTab() : null}
+        {settingsSection === "passive" ? renderContextTab() : null}
+        {settingsSection === "judgment" ? renderJudgmentTab() : null}
+        {settingsSection === "review" ? renderReviewTab() : null}
+      </div>
+    );
+  }
+
   function renderActiveTab() {
     switch (activeTab) {
-      case "settings": return renderSettingsTab();
-      case "memory": return renderMemoryTab();
-      case "context": return renderContextTab();
-      case "judgment": return renderJudgmentTab();
-      case "review": return renderReviewTab();
+      case "home": return renderHomeTab();
+      case "context": return renderCompanionContextTab();
+      case "settings": return renderSettingsExperience();
       default: return null;
     }
   }
 
+  const profileLabel = settings.northStarDisplayName.trim() || "Companion Profile";
+
   return (
-    <main className="workspace-shell">
-      <section className="hero panel hero-panel">
-        <div>
-          <p className="eyebrow">MVP Build Workspace</p>
-          <h1>NeuralTrainer</h1>
-          <p className="lede">The app now tracks the checklist phases as a navigable workspace instead of a single vertical page, so it is easier to move between setup, memory, context, judgment, and review.</p>
-        </div>
-        <div className="hero-status">
-          <span className="status-pill">Windows app shell cleaned up</span>
-          <span className="status-pill">Phase-based navigation</span>
-          <span className="status-pill">SQLite-first MVP</span>
+    <main className="literal-app-shell">
+      <section className="literal-app-frame">
+        <header className="literal-topbar">
+          <div className="literal-brand">Neural Trainer</div>
+          <div className="literal-profile-name">{profileLabel}</div>
+        </header>
+
+        <div className="literal-body">
+          <aside className="literal-rail">
+            <nav className="literal-rail-nav" aria-label="Primary workspace sections">
+              {tabs.map((tab) => (
+                <button
+                  key={tab.id}
+                  type="button"
+                  className={tab.id === activeTab ? "literal-rail-item active" : "literal-rail-item"}
+                  onClick={() => setActiveTab(tab.id)}
+                >
+                  <span className="literal-rail-icon">{tab.id === "home" ? "HM" : tab.id === "context" ? "CX" : "ST"}</span>
+                  <span className="literal-rail-label">{tab.label}</span>
+                </button>
+              ))}
+            </nav>
+          </aside>
+
+          <section className="literal-main-stage">
+            {(message || error) ? (
+              <div className="literal-notice-stack">
+                {message ? <p className="notice success">{message}</p> : null}
+                {error ? <p className="notice error">{error}</p> : null}
+              </div>
+            ) : null}
+
+            {loading ? <section className="panel literal-shell-panel"><p>Loading workspace...</p></section> : renderActiveTab()}
+          </section>
         </div>
       </section>
-
-      <div className="workspace-layout">
-        <aside className="panel sidebar">
-          <div className="panel-header"><h2>Workspace</h2><p>Follow the docs by phase instead of scrolling through one page.</p></div>
-          <nav className="tab-list" aria-label="Primary workspace sections">
-            {tabs.map((tab) => (
-              <button key={tab.id} type="button" className={tab.id === activeTab ? "tab-button active" : "tab-button"} onClick={() => setActiveTab(tab.id)}>
-                <span className="tab-eyebrow">{tab.eyebrow}</span>
-                <span className="tab-label">{tab.label}</span>
-              </button>
-            ))}
-          </nav>
-          <div className="saved-state">
-            <h3>Quick counts</h3>
-            <ul>
-              <li><strong>Places</strong><code>{snapshot?.places.length ?? 0}</code></li>
-              <li><strong>Visits</strong><code>{passiveSnapshot?.visits.length ?? 0}</code></li>
-              <li><strong>Saved moments</strong><code>{phaseThreeSnapshot?.savedMoments.length ?? 0}</code></li>
-              <li><strong>Calls</strong><code>{callSessionSnapshot?.recentSessions.length ?? 0}</code></li>
-            </ul>
-          </div>
-        </aside>
-
-        <section className="workspace-main">
-          {message ? <p className="notice success">{message}</p> : null}
-          {error ? <p className="notice error">{error}</p> : null}
-          <section className="panel tab-intro"><p className="eyebrow">{activeTabMeta.eyebrow}</p><h2>{activeTabMeta.title}</h2><p>{activeTabMeta.description}</p></section>
-          {loading ? <section className="panel"><p>Loading workspace...</p></section> : renderActiveTab()}
-        </section>
-      </div>
     </main>
   );
 }

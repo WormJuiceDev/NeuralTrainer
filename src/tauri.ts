@@ -5,6 +5,12 @@ import type {
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
+  CompanionContextEntry,
+  CompanionContextSnapshot,
+  CompanionHomeSnapshot,
+  CompanionContextCategory,
+  CreateCompanionContextCategoryInput,
+  CreateCompanionContextEntryInput,
   CreatePlaceInput,
   CreateReflectionInput,
   CreateRuleInput,
@@ -29,6 +35,8 @@ import type {
   StartSpeechStreamInput,
   StopSpeechStreamInput,
   PushSpeechStreamAudioInput,
+  ReorderCompanionContextEntriesInput,
+  DeleteCompanionContextCategoryInput,
   VoiceSnapshot,
   VoiceSynthesisResult,
   PassiveContextSnapshot,
@@ -40,6 +48,8 @@ import type {
   RunCallTurnInput,
   SettingsEntry,
   StartCallSessionInput,
+  UpdateCompanionContextEntryInput,
+  UpdateCompanionContextCategoryIconInput,
   UpdateMemoryItemInput,
   UpdatePlaceInput,
   UpdateRuleInput,
@@ -51,6 +61,33 @@ export const saveSettings = (settings: AppSettings) =>
   invoke<SettingsEntry[]>("save_settings", { payload: settings });
 
 export const getDiagnostics = () => invoke<DiagnosticStatus>("get_diagnostics");
+
+export const getCompanionContextSnapshot = () =>
+  invoke<CompanionContextSnapshot>("get_companion_context_snapshot");
+
+export const getCompanionHomeSnapshot = () =>
+  invoke<CompanionHomeSnapshot>("get_companion_home_snapshot");
+
+export const createCompanionContextCategory = (payload: CreateCompanionContextCategoryInput) =>
+  invoke<CompanionContextCategory>("create_companion_context_category", { payload });
+
+export const updateCompanionContextCategoryIcon = (payload: UpdateCompanionContextCategoryIconInput) =>
+  invoke<CompanionContextCategory>("update_companion_context_category_icon", { payload });
+
+export const createCompanionContextEntry = (payload: CreateCompanionContextEntryInput) =>
+  invoke<CompanionContextEntry>("create_companion_context_entry", { payload });
+
+export const updateCompanionContextEntry = (payload: UpdateCompanionContextEntryInput) =>
+  invoke<CompanionContextEntry>("update_companion_context_entry", { payload });
+
+export const archiveCompanionContextEntry = (id: number) =>
+  invoke<CompanionContextEntry>("archive_companion_context_entry", { id });
+
+export const reorderCompanionContextEntries = (payload: ReorderCompanionContextEntriesInput) =>
+  invoke<CompanionContextSnapshot>("reorder_companion_context_entries", { payload });
+
+export const deleteCompanionContextCategory = (payload: DeleteCompanionContextCategoryInput) =>
+  invoke<CompanionContextSnapshot>("delete_companion_context_category", { payload });
 
 export const getNorthStarSnapshot = () =>
   invoke<NorthStarSnapshot>("get_north_star_snapshot");

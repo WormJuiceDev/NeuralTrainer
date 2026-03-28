@@ -46,22 +46,29 @@ The project is no longer in an early buildout phase.
 The current stage is:
 
 - working live companion baseline
-- active quality and naturalness refinement
-- active memory and post-call growth refinement
+- active companion-first desktop UI and manual context phase
+- active preparation for deeper memory and post-call growth refinement
 
-The main work now is making the real system feel better, more trustworthy, and more human.
+The main work now is making the desktop reflect the philosophy clearly before the next memory/intelligence step is defined.
 
 ## Next
 
 These are the next priorities:
 
-### 1. Memory and review growth
+### 1. Companion-first UI and context data
+
+- Home as the default opening surface
+- Context as the manual teaching surface
+- Settings as the place for technical/runtime/debug-heavy tools
+- a dedicated manual context model for the person-centered Home screen
+
+### 2. Memory and review growth
 
 - strengthen post-call review integration
 - improve local memory shaping from good and bad calls
 - make the companion learn more clearly from lived interaction
 
-### 2. Broader companion intelligence
+### 3. Broader companion intelligence
 
 - meaningful context detection
 - saved moments

@@ -605,3 +605,77 @@ export type RunCallTurnInput = {
   sessionId: number;
   durationSeconds: number;
 };
+
+export type CompanionContextCategory = {
+  key: string;
+  label: string;
+  description: string;
+  icon: string;
+  displayOrder: number;
+  isSystem: boolean;
+  isDeleted: boolean;
+  deletedAt: string | null;
+};
+
+export type CompanionContextEntry = {
+  id: number;
+  categoryKey: string;
+  title: string;
+  body: string;
+  tags: string[];
+  notes: string;
+  displayOrder: number;
+  isActive: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type CompanionContextSection = {
+  category: CompanionContextCategory;
+  entries: CompanionContextEntry[];
+};
+
+export type CompanionContextSnapshot = {
+  categories: CompanionContextSection[];
+};
+
+export type CompanionHomeSnapshot = {
+  categories: CompanionContextSection[];
+};
+
+export type CreateCompanionContextEntryInput = {
+  categoryKey: string;
+  title: string;
+  body: string;
+  tags: string[];
+  notes: string;
+};
+
+export type CreateCompanionContextCategoryInput = {
+  label: string;
+  description: string;
+  icon: string;
+};
+
+export type UpdateCompanionContextCategoryIconInput = {
+  categoryKey: string;
+  icon: string;
+};
+
+export type UpdateCompanionContextEntryInput = {
+  id: number;
+  title: string;
+  body: string;
+  tags: string[];
+  notes: string;
+  isActive: boolean;
+};
+
+export type ReorderCompanionContextEntriesInput = {
+  categoryKey: string;
+  entryIds: number[];
+};
+
+export type DeleteCompanionContextCategoryInput = {
+  categoryKey: string;
+};

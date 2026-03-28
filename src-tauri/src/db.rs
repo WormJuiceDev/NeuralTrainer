@@ -9,6 +9,8 @@ use crate::{
   error::AppError,
   models::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DecisionRunResult,
+    CompanionContextCategory, CompanionContextEntry, CompanionContextSection, CompanionContextSnapshot, CompanionHomeSnapshot,
+    CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput, UpdateCompanionContextEntryInput,
     DecisionSnapshot, DiagnosticStatus, EndCallSessionInput, InboundMessage, InferredSleepWindow,
     LocationEventInput, ManualReflection, MemoryOverview, MomentDecision, OutreachEvent,
     MemoryGrowthSnapshot, MemoryItem, OutreachFeedback, PassiveContextSnapshot, PhaseOneSnapshot, PhaseThreeSnapshot, Place,
@@ -20,7 +22,21 @@ use crate::{
   },
 };
 
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 13;
+
+const COMPANION_CONTEXT_CATEGORY_DEFS: [(&str, &str, &str, &str); 11] = [
+    ("friends", "Friends", "The people you lean toward, miss, trust, or feel alive around.", "users"),
+    ("family", "Family", "Family ties, emotional anchors, and the people whose presence shapes your life.", "family"),
+    ("favorite_places", "Favorite Places", "Places that feel meaningful, alive, restorative, familiar, or important.", "map"),
+    ("career", "Career", "Work identity, responsibilities, ambitions, and the shape your work life takes.", "briefcase"),
+    ("home_location", "Home Location", "What home means, where it is, and what the space represents in daily life.", "home"),
+    ("goals", "Goals", "What you are reaching toward right now, whether practical, personal, or long-term.", "target"),
+    ("favorite_food", "Favorite Food", "Comfort foods, rituals, cravings, or things that genuinely feel like you.", "food"),
+    ("hobbies", "Hobbies", "Activities, crafts, interests, and the ways you naturally spend attention and time.", "spark"),
+    ("pet", "Pet", "Animals, companions, routines, and emotional bonds that matter in day-to-day life.", "paw"),
+    ("life_principles", "Life Principles", "Values, lines you do not want to cross, and truths you try to live by.", "compass"),
+    ("music", "Music", "Artists, sounds, moods, or songs that carry identity, memory, and feeling.", "music"),
+  ];
 
 pub fn init_storage() -> Result<(PathBuf, PathBuf, String), AppError> {
   let base_dir = dirs::data_local_dir().ok_or(AppError::MissingAppDataDir)?;
@@ -329,6 +345,493 @@ pub fn diagnostics(
     last_initialized_at: last_initialized_at.to_string(),
     recent_events,
   })
+}
+
+fn slugify_companion_context_label(label: &str) -> String {
+  let mut slug = String::new();
+  let mut last_was_separator = false;
+  for ch in label.chars() {
+    if ch.is_ascii_alphanumeric() {
+      slug.push(ch.to_ascii_lowercase());
+      last_was_separator = false;
+    } else if !last_was_separator {
+      slug.push('_');
+      last_was_separator = true;
+    }
+  }
+  slug.trim_matches('_').to_string()
+}
+
+fn table_columns(connection: &Connection, table_name: &str) -> Result<Vec<String>, AppError> {
+  let pragma = format!("PRAGMA table_info({table_name})");
+  let mut statement = connection.prepare(&pragma)?;
+  let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn companion_context_category_exists(connection: &Connection, category_key: &str) -> Result<bool, AppError> {
+  let count: i64 = connection.query_row(
+    "SELECT COUNT(*) FROM companion_context_categories WHERE key = ?1",
+    params![category_key],
+    |row| row.get(0),
+  )?;
+
+  let category_columns = table_columns(connection, "companion_context_categories")?;
+  if !category_columns.iter().any(|column| column == "icon") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN icon TEXT NOT NULL DEFAULT 'spark'",
+      [],
+    )?;
+  }
+  if !category_columns.iter().any(|column| column == "is_deleted") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+      [],
+    )?;
+  }
+  if !category_columns.iter().any(|column| column == "deleted_at") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN deleted_at TEXT",
+      [],
+    )?;
+  }
+
+  let entry_columns = table_columns(connection, "companion_context_entries")?;
+  if !entry_columns.iter().any(|column| column == "deleted_at") {
+    connection.execute(
+      "ALTER TABLE companion_context_entries ADD COLUMN deleted_at TEXT",
+      [],
+    )?;
+  }
+  Ok(count > 0)
+}
+
+fn is_valid_companion_context_category(connection: &Connection, category_key: &str) -> Result<bool, AppError> {
+  let count: i64 = connection.query_row(
+    "SELECT COUNT(*) FROM companion_context_categories WHERE key = ?1 AND is_deleted = 0",
+    params![category_key],
+    |row| row.get(0),
+  )?;
+  Ok(count > 0)
+}
+
+fn row_to_companion_context_entry(row: &rusqlite::Row<'_>) -> Result<CompanionContextEntry, rusqlite::Error> {
+  let tags_json: String = row.get("tags_json")?;
+  Ok(CompanionContextEntry {
+    id: row.get("id")?,
+    category_key: row.get("category_key")?,
+    title: row.get("title")?,
+    body: row.get("body")?,
+    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+    notes: row.get("notes")?,
+    display_order: row.get("display_order")?,
+    is_active: row.get("is_active")?,
+    created_at: row.get("created_at")?,
+    updated_at: row.get("updated_at")?,
+  })
+}
+
+fn list_companion_context_entries(connection: &Connection) -> Result<Vec<CompanionContextEntry>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        category_key,
+        title,
+        body,
+        tags_json,
+        notes,
+        display_order,
+        is_active,
+        created_at,
+        updated_at
+      FROM companion_context_entries
+      ORDER BY category_key ASC, display_order ASC, updated_at DESC, id DESC
+    "#,
+  )?;
+  let rows = statement.query_map([], row_to_companion_context_entry)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn build_companion_context_snapshot_with_filter(
+  connection: &Connection,
+  active_only: bool,
+) -> Result<Vec<CompanionContextSection>, AppError> {
+  let entries = list_companion_context_entries(connection)?;
+  let categories = companion_context_categories_with_visibility(connection)?;
+  Ok(
+      categories
+        .into_iter()
+        .filter(|category| !category.is_deleted)
+        .map(|category| {
+          let filtered_entries = entries
+            .iter()
+          .filter(|entry| entry.category_key == category.key && (!active_only || entry.is_active))
+          .cloned()
+          .collect::<Vec<_>>();
+        CompanionContextSection {
+          category,
+          entries: filtered_entries,
+        }
+      })
+      .collect(),
+  )
+}
+
+fn companion_context_categories_with_visibility(connection: &Connection) -> Result<Vec<CompanionContextCategory>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        key,
+        label,
+        description,
+        icon,
+        display_order,
+        is_system,
+        is_deleted,
+        deleted_at
+      FROM companion_context_categories
+      ORDER BY display_order ASC, key ASC
+    "#,
+  )?;
+  let rows = statement.query_map([], |row| {
+    Ok(CompanionContextCategory {
+      key: row.get("key")?,
+      label: row.get("label")?,
+      description: row.get("description")?,
+      icon: row.get("icon")?,
+      display_order: row.get("display_order")?,
+      is_system: row.get("is_system")?,
+      is_deleted: row.get("is_deleted")?,
+      deleted_at: row.get("deleted_at")?,
+    })
+  })?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn get_companion_context_entry_by_id(
+  connection: &Connection,
+  id: i64,
+) -> Result<CompanionContextEntry, AppError> {
+  connection.query_row(
+    r#"
+      SELECT
+        id,
+        category_key,
+        title,
+        body,
+        tags_json,
+        notes,
+        display_order,
+        is_active,
+        created_at,
+        updated_at
+      FROM companion_context_entries
+      WHERE id = ?1
+    "#,
+    params![id],
+    row_to_companion_context_entry,
+  ).map_err(AppError::from)
+}
+
+pub fn companion_context_snapshot(db_path: &PathBuf) -> Result<CompanionContextSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  Ok(CompanionContextSnapshot {
+    categories: build_companion_context_snapshot_with_filter(&connection, false)?,
+  })
+}
+
+pub fn companion_home_snapshot(db_path: &PathBuf) -> Result<CompanionHomeSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  Ok(CompanionHomeSnapshot {
+    categories: build_companion_context_snapshot_with_filter(&connection, true)?,
+  })
+}
+
+pub fn create_companion_context_entry(
+  db_path: &PathBuf,
+  payload: &CreateCompanionContextEntryInput,
+) -> Result<CompanionContextEntry, AppError> {
+  let connection = Connection::open(db_path)?;
+  if !is_valid_companion_context_category(&connection, &payload.category_key)? {
+    return Err(AppError::Message(format!(
+      "Unknown companion context category '{}'.",
+      payload.category_key
+    )));
+  }
+  let timestamp = Utc::now().to_rfc3339();
+  let display_order = connection.query_row(
+    "SELECT COALESCE(MAX(display_order) + 1, 0) FROM companion_context_entries WHERE category_key = ?1",
+    params![payload.category_key],
+    |row| row.get::<_, i64>(0),
+  )?;
+
+  connection.execute(
+    r#"
+      INSERT INTO companion_context_entries (
+        category_key,
+        title,
+        body,
+        tags_json,
+        notes,
+        display_order,
+        is_active,
+        created_at,
+        updated_at
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8)
+    "#,
+    params![
+      payload.category_key,
+      payload.title.trim(),
+      payload.body.trim(),
+      serde_json::to_string(&payload.tags)?,
+      payload.notes.trim(),
+      display_order,
+      timestamp,
+      timestamp,
+    ],
+  )?;
+
+  get_companion_context_entry_by_id(&connection, connection.last_insert_rowid())
+}
+
+pub fn update_companion_context_entry(
+  db_path: &PathBuf,
+  payload: &UpdateCompanionContextEntryInput,
+) -> Result<CompanionContextEntry, AppError> {
+  let connection = Connection::open(db_path)?;
+  connection.execute(
+    r#"
+      UPDATE companion_context_entries
+      SET title = ?2,
+          body = ?3,
+          tags_json = ?4,
+          notes = ?5,
+          is_active = ?6,
+          updated_at = ?7
+      WHERE id = ?1
+    "#,
+    params![
+      payload.id,
+      payload.title.trim(),
+      payload.body.trim(),
+      serde_json::to_string(&payload.tags)?,
+      payload.notes.trim(),
+      payload.is_active,
+      Utc::now().to_rfc3339(),
+    ],
+  )?;
+  get_companion_context_entry_by_id(&connection, payload.id)
+}
+
+pub fn archive_companion_context_entry(
+  db_path: &PathBuf,
+  id: i64,
+) -> Result<CompanionContextEntry, AppError> {
+  let connection = Connection::open(db_path)?;
+  connection.execute(
+    r#"
+      UPDATE companion_context_entries
+      SET is_active = 0,
+          updated_at = ?2
+      WHERE id = ?1
+    "#,
+    params![id, Utc::now().to_rfc3339()],
+  )?;
+  get_companion_context_entry_by_id(&connection, id)
+}
+
+pub fn reorder_companion_context_entries(
+  db_path: &PathBuf,
+  payload: &ReorderCompanionContextEntriesInput,
+) -> Result<CompanionContextSnapshot, AppError> {
+  let mut connection = Connection::open(db_path)?;
+  if !is_valid_companion_context_category(&connection, &payload.category_key)? {
+    return Err(AppError::Message(format!(
+      "Unknown companion context category '{}'.",
+      payload.category_key
+    )));
+  }
+  let transaction = connection.transaction()?;
+  let updated_at = Utc::now().to_rfc3339();
+
+  for (index, entry_id) in payload.entry_ids.iter().enumerate() {
+    transaction.execute(
+      r#"
+        UPDATE companion_context_entries
+        SET display_order = ?3,
+            updated_at = ?4
+        WHERE id = ?1 AND category_key = ?2
+      "#,
+      params![entry_id, payload.category_key, index as i64, updated_at],
+    )?;
+  }
+
+  transaction.commit()?;
+  companion_context_snapshot(db_path)
+}
+
+pub fn delete_companion_context_category(
+  db_path: &PathBuf,
+  payload: &DeleteCompanionContextCategoryInput,
+) -> Result<CompanionContextSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  if !is_valid_companion_context_category(&connection, &payload.category_key)? {
+    return Err(AppError::Message(format!(
+      "Unknown companion context category '{}'.",
+      payload.category_key
+    )));
+  }
+  let timestamp = Utc::now().to_rfc3339();
+  connection.execute(
+    r#"
+      UPDATE companion_context_categories
+      SET is_deleted = 1,
+          deleted_at = ?2,
+          updated_at = ?2
+      WHERE key = ?1
+    "#,
+    params![payload.category_key, timestamp],
+  )?;
+  connection.execute(
+    r#"
+      UPDATE companion_context_entries
+      SET is_active = 0,
+          deleted_at = ?2,
+          updated_at = ?2
+      WHERE category_key = ?1
+    "#,
+    params![payload.category_key, timestamp],
+  )?;
+
+  companion_context_snapshot(db_path)
+}
+
+pub fn create_companion_context_category(
+  db_path: &PathBuf,
+  payload: &CreateCompanionContextCategoryInput,
+) -> Result<CompanionContextCategory, AppError> {
+  let connection = Connection::open(db_path)?;
+  let timestamp = Utc::now().to_rfc3339();
+  let base_key = slugify_companion_context_label(payload.label.trim());
+  let icon = if payload.icon.trim().is_empty() {
+    "spark"
+  } else {
+    payload.icon.trim()
+  };
+  if base_key.is_empty() {
+    return Err(AppError::Message("Category label needs at least one letter or number.".into()));
+  }
+
+  let mut key = base_key.clone();
+  let mut suffix = 2;
+  while companion_context_category_exists(&connection, &key)? {
+    key = format!("{base_key}_{suffix}");
+    suffix += 1;
+  }
+
+  let display_order = connection.query_row(
+    "SELECT COALESCE(MAX(display_order) + 1, 0) FROM companion_context_categories",
+    [],
+    |row| row.get::<_, i64>(0),
+  )?;
+
+  connection.execute(
+    r#"
+        INSERT INTO companion_context_categories (
+          key,
+          label,
+          description,
+          icon,
+          display_order,
+          is_system,
+          is_deleted,
+          deleted_at,
+          created_at,
+          updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, NULL, ?6, ?7)
+      "#,
+      params![
+        key,
+        payload.label.trim(),
+        payload.description.trim(),
+        icon,
+        display_order,
+        timestamp,
+        timestamp,
+    ],
+  )?;
+
+  connection.query_row(
+    r#"
+        SELECT key, label, description, icon, display_order, is_system, is_deleted, deleted_at
+        FROM companion_context_categories
+        WHERE key = ?1
+      "#,
+      params![key],
+      |row| {
+        Ok(CompanionContextCategory {
+          key: row.get("key")?,
+          label: row.get("label")?,
+          description: row.get("description")?,
+          icon: row.get("icon")?,
+          display_order: row.get("display_order")?,
+          is_system: row.get("is_system")?,
+          is_deleted: row.get("is_deleted")?,
+          deleted_at: row.get("deleted_at")?,
+        })
+      },
+  ).map_err(AppError::from)
+}
+
+pub fn update_companion_context_category_icon(
+  db_path: &PathBuf,
+  payload: &UpdateCompanionContextCategoryIconInput,
+) -> Result<CompanionContextCategory, AppError> {
+  let connection = Connection::open(db_path)?;
+  if !is_valid_companion_context_category(&connection, &payload.category_key)? {
+    return Err(AppError::Message(format!(
+      "Unknown companion context category '{}'.",
+      payload.category_key
+    )));
+  }
+
+  let icon = if payload.icon.trim().is_empty() {
+    "spark"
+  } else {
+    payload.icon.trim()
+  };
+
+  connection.execute(
+    r#"
+      UPDATE companion_context_categories
+      SET icon = ?2,
+          updated_at = ?3
+      WHERE key = ?1
+    "#,
+    params![payload.category_key, icon, Utc::now().to_rfc3339()],
+  )?;
+
+  connection.query_row(
+    r#"
+      SELECT key, label, description, icon, display_order, is_system, is_deleted, deleted_at
+      FROM companion_context_categories
+      WHERE key = ?1
+    "#,
+    params![payload.category_key],
+    |row| {
+      Ok(CompanionContextCategory {
+        key: row.get("key")?,
+        label: row.get("label")?,
+        description: row.get("description")?,
+        icon: row.get("icon")?,
+        display_order: row.get("display_order")?,
+        is_system: row.get("is_system")?,
+        is_deleted: row.get("is_deleted")?,
+        deleted_at: row.get("deleted_at")?,
+      })
+    },
+  ).map_err(AppError::from)
 }
 
 pub fn create_place(db_path: &PathBuf, payload: &CreatePlaceInput) -> Result<Place, AppError> {
@@ -1373,8 +1876,69 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
         reply_text TEXT NOT NULL,
         reply_mode TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS companion_context_entries (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          category_key TEXT NOT NULL,
+          title TEXT NOT NULL,
+          body TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+          notes TEXT NOT NULL DEFAULT '',
+          display_order INTEGER NOT NULL DEFAULT 0,
+          is_active INTEGER NOT NULL DEFAULT 1,
+          deleted_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+      CREATE TABLE IF NOT EXISTS companion_context_categories (
+          key TEXT PRIMARY KEY,
+          label TEXT NOT NULL,
+          description TEXT NOT NULL DEFAULT '',
+          icon TEXT NOT NULL DEFAULT 'spark',
+          display_order INTEGER NOT NULL DEFAULT 0,
+          is_system INTEGER NOT NULL DEFAULT 0,
+          is_deleted INTEGER NOT NULL DEFAULT 0,
+          deleted_at TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+      CREATE TABLE IF NOT EXISTS companion_context_category_state (
+        category_key TEXT PRIMARY KEY,
+        is_visible INTEGER NOT NULL DEFAULT 1,
+        updated_at TEXT NOT NULL
+      );
     "#,
   )?;
+
+  let category_columns = table_columns(connection, "companion_context_categories")?;
+  if !category_columns.iter().any(|column| column == "icon") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN icon TEXT NOT NULL DEFAULT 'spark'",
+      [],
+    )?;
+  }
+  if !category_columns.iter().any(|column| column == "is_deleted") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0",
+      [],
+    )?;
+  }
+  if !category_columns.iter().any(|column| column == "deleted_at") {
+    connection.execute(
+      "ALTER TABLE companion_context_categories ADD COLUMN deleted_at TEXT",
+      [],
+    )?;
+  }
+
+  let entry_columns = table_columns(connection, "companion_context_entries")?;
+  if !entry_columns.iter().any(|column| column == "deleted_at") {
+    connection.execute(
+      "ALTER TABLE companion_context_entries ADD COLUMN deleted_at TEXT",
+      [],
+    )?;
+  }
 
   let existing: i64 = connection.query_row("SELECT COUNT(*) FROM app_meta", [], |row| row.get(0))?;
   if existing == 0 {
@@ -1384,6 +1948,44 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
     )?;
   } else {
     connection.execute("UPDATE app_meta SET version = ?1", params![SCHEMA_VERSION])?;
+  }
+
+  seed_companion_context_categories(connection)?;
+
+  Ok(())
+}
+
+fn seed_companion_context_categories(connection: &Connection) -> Result<(), AppError> {
+  for (index, (key, label, description, icon)) in COMPANION_CONTEXT_CATEGORY_DEFS.iter().enumerate() {
+    let timestamp = Utc::now().to_rfc3339();
+    connection.execute(
+      r#"
+        INSERT INTO companion_context_categories (
+          key,
+          label,
+          description,
+          icon,
+          display_order,
+          is_system,
+          is_deleted,
+          deleted_at,
+          created_at,
+          updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 0, NULL, ?6, ?7)
+        ON CONFLICT(key) DO UPDATE SET
+          label = excluded.label,
+          description = excluded.description,
+          icon = CASE
+            WHEN companion_context_categories.icon IS NULL OR companion_context_categories.icon = ''
+            THEN excluded.icon
+            ELSE companion_context_categories.icon
+          END,
+          display_order = excluded.display_order,
+          is_system = 1,
+          updated_at = excluded.updated_at
+      "#,
+      params![key, label, description, icon, index as i64, timestamp, timestamp],
+    )?;
   }
 
   Ok(())
