@@ -14,6 +14,7 @@ pub struct AppState {
   pub last_initialized_at: Arc<String>,
   pub voice_worker: Arc<Mutex<Option<VoiceWorker>>>,
   pub speech_stream_worker: Arc<Mutex<Option<SpeechStreamWorker>>>,
+  pub kokoro_fastapi_runtime: Arc<Mutex<Option<ManagedKokoroFastApiRuntime>>>,
   pub active_call_session_id: Arc<Mutex<Option<i64>>>,
 }
 
@@ -31,6 +32,12 @@ pub struct SpeechStreamWorker {
   pub child: Child,
   pub stdin: ChildStdin,
   pub snapshot: Arc<Mutex<SpeechStreamSnapshotState>>,
+}
+
+pub struct ManagedKokoroFastApiRuntime {
+  pub child: Child,
+  pub working_dir: PathBuf,
+  pub started_at: String,
 }
 
 impl AppState {

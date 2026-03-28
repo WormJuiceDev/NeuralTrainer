@@ -90,6 +90,7 @@ button {
 
 .topbar-copy {
   min-width: 0;
+  flex: 1;
 }
 
 .topbar-copy strong,
@@ -102,6 +103,16 @@ button {
 .section-title h3 {
   display: block;
   color: var(--ink);
+}
+
+.topbar-copy strong {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topbar-actions {
+  flex: 0 0 auto;
 }
 
 .topbar-copy span,
@@ -460,6 +471,7 @@ button {
   position: relative;
   z-index: 1;
   height: 100%;
+  min-height: 0;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 1rem;
@@ -488,13 +500,21 @@ button {
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  align-content: end;
+  align-content: start;
   gap: 0.75rem;
-  padding: 0 0.2rem;
+  padding: 0 0.2rem 0.4rem;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+
+.call-live-diagnostics-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.65rem;
 }
 
 .call-live-chip {
-  max-width: 84%;
+  max-width: 100%;
   display: grid;
   gap: 0.25rem;
   padding: 0.9rem 1rem;
@@ -515,6 +535,10 @@ button {
 
 .call-live-chip--trainer {
   justify-self: start;
+}
+
+.call-live-diagnostics-grid .call-live-chip {
+  justify-self: stretch;
 }
 
 .call-overlay-actions {

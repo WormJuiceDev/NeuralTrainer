@@ -3,8 +3,10 @@
 set -eu
 
 if [ -f /usr/local/etc/northstar.env ]; then
+  set -a
   # shellcheck disable=SC1091
   . /usr/local/etc/northstar.env
+  set +a
 fi
 
 export NORTHSTAR_BIND_ADDR="${NORTHSTAR_BIND_ADDR:-0.0.0.0:3100}"

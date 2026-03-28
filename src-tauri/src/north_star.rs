@@ -8,8 +8,8 @@ use crate::{
   error::AppError,
   models::{
     AppSettings, CallTurnResult, LocationEventInput, NorthStarCallReview, NorthStarCallSession, NorthStarCallTurn,
-    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarSnapshot, NorthStarTurnProcessingResult,
-    NorthStarWebRtcSignal,
+    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarRtcIceServer, NorthStarSnapshot,
+    NorthStarTurnProcessingResult, NorthStarWebRtcSignal,
   },
 };
 
@@ -143,6 +143,18 @@ struct CallTurnsResponse {
 #[derive(Debug, Deserialize)]
 struct WebRtcSignalsResponse {
   signals: Vec<RawNorthStarWebRtcSignal>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawNorthStarRtcIceServer {
+  urls: Vec<String>,
+  username: Option<String>,
+  credential: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RtcConfigResponse {
+  ice_servers: Vec<RawNorthStarRtcIceServer>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,6 +321,16 @@ impl From<RawNorthStarWebRtcSignal> for NorthStarWebRtcSignal {
       signal_kind: value.signal_kind,
       payload_json: value.payload_json,
       created_at: value.created_at,
+    }
+  }
+}
+
+impl From<RawNorthStarRtcIceServer> for NorthStarRtcIceServer {
+  fn from(value: RawNorthStarRtcIceServer) -> Self {
+    Self {
+      urls: value.urls,
+      username: value.username,
+      credential: value.credential,
     }
   }
 }
@@ -765,6 +787,21 @@ pub fn pull_desktop_webrtc_signals(
     .json::<WebRtcSignalsResponse>()?;
 
   Ok(response.signals.into_iter().map(Into::into).collect())
+}
+
+pub fn fetch_rtc_config(settings: &AppSettings) -> Result<Vec<NorthStarRtcIceServer>, AppError> {
+  if settings.north_star_session_token.trim().is_empty() {
+    return Err(AppError::Message("Create a North Star session first.".into()));
+  }
+
+  let response = client()
+    .get(format!("{}/api/companion/rtc-config", endpoint(settings)?))
+    .header("x-northstar-session", settings.north_star_session_token.clone())
+    .send()?
+    .error_for_status()?
+    .json::<RtcConfigResponse>()?;
+
+  Ok(response.ice_servers.into_iter().map(Into::into).collect())
 }
 
 pub fn process_next_pending_turn<F>(

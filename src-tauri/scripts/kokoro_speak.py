@@ -154,15 +154,8 @@ def stream_microphone(model_dir: str, sample_rate: int) -> int:
 
 def run_speech_worker(model_dir: str, sample_rate: int) -> int:
     listener = JsonListener()
-    mic = MicTranscriber(
-        model_path=model_dir,
-        model_arch=ModelArch.TINY_STREAMING,
-        update_interval=0.2,
-        samplerate=sample_rate,
-        channels=1,
-        blocksize=1024,
-    )
-    mic.add_listener(listener)
+    transcriber = Transcriber(model_dir, ModelArch.TINY_STREAMING, update_interval=0.2)
+    stream = None
     active = False
 
     print(json.dumps({"event": "worker_ready"}), flush=True)
@@ -184,9 +177,41 @@ def run_speech_worker(model_dir: str, sample_rate: int) -> int:
                 continue
             listener.completed_lines = []
             listener.current_line = ""
-            mic.start()
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            stream = transcriber.create_stream(0.2)
+            stream.add_listener(listener)
+            stream.start()
             active = True
             print(json.dumps({"event": "ready"}), flush=True)
+            continue
+
+        if action == "add_audio":
+            if not active or stream is None:
+                print(json.dumps({"event": "error", "text": "speech stream is not active"}), flush=True)
+                continue
+            audio_base64 = payload.get("audio_base64", "")
+            audio_format = payload.get("audio_format", "pcm16le")
+            chunk_sample_rate = int(payload.get("sample_rate", sample_rate))
+            if not audio_base64:
+                continue
+            try:
+                decoded = base64.b64decode(audio_base64)
+                if audio_format == "pcm16le":
+                    audio_data = np.frombuffer(decoded, dtype="<i2").astype(np.float32) / 32768.0
+                elif audio_format == "f32le":
+                    audio_data = np.frombuffer(decoded, dtype="<f4").astype(np.float32)
+                else:
+                    print(json.dumps({"event": "error", "text": f"unknown audio format: {audio_format}"}), flush=True)
+                    continue
+                if audio_data.size == 0:
+                    continue
+                stream.add_audio(audio_data.tolist(), chunk_sample_rate)
+            except Exception as exc:
+                print(json.dumps({"event": "error", "text": str(exc)}), flush=True)
             continue
 
         if action == "stop":
@@ -194,23 +219,35 @@ def run_speech_worker(model_dir: str, sample_rate: int) -> int:
                 print(json.dumps({"event": "stopped", "text": listener.current_text()}), flush=True)
                 continue
             time.sleep(STOP_GRACE_MS / 1000.0)
-            final_transcript = mic.stop()
+            final_transcript = stream.stop() if stream is not None else None
             final_text = listener.current_text()
             if final_transcript is not None and getattr(final_transcript, "lines", None):
                 combined = " ".join(line.text.strip() for line in final_transcript.lines if getattr(line, "text", "").strip())
                 if combined.strip():
                     final_text = combined.strip()
             active = False
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                stream = None
             print(json.dumps({"event": "stopped", "text": final_text}), flush=True)
             continue
 
         if action == "shutdown":
             if active:
                 try:
-                    mic.stop()
+                    if stream is not None:
+                        stream.stop()
                 except Exception:
                     pass
-            mic.close()
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            transcriber.close()
             print(json.dumps({"event": "shutdown"}), flush=True)
             return 0
 
@@ -218,10 +255,16 @@ def run_speech_worker(model_dir: str, sample_rate: int) -> int:
 
     try:
         if active:
-            mic.stop()
+            if stream is not None:
+                stream.stop()
     except Exception:
         pass
-    mic.close()
+    if stream is not None:
+        try:
+            stream.close()
+        except Exception:
+            pass
+    transcriber.close()
     return 0
 
 

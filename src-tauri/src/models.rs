@@ -24,6 +24,8 @@ pub struct AppSettings {
   pub lm_studio_api_key: String,
   pub lm_studio_model: String,
   pub tts_provider: String,
+  pub tts_endpoint: String,
+  pub tts_api_key: String,
   pub tts_model_id: String,
   pub tts_sample_rate: i64,
   pub tts_default_voice: String,
@@ -61,6 +63,8 @@ impl Default for AppSettings {
       lm_studio_api_key: String::new(),
       lm_studio_model: "qwen/qwen3.5-9b".into(),
       tts_provider: "kokoro".into(),
+      tts_endpoint: "http://127.0.0.1:8880/v1".into(),
+      tts_api_key: String::new(),
       tts_model_id: "kokoro-82m".into(),
       tts_sample_rate: 24_000,
       tts_default_voice: "af_heart".into(),
@@ -164,6 +168,14 @@ pub struct NorthStarWebRtcSignal {
   pub signal_kind: String,
   pub payload_json: String,
   pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NorthStarRtcIceServer {
+  pub urls: Vec<String>,
+  pub username: Option<String>,
+  pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -766,6 +778,11 @@ pub struct VoiceSnapshot {
   pub missing_files: Vec<String>,
   pub runtime_ready: bool,
   pub runtime_detail: String,
+  pub managed_runtime: bool,
+  pub runtime_endpoint: String,
+  pub runtime_root: String,
+  pub runtime_stdout_log: String,
+  pub runtime_stderr_log: String,
   pub speech_ready: bool,
   pub speech_runtime_ready: bool,
   pub speech_runtime_detail: String,
@@ -798,6 +815,21 @@ pub struct CallTurnResult {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NorthStarLiveReplyStreamEvent {
+  pub request_id: String,
+  pub phase: String,
+  pub transcript_text: Option<String>,
+  pub reply_text: Option<String>,
+  pub reply_mode: Option<String>,
+  pub text_chunk: Option<String>,
+  pub audio_base64: Option<String>,
+  pub sample_rate: Option<i64>,
+  pub chunk_index: Option<usize>,
+  pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SpeechStreamSnapshot {
   pub active: bool,
   pub started_at: Option<String>,
@@ -817,6 +849,15 @@ pub struct StartSpeechStreamInput {
 #[serde(rename_all = "camelCase")]
 pub struct StopSpeechStreamInput {
   pub session_id: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PushSpeechStreamAudioInput {
+  pub session_id: i64,
+  pub audio_base64: String,
+  pub sample_rate: i64,
+  pub audio_format: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

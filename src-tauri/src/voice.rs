@@ -4,6 +4,8 @@ use std::{
   path::{Path, PathBuf},
   process::{Child, ChildStdin, ChildStdout, Command, Stdio},
   sync::Mutex,
+  thread,
+  time::{Duration, Instant},
 };
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
@@ -16,8 +18,8 @@ use std::os::windows::process::CommandExt;
 
 use crate::{
   error::AppError,
-  models::{AppSettings, CallTurnResult, VoiceSnapshot, VoiceSynthesisResult},
-  state::{SpeechStreamSnapshotState, SpeechStreamWorker},
+  models::{AppSettings, CallTurnResult, NorthStarLiveReplyStreamEvent, VoiceSnapshot, VoiceSynthesisResult},
+  state::{ManagedKokoroFastApiRuntime, SpeechStreamSnapshotState, SpeechStreamWorker},
 };
 
 const KOKORO_SCRIPT: &str = include_str!("../scripts/kokoro_speak.py");
@@ -27,6 +29,7 @@ const KOKORO_MODEL_FILE: &str = "kokoro-v1.0.int8.onnx";
 const KOKORO_VOICES_FILE: &str = "voices-v1.0.bin";
 const KOKORO_MODEL_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx";
 const KOKORO_VOICES_URL: &str = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin";
+const KOKORO_FASTAPI_REPO_URL: &str = "https://github.com/remsky/Kokoro-FastAPI.git";
 const MOONSHINE_MODEL_DIR_NAME: &str = "tiny-streaming-en";
 const MOONSHINE_MODEL_BASE_URL: &str = "https://download.moonshine.ai/model/tiny-streaming-en/quantized";
 const MOONSHINE_MODEL_FILES: [&str; 7] = [
@@ -63,20 +66,40 @@ pub fn voice_snapshot(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_loaded: bool,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
 ) -> Result<VoiceSnapshot, AppError> {
   let paths = resolve_voice_paths(app_data_dir, settings);
+  let managed_runtime = uses_managed_local_fastapi(settings);
+  let managed_root = managed_fastapi_root(app_data_dir);
+  let managed_logs_dir = managed_root.join("runtime-logs");
   fs::create_dir_all(&paths.previews_dir)?;
   fs::create_dir_all(&paths.recordings_dir)?;
 
   let mut missing_files = Vec::new();
-  if !paths.model_path.exists() {
-    missing_files.push(KOKORO_MODEL_FILE.to_string());
-  }
-  if !paths.voices_path.exists() {
-    missing_files.push(KOKORO_VOICES_FILE.to_string());
+  let tts_uses_remote_kokoro = tts_uses_fastapi(settings);
+  if !tts_uses_remote_kokoro {
+    if !paths.model_path.exists() {
+      missing_files.push(KOKORO_MODEL_FILE.to_string());
+    }
+    if !paths.voices_path.exists() {
+      missing_files.push(KOKORO_VOICES_FILE.to_string());
+    }
   }
 
   let speech_ready = speech_model_files_exist(&paths.speech_model_dir);
+  let runtime_ready = if tts_uses_remote_kokoro {
+    match managed_fastapi_health(settings) {
+      Ok(true) => true,
+      _ => kokoro_runtime_slot
+        .lock()
+        .map_err(|_| AppError::Message("Kokoro-FastAPI runtime mutex was poisoned.".into()))?
+        .as_mut()
+        .map(|runtime| runtime.child.try_wait().ok().flatten().is_none())
+        .unwrap_or(false),
+    }
+  } else {
+    worker_loaded || python_command().is_some()
+  };
   Ok(VoiceSnapshot {
     provider: settings.tts_provider.clone(),
     model_id: settings.tts_model_id.clone(),
@@ -88,12 +111,25 @@ pub fn voice_snapshot(
     speech_model_path: paths.speech_model_dir.display().to_string(),
     files_ready: missing_files.is_empty(),
     missing_files,
-    runtime_ready: worker_loaded || python_command().is_some(),
-    runtime_detail: if worker_loaded {
+    runtime_ready,
+    runtime_detail: if tts_uses_remote_kokoro {
+      if settings.tts_endpoint.trim().is_empty() {
+        "Kokoro-FastAPI endpoint is not configured.".into()
+      } else if managed_fastapi_health(settings).unwrap_or(false) {
+        format!("Managed Kokoro-FastAPI is reachable at {}.", settings.tts_endpoint.trim())
+      } else {
+        format!("Kokoro-FastAPI is configured for {} but is not reachable yet.", settings.tts_endpoint.trim())
+      }
+    } else if worker_loaded {
       "Voice runtime is ready.".into()
     } else {
       "Voice runtime is available after setup.".into()
     },
+    managed_runtime,
+    runtime_endpoint: settings.tts_endpoint.trim().to_string(),
+    runtime_root: managed_root.display().to_string(),
+    runtime_stdout_log: managed_logs_dir.join("kokoro-fastapi.stdout.log").display().to_string(),
+    runtime_stderr_log: managed_logs_dir.join("kokoro-fastapi.stderr.log").display().to_string(),
     speech_ready,
     speech_runtime_ready: speech_ready,
     speech_runtime_detail: if speech_ready {
@@ -120,7 +156,12 @@ pub fn prepare_python_runtime(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
 ) -> Result<(), AppError> {
+  if tts_uses_fastapi(settings) {
+    ensure_managed_kokoro_fastapi_runtime(app_data_dir, settings, kokoro_runtime_slot)?;
+    return Ok(());
+  }
   let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3.".into()))?;
   ensure_python_script(app_data_dir)?;
   let output = hidden_command(&python)
@@ -137,7 +178,7 @@ pub fn prepare_python_runtime(
 pub fn setup_local_speech(
   app_data_dir: &Path,
   settings: &AppSettings,
-  _speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
 ) -> Result<(), AppError> {
   let paths = resolve_voice_paths(app_data_dir, settings);
   let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3.".into()))?;
@@ -151,37 +192,372 @@ pub fn setup_local_speech(
     return Err(AppError::Message(String::from_utf8_lossy(&output.stderr).trim().to_string()));
   }
   download_moonshine_model_if_missing(&paths.speech_model_dir)
+    .and_then(|_| {
+      let mut guard = speech_worker_slot
+        .lock()
+        .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+      let _ = ensure_speech_worker(app_data_dir, settings, &mut guard)?;
+      Ok(())
+    })
+}
+
+fn ensure_speech_worker<'a>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  speech_worker_slot: &'a mut Option<SpeechStreamWorker>,
+) -> Result<&'a mut SpeechStreamWorker, AppError> {
+  let worker_is_running = match speech_worker_slot {
+    Some(worker) => worker.child.try_wait()?.is_none(),
+    None => false,
+  };
+  if worker_is_running {
+    return speech_worker_slot
+      .as_mut()
+      .ok_or_else(|| AppError::Message("Speech worker disappeared unexpectedly.".into()));
+  }
+
+  *speech_worker_slot = None;
+  let paths = resolve_voice_paths(app_data_dir, settings);
+  if !speech_model_files_exist(&paths.speech_model_dir) {
+    return Err(AppError::Message("Speech input model is missing. Set up voice first.".into()));
+  }
+
+  let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3.".into()))?;
+  let script_path = ensure_python_script(app_data_dir)?;
+  let mut child = hidden_command(&python)
+    .arg(&script_path)
+    .arg("--speech-worker")
+    .arg("--stt-model")
+    .arg(&paths.speech_model_dir)
+    .arg("--sample-rate")
+    .arg("16000")
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()?;
+
+  let stdin = child
+    .stdin
+    .take()
+    .ok_or_else(|| AppError::Message("Speech worker did not expose stdin.".into()))?;
+  let stdout = child
+    .stdout
+    .take()
+    .ok_or_else(|| AppError::Message("Speech worker did not expose stdout.".into()))?;
+  let mut stdout = BufReader::new(stdout);
+  let mut ready_line = String::new();
+  let read_count = stdout.read_line(&mut ready_line)?;
+  if read_count == 0 {
+    return Err(AppError::Message("Speech worker did not start correctly.".into()));
+  }
+  let ready_payload: Value = serde_json::from_str(ready_line.trim())?;
+  if ready_payload.get("event").and_then(|value| value.as_str()) != Some("worker_ready") {
+    return Err(AppError::Message(
+      ready_payload
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Speech worker failed to initialize.")
+        .to_string(),
+    ));
+  }
+
+  let snapshot = std::sync::Arc::new(Mutex::new(SpeechStreamSnapshotState::default()));
+  let snapshot_reader = snapshot.clone();
+  thread::spawn(move || {
+    let mut reader = stdout;
+    loop {
+      let mut line = String::new();
+      match reader.read_line(&mut line) {
+        Ok(0) => break,
+        Ok(_) => {
+          let trimmed = line.trim();
+          if trimmed.is_empty() {
+            continue;
+          }
+          let Ok(payload): Result<Value, _> = serde_json::from_str(trimmed) else {
+            continue;
+          };
+          let event = payload.get("event").and_then(|value| value.as_str()).unwrap_or("");
+          let text = payload.get("text").and_then(|value| value.as_str()).unwrap_or("").to_string();
+          if let Ok(mut state) = snapshot_reader.lock() {
+            match event {
+              "ready" => {
+                state.active = true;
+                state.status = "listening".into();
+                state.last_error = None;
+              }
+              "partial" => {
+                state.partial_text = text;
+                state.status = "listening".into();
+              }
+              "final" => {
+                state.final_text = text;
+                state.status = "processing".into();
+              }
+              "stopped" => {
+                state.active = false;
+                state.final_text = text;
+                state.status = "stopped".into();
+              }
+              "error" => {
+                state.last_error = Some(text);
+                state.status = "error".into();
+              }
+              "shutdown" => {
+                state.active = false;
+                state.status = "idle".into();
+                break;
+              }
+              _ => {}
+            }
+          }
+        }
+        Err(_) => break,
+      }
+    }
+  });
+
+  *speech_worker_slot = Some(SpeechStreamWorker { child, stdin, snapshot });
+  speech_worker_slot
+    .as_mut()
+    .ok_or_else(|| AppError::Message("Speech worker was not available after startup.".into()))
+}
+
+fn send_speech_worker_command(worker: &mut SpeechStreamWorker, payload: &Value) -> Result<(), AppError> {
+  let line = serde_json::to_string(payload)?;
+  writeln!(worker.stdin, "{line}")?;
+  worker.stdin.flush()?;
+  Ok(())
+}
+
+fn wait_for_speech_stream_state<F>(
+  snapshot: &std::sync::Arc<Mutex<SpeechStreamSnapshotState>>,
+  timeout: Duration,
+  predicate: F,
+) -> Result<(), AppError>
+where
+  F: Fn(&SpeechStreamSnapshotState) -> bool,
+{
+  let started = Instant::now();
+  loop {
+    let current = snapshot
+      .lock()
+      .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+      .clone();
+    if predicate(&current) {
+      return Ok(());
+    }
+    if started.elapsed() >= timeout {
+      return Err(AppError::Message("Speech stream state transition timed out.".into()));
+    }
+    thread::sleep(Duration::from_millis(25));
+  }
 }
 
 pub fn speech_stream_snapshot(
-  _speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
 ) -> Result<SpeechStreamSnapshotState, AppError> {
+  let guard = speech_worker_slot
+    .lock()
+    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+  if let Some(worker) = guard.as_ref() {
+    let snapshot = worker
+      .snapshot
+      .lock()
+      .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?;
+    return Ok(snapshot.clone());
+  }
   Ok(SpeechStreamSnapshotState::default())
 }
 
 pub fn start_speech_stream(
-  _app_data_dir: &Path,
-  _settings: &AppSettings,
-  _speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
 ) -> Result<SpeechStreamSnapshotState, AppError> {
-  Err(AppError::Message("Live desktop speech streaming is temporarily unavailable while the voice module is being repaired.".into()))
+  let mut guard = speech_worker_slot
+    .lock()
+    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+  let worker = ensure_speech_worker(app_data_dir, settings, &mut guard)?;
+  let existing_snapshot = worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .clone();
+  if existing_snapshot.active
+    || matches!(existing_snapshot.status.as_str(), "starting" | "listening" | "processing")
+  {
+    send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
+    wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
+      !snapshot.active || snapshot.status == "stopped" || snapshot.last_error.is_some()
+    })?;
+  }
+  {
+    let mut snapshot = worker
+      .snapshot
+      .lock()
+      .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?;
+    snapshot.active = true;
+    snapshot.started_at = Some(Utc::now().to_rfc3339());
+    snapshot.partial_text.clear();
+    snapshot.final_text.clear();
+    snapshot.status = "starting".into();
+    snapshot.last_error = None;
+  }
+  send_speech_worker_command(worker, &json!({ "command": "start" }))?;
+  wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(2), |snapshot| {
+    snapshot.status == "listening" || snapshot.last_error.is_some()
+  })?;
+  let snapshot = worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .clone();
+  if let Some(error) = snapshot.last_error.clone() {
+    return Err(AppError::Message(error));
+  }
+  Ok(snapshot)
 }
 
 pub fn stop_speech_stream_and_reply(
-  _app_data_dir: &Path,
-  _settings: &AppSettings,
-  _worker_slot: &Mutex<Option<VoiceWorker>>,
-  _speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
-  _session_id: i64,
-  _session_context: &str,
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_id: i64,
+  session_context: &str,
 ) -> Result<CallTurnResult, AppError> {
-  Err(AppError::Message("Live desktop speech streaming is temporarily unavailable while the voice module is being repaired.".into()))
+  let mut guard = speech_worker_slot
+    .lock()
+    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+  let worker = guard
+    .as_mut()
+    .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
+  send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
+  wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
+    snapshot.status == "stopped" || snapshot.last_error.is_some()
+  })?;
+  let snapshot = worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .clone();
+  if let Some(error) = snapshot.last_error.clone() {
+    return Err(AppError::Message(error));
+  }
+  let transcript_text = if snapshot.final_text.trim().is_empty() {
+    snapshot.partial_text.trim().to_string()
+  } else {
+    snapshot.final_text.trim().to_string()
+  };
+  if transcript_text.is_empty() {
+    return Err(AppError::Message("Speech stream produced no transcript.".into()));
+  }
+  build_call_turn_result(
+    app_data_dir,
+    settings,
+    worker_slot,
+    kokoro_runtime_slot,
+    session_id,
+    &transcript_text,
+    session_context,
+  )
+}
+
+pub fn stop_speech_stream_and_stream_reply<F>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_id: i64,
+  session_context: &str,
+  request_id: &str,
+  mut emit_event: F,
+) -> Result<CallTurnResult, AppError>
+where
+  F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+{
+  let mut guard = speech_worker_slot
+    .lock()
+    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+  let worker = guard
+    .as_mut()
+    .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
+  send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
+  wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
+    snapshot.status == "stopped" || snapshot.last_error.is_some()
+  })?;
+  let snapshot = worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .clone();
+  if let Some(error) = snapshot.last_error.clone() {
+    return Err(AppError::Message(error));
+  }
+  let transcript_text = if snapshot.final_text.trim().is_empty() {
+    snapshot.partial_text.trim().to_string()
+  } else {
+    snapshot.final_text.trim().to_string()
+  };
+  if transcript_text.is_empty() {
+    return Err(AppError::Message("Speech stream produced no transcript.".into()));
+  }
+  stream_call_turn_for_transcript(
+    app_data_dir,
+    settings,
+    worker_slot,
+    kokoro_runtime_slot,
+    session_id,
+    &transcript_text,
+    session_context,
+    request_id,
+    &mut emit_event,
+  )
+}
+
+pub fn push_speech_stream_audio(
+  speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  _session_id: i64,
+  audio_base64: &str,
+  sample_rate: i32,
+  audio_format: &str,
+) -> Result<SpeechStreamSnapshotState, AppError> {
+  let mut guard = speech_worker_slot
+    .lock()
+    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+  let worker = guard
+    .as_mut()
+    .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
+  if !worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .active
+  {
+    return Err(AppError::Message("Speech stream is not active.".into()));
+  }
+  send_speech_worker_command(worker, &json!({
+    "command": "add_audio",
+    "audio_base64": audio_base64,
+    "sample_rate": sample_rate,
+    "audio_format": audio_format,
+  }))?;
+  let snapshot = worker
+    .snapshot
+    .lock()
+    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+    .clone();
+  Ok(snapshot)
 }
 
 pub fn run_call_turn(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
   session_id: i64,
   duration_seconds: i64,
   session_context: &str,
@@ -213,13 +589,14 @@ pub fn run_call_turn(
   if transcript_text.is_empty() {
     return Err(AppError::Message("I could not hear a clear spoken turn yet. Try again a little closer to the microphone.".into()));
   }
-  build_call_turn_result(app_data_dir, settings, worker_slot, session_id, &transcript_text, session_context)
+  build_call_turn_result(app_data_dir, settings, worker_slot, kokoro_runtime_slot, session_id, &transcript_text, session_context)
 }
 
 pub fn run_uploaded_call_turn(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
   session_id: i64,
   input_audio_wav: &[u8],
   session_context: &str,
@@ -248,16 +625,17 @@ pub fn run_uploaded_call_turn(
   if transcript_text.is_empty() {
     return Err(AppError::Message("I could not hear a clear spoken turn from North Star yet. Try again a little closer to the microphone.".into()));
   }
-  build_call_turn_result(app_data_dir, settings, worker_slot, session_id, &transcript_text, session_context)
+  build_call_turn_result(app_data_dir, settings, worker_slot, kokoro_runtime_slot, session_id, &transcript_text, session_context)
 }
 
 pub fn synthesize_test_phrase(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
 ) -> Result<VoiceSynthesisResult, AppError> {
   let voice_name = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
-  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, DEFAULT_TEST_PHRASE, voice_name)?;
+  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, DEFAULT_TEST_PHRASE, voice_name)?;
   let output_path = resolve_voice_paths(app_data_dir, settings)
     .previews_dir
     .join(format!("voice-preview-{}.wav", Utc::now().timestamp_millis()));
@@ -275,13 +653,41 @@ pub fn synthesize_test_phrase(
   })
 }
 
+pub fn synthesize_phrase(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  text: &str,
+) -> Result<VoiceSynthesisResult, AppError> {
+  let voice_name = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
+  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, text, voice_name)?;
+  let output_path = resolve_voice_paths(app_data_dir, settings)
+    .previews_dir
+    .join(format!("voice-line-{}.wav", Utc::now().timestamp_millis()));
+  if let Some(parent) = output_path.parent() {
+    fs::create_dir_all(parent)?;
+  }
+  fs::write(&output_path, &audio_bytes)?;
+  Ok(VoiceSynthesisResult {
+    provider: settings.tts_provider.clone(),
+    voice: voice_name.to_string(),
+    text: sanitize_text(text),
+    sample_rate: settings.tts_sample_rate,
+    output_path: output_path.display().to_string(),
+    audio_base64: STANDARD.encode(audio_bytes),
+  })
+}
+
 pub fn clear_voice_assets(
   app_data_dir: &Path,
   worker_slot: &Mutex<Option<VoiceWorker>>,
   speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
 ) -> Result<(), AppError> {
   shutdown_worker(worker_slot);
   shutdown_speech_worker(speech_worker_slot);
+  shutdown_kokoro_fastapi_runtime(kokoro_runtime_slot);
   let voice_dir = app_data_dir.join("voice");
   if voice_dir.exists() {
     fs::remove_dir_all(voice_dir)?;
@@ -289,10 +695,20 @@ pub fn clear_voice_assets(
   Ok(())
 }
 
-pub fn stop_speech_stream(_speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>) {}
+pub fn stop_speech_stream(speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>) {
+  if let Ok(mut guard) = speech_worker_slot.lock() {
+    if let Some(worker) = guard.as_mut() {
+      let _ = send_speech_worker_command(worker, &json!({ "command": "stop" }));
+    }
+  }
+}
 
 pub fn shutdown_speech_worker(speech_worker_slot: &Mutex<Option<SpeechStreamWorker>>) {
   if let Ok(mut guard) = speech_worker_slot.lock() {
+    if let Some(worker) = guard.as_mut() {
+      let _ = send_speech_worker_command(worker, &json!({ "command": "shutdown" }));
+      let _ = worker.child.wait();
+    }
     *guard = None;
   }
 }
@@ -311,6 +727,7 @@ fn build_call_turn_result(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
   session_id: i64,
   transcript_text: &str,
   session_context: &str,
@@ -320,7 +737,7 @@ fn build_call_turn_result(
     .unwrap_or_else(|| transcript_text.to_string());
   let (reply_text, reply_mode) = choose_call_reply(settings, session_context, &repaired_transcript)?;
   let reply_voice = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
-  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, &reply_text, reply_voice)?;
+  let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &reply_text, reply_voice)?;
   let output_path = resolve_voice_paths(app_data_dir, settings)
     .previews_dir
     .join(format!("call-reply-{}-{}.wav", session_id, Utc::now().timestamp_millis()));
@@ -340,10 +757,139 @@ fn build_call_turn_result(
   })
 }
 
+pub fn run_uploaded_call_turn_streaming<F>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_id: i64,
+  input_audio_wav: &[u8],
+  session_context: &str,
+  request_id: &str,
+  mut emit_event: F,
+) -> Result<CallTurnResult, AppError>
+where
+  F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+{
+  let paths = resolve_voice_paths(app_data_dir, settings);
+  let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3.".into()))?;
+  let script_path = ensure_python_script(app_data_dir)?;
+  fs::create_dir_all(&paths.recordings_dir)?;
+  let recording_path = paths
+    .recordings_dir
+    .join(format!("north-star-call-input-{}-{}.wav", session_id, Utc::now().timestamp_millis()));
+  fs::write(&recording_path, input_audio_wav)?;
+  let output = hidden_command(&python)
+    .arg(&script_path)
+    .arg("--transcribe-file")
+    .arg("--stt-model")
+    .arg(&paths.speech_model_dir)
+    .arg("--input")
+    .arg(&recording_path)
+    .output()?;
+  if !output.status.success() {
+    return Err(AppError::Message(String::from_utf8_lossy(&output.stderr).trim().to_string()));
+  }
+  let parsed: Value = serde_json::from_slice(&output.stdout)?;
+  let transcript_text = parsed.get("text").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+  if transcript_text.is_empty() {
+    return Err(AppError::Message("I could not hear a clear spoken turn from North Star yet. Try again a little closer to the microphone.".into()));
+  }
+
+  stream_call_turn_for_transcript(
+    app_data_dir,
+    settings,
+    worker_slot,
+    kokoro_runtime_slot,
+    session_id,
+    &transcript_text,
+    session_context,
+    request_id,
+    &mut emit_event,
+  )
+}
+
+fn stream_call_turn_for_transcript<F>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_id: i64,
+  transcript_text: &str,
+  session_context: &str,
+  request_id: &str,
+  emit_event: &mut F,
+) -> Result<CallTurnResult, AppError>
+where
+  F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+{
+  let repaired_transcript = repair_call_transcript(settings, session_context, &transcript_text)?
+    .filter(|candidate| !candidate.is_empty())
+    .unwrap_or_else(|| transcript_text.to_string());
+  emit_event(NorthStarLiveReplyStreamEvent {
+    request_id: request_id.to_string(),
+    phase: "transcript_ready".into(),
+    transcript_text: Some(repaired_transcript.clone()),
+    reply_text: None,
+    reply_mode: None,
+    text_chunk: None,
+    audio_base64: None,
+    sample_rate: None,
+    chunk_index: None,
+    message: None,
+  })?;
+
+  let reply_voice = if settings.tts_default_voice.trim().is_empty() { "af_heart" } else { settings.tts_default_voice.trim() };
+  let (reply_text, reply_mode, chunk_texts) = generate_streamed_call_reply(
+    app_data_dir,
+    settings,
+    worker_slot,
+    kokoro_runtime_slot,
+    session_context,
+    &repaired_transcript,
+    request_id,
+    reply_voice,
+    emit_event,
+  )?;
+
+  let full_audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &reply_text, reply_voice)?;
+  let output_path = resolve_voice_paths(app_data_dir, settings)
+    .previews_dir
+    .join(format!("call-reply-{}-{}.wav", session_id, Utc::now().timestamp_millis()));
+  if let Some(parent) = output_path.parent() {
+    fs::create_dir_all(parent)?;
+  }
+  fs::write(&output_path, &full_audio_bytes)?;
+  let result = CallTurnResult {
+    session_id,
+    transcript_text: repaired_transcript.clone(),
+    reply_text: reply_text.clone(),
+    reply_mode: reply_mode.clone(),
+    reply_voice: reply_voice.to_string(),
+    reply_output_path: output_path.display().to_string(),
+    reply_audio_base64: STANDARD.encode(full_audio_bytes),
+    sample_rate: settings.tts_sample_rate,
+  };
+  emit_event(NorthStarLiveReplyStreamEvent {
+    request_id: request_id.to_string(),
+    phase: "complete".into(),
+    transcript_text: Some(repaired_transcript),
+    reply_text: Some(reply_text),
+    reply_mode: Some(reply_mode),
+    text_chunk: Some(chunk_texts.join(" ").trim().to_string()),
+    audio_base64: None,
+    sample_rate: Some(settings.tts_sample_rate),
+    chunk_index: None,
+    message: None,
+  })?;
+  Ok(result)
+}
+
 fn synthesize_text_once(
   app_data_dir: &Path,
   settings: &AppSettings,
   worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
   text: &str,
   voice_name: &str,
 ) -> Result<Vec<u8>, AppError> {
@@ -351,10 +897,253 @@ fn synthesize_text_once(
   if cleaned_text.is_empty() {
     return Err(AppError::Message("Voice synthesis text is empty.".into()));
   }
+  if tts_uses_fastapi(settings) {
+    ensure_managed_kokoro_fastapi_runtime(app_data_dir, settings, kokoro_runtime_slot)?;
+    return synthesize_text_via_fastapi(settings, &cleaned_text, voice_name);
+  }
   match synthesize_text_with_worker(app_data_dir, settings, worker_slot, &cleaned_text, voice_name) {
     Ok(audio_bytes) => Ok(audio_bytes),
     Err(_) => synthesize_text_one_shot(app_data_dir, settings, &cleaned_text, voice_name),
   }
+}
+
+fn tts_uses_fastapi(settings: &AppSettings) -> bool {
+  let provider = settings.tts_provider.trim().to_ascii_lowercase();
+  provider == "kokoro_fastapi"
+    || provider == "kokoro-fastapi"
+    || (
+      provider == "kokoro"
+      && !settings.tts_endpoint.trim().is_empty()
+    )
+}
+
+fn normalize_tts_endpoint(endpoint: &str) -> String {
+  let trimmed = endpoint.trim().trim_end_matches('/').to_string();
+  if trimmed.ends_with("/v1") {
+    trimmed
+  } else {
+    format!("{trimmed}/v1")
+  }
+}
+
+fn managed_fastapi_health(settings: &AppSettings) -> Result<bool, AppError> {
+  let endpoint = settings.tts_endpoint.trim();
+  if endpoint.is_empty() {
+    return Ok(false);
+  }
+  let root = normalize_tts_endpoint(endpoint).trim_end_matches("/v1").to_string();
+  let client = Client::builder()
+    .timeout(Duration::from_secs(2))
+    .build()?;
+  let response = client.get(format!("{root}/docs")).send();
+  match response {
+    Ok(response) => Ok(response.status().is_success()),
+    Err(_) => Ok(false),
+  }
+}
+
+fn managed_fastapi_root(app_data_dir: &Path) -> PathBuf {
+  app_data_dir.join("voice").join("kokoro-fastapi")
+}
+
+fn ensure_managed_kokoro_fastapi_installed(app_data_dir: &Path) -> Result<PathBuf, AppError> {
+  let root = managed_fastapi_root(app_data_dir);
+  let start_script = root.join("start-cpu.ps1");
+  if start_script.exists() {
+    return Ok(root);
+  }
+  if root.exists() {
+    fs::remove_dir_all(&root)?;
+  }
+  let parent = root.parent().ok_or_else(|| AppError::Message("Managed Kokoro-FastAPI path was invalid.".into()))?;
+  fs::create_dir_all(parent)?;
+  let output = hidden_command("git")
+    .args(["clone", "--depth", "1", KOKORO_FASTAPI_REPO_URL, root.to_string_lossy().as_ref()])
+    .output()
+    .map_err(|caught| AppError::Message(format!("Could not start git clone for Kokoro-FastAPI: {caught}")))?;
+  if !output.status.success() {
+    return Err(AppError::Message(format!(
+      "Could not clone Kokoro-FastAPI. Make sure Git is installed. {}",
+      String::from_utf8_lossy(&output.stderr).trim()
+    )));
+  }
+  Ok(root)
+}
+
+fn ensure_python_uv_available(python: &str) -> Result<(), AppError> {
+  let uv_check = hidden_command(python)
+    .args(["-m", "uv", "--version"])
+    .output();
+  if let Ok(output) = uv_check {
+    if output.status.success() {
+      return Ok(());
+    }
+  }
+
+  let install = hidden_command(python)
+    .args(["-m", "pip", "install", "-U", "uv"])
+    .output()?;
+  if !install.status.success() {
+    return Err(AppError::Message(format!(
+      "Could not install the Python uv runtime manager required by Kokoro-FastAPI. {}",
+      String::from_utf8_lossy(&install.stderr).trim()
+    )));
+  }
+
+  let verify = hidden_command(python)
+    .args(["-m", "uv", "--version"])
+    .output()?;
+  if !verify.status.success() {
+    return Err(AppError::Message(
+      "Python uv was installed, but NeuralTrainer still could not run it.".into(),
+    ));
+  }
+  Ok(())
+}
+
+fn managed_fastapi_bootstrap_script(root: &Path, python: &str) -> String {
+  let python_escaped = python.replace('\'', "''");
+  let root_display = root.display().to_string().replace('\'', "''");
+  format!(
+    r#"$ErrorActionPreference = "Stop"
+$env:PHONEMIZER_ESPEAK_LIBRARY="C:\Program Files\eSpeak NG\libespeak-ng.dll"
+$env:PYTHONUTF8=1
+$Env:PROJECT_ROOT='{root_display}'
+$Env:USE_GPU="false"
+$Env:USE_ONNX="false"
+$Env:PYTHONPATH="$Env:PROJECT_ROOT;$Env:PROJECT_ROOT/api"
+$Env:MODEL_DIR="src/models"
+$Env:VOICES_DIR="src/voices/v1_0"
+$Env:WEB_PLAYER_PATH="$Env:PROJECT_ROOT/web"
+
+& '{python_escaped}' -m uv sync --extra cpu
+& '{python_escaped}' -m uv run --no-sync python docker/scripts/download_model.py --output api/src/models/v1_0
+& '{python_escaped}' -m uv run --no-sync uvicorn api.src.main:app --host 0.0.0.0 --port 8880
+"#
+  )
+}
+
+fn uses_managed_local_fastapi(settings: &AppSettings) -> bool {
+  if !tts_uses_fastapi(settings) {
+    return false;
+  }
+  let endpoint = settings.tts_endpoint.trim().to_ascii_lowercase();
+  endpoint.starts_with("http://127.0.0.1:") || endpoint.starts_with("http://localhost:")
+}
+
+fn ensure_managed_kokoro_fastapi_runtime(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+) -> Result<(), AppError> {
+  if !uses_managed_local_fastapi(settings) {
+    return Ok(());
+  }
+  if managed_fastapi_health(settings)? {
+    return Ok(());
+  }
+  {
+    let mut guard = runtime_slot.lock().map_err(|_| AppError::Message("Kokoro-FastAPI runtime mutex was poisoned.".into()))?;
+    if let Some(runtime) = guard.as_mut() {
+      if runtime.child.try_wait()?.is_some() {
+        *guard = None;
+      }
+    }
+    if guard.is_some() && managed_fastapi_health(settings)? {
+      return Ok(());
+    }
+  }
+
+  let root = ensure_managed_kokoro_fastapi_installed(app_data_dir)?;
+  let python = python_command().ok_or_else(|| AppError::Message("Could not find Python 3 for managed Kokoro-FastAPI.".into()))?;
+  ensure_python_uv_available(&python)?;
+  let logs_dir = root.join("runtime-logs");
+  fs::create_dir_all(&logs_dir)?;
+  let bootstrap_script = logs_dir.join("start-managed-cpu.ps1");
+  fs::write(&bootstrap_script, managed_fastapi_bootstrap_script(&root, &python))?;
+  let stdout_log = fs::File::create(logs_dir.join("kokoro-fastapi.stdout.log"))?;
+  let stderr_log = fs::File::create(logs_dir.join("kokoro-fastapi.stderr.log"))?;
+
+  let mut command = hidden_command("powershell");
+  command
+    .arg("-ExecutionPolicy")
+    .arg("Bypass")
+    .arg("-File")
+    .arg(&bootstrap_script)
+    .current_dir(&root)
+    .stdin(Stdio::null())
+    .stdout(Stdio::from(stdout_log))
+    .stderr(Stdio::from(stderr_log));
+  let child = command.spawn()?;
+
+  {
+    let mut guard = runtime_slot.lock().map_err(|_| AppError::Message("Kokoro-FastAPI runtime mutex was poisoned.".into()))?;
+    *guard = Some(ManagedKokoroFastApiRuntime {
+      child,
+      working_dir: root,
+      started_at: Utc::now().to_rfc3339(),
+    });
+  }
+
+  let deadline = Instant::now() + Duration::from_secs(90);
+  while Instant::now() < deadline {
+    if managed_fastapi_health(settings)? {
+      return Ok(());
+    }
+    thread::sleep(Duration::from_millis(800));
+  }
+  Err(AppError::Message("Managed Kokoro-FastAPI did not become ready in time.".into()))
+}
+
+pub fn shutdown_kokoro_fastapi_runtime(runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>) {
+  if let Ok(mut guard) = runtime_slot.lock() {
+    if let Some(runtime) = guard.as_mut() {
+      let _ = runtime.child.kill();
+      let _ = runtime.child.wait();
+    }
+    *guard = None;
+  }
+}
+
+fn synthesize_text_via_fastapi(
+  settings: &AppSettings,
+  text: &str,
+  voice_name: &str,
+) -> Result<Vec<u8>, AppError> {
+  let endpoint = settings.tts_endpoint.trim();
+  if endpoint.is_empty() {
+    return Err(AppError::Message("Kokoro-FastAPI endpoint is empty.".into()));
+  }
+
+  let requested_model = settings.tts_model_id.trim();
+  let fastapi_model = match requested_model.to_ascii_lowercase().as_str() {
+    "" => "kokoro".to_string(),
+    "kokoro-82m" => "kokoro".to_string(),
+    other => other.to_string(),
+  };
+
+  let client = Client::new();
+  let mut request = client
+    .post(format!("{}/audio/speech", normalize_tts_endpoint(endpoint)))
+    .json(&json!({
+      "model": fastapi_model,
+      "voice": voice_name,
+      "input": text,
+      "response_format": "wav",
+      "speed": 1.0
+    }));
+
+  if !settings.tts_api_key.trim().is_empty() {
+    request = request.bearer_auth(settings.tts_api_key.trim());
+  }
+
+  let response = request.send()?;
+  if !response.status().is_success() {
+    let status = response.status();
+    let detail = response.text().unwrap_or_default();
+    return Err(AppError::Message(format!("Kokoro-FastAPI synthesis failed with {status}: {detail}")));
+  }
+  Ok(response.bytes()?.to_vec())
 }
 
 fn synthesize_text_with_worker(
@@ -573,13 +1362,13 @@ fn repair_call_transcript(
 
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
   let repair_prompt = format!(
-    "You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative, but when a garbled phrase is obviously close to a common real-world phrase, instrument, activity, place, or request, restore the intended wording.\n\nRecent call context:\n{session_context}\n\nRaw transcript:\n{transcript_text}\n\nReturn only the cleaned transcript."
+    "You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.\n\nRecent call context:\n{session_context}\n\nRaw transcript:\n{transcript_text}\n\nReturn only the cleaned transcript."
   );
 
   request_call_reply(
     settings,
     &endpoint,
-    "Rewrite rough speech recognition into the speaker's likely intended words. Output transcript text only.",
+    "Rewrite rough speech recognition into the speaker's likely intended words. Output transcript text only. Do not use <think> tags or reasoning.",
     &repair_prompt,
     0.2,
     80,
@@ -599,13 +1388,24 @@ fn generate_call_reply(
   }
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
   let primary_prompt = format!(
-    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
+    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. If the user asks how, why, or what something is, actually explain it instead of merely acknowledging the question. Do not stall with phrases like 'That's a great question', 'I'd love to help', or 'Sure' unless they are immediately followed by the real answer in the same reply. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
   );
   let fallback_prompt = format!(
     "Answer this live phone-call question directly in 2 or 3 natural spoken sentences. No analysis. No tags. No hidden reasoning. Do not mention being an AI.\n\nUser asked: {transcript_text}"
   );
+  let wants_explanation = wants_explanatory_answer(transcript_text);
   if let Some(reply) = request_call_reply(settings, &endpoint, "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning.", &primary_prompt, 0.45, 180)? {
-    return Ok(Some(reply));
+    if !wants_explanation || !is_acknowledgment_only_reply(&reply) {
+      return Ok(Some(reply));
+    }
+  }
+  if wants_explanation {
+    let stricter_prompt = format!(
+      "The user is clearly asking for an explanation. Answer the question itself right away. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
+    );
+    if let Some(reply) = request_call_reply(settings, &endpoint, "You are on a live phone call. Provide the actual answer immediately. No <think> tags. No reasoning trace. No acknowledgment-only replies.", &stricter_prompt, 0.35, 220)? {
+      return Ok(Some(reply));
+    }
   }
   request_call_reply(settings, &endpoint, "Reply with plain spoken answer text only.", &fallback_prompt, 0.3, 96)
 }
@@ -651,6 +1451,223 @@ fn request_call_reply(
   Ok(content)
 }
 
+fn generate_streamed_call_reply<F>(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_context: &str,
+  transcript_text: &str,
+  request_id: &str,
+  reply_voice: &str,
+  emit_event: &mut F,
+) -> Result<(String, String, Vec<String>), AppError>
+where
+  F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+{
+  if settings.lm_studio_endpoint.trim().is_empty()
+    || settings.lm_studio_model.trim().is_empty()
+    || settings.lm_studio_api_key.trim().is_empty()
+  {
+    let fallback = fallback_call_reply(transcript_text);
+    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &fallback, reply_voice)?;
+    emit_event(NorthStarLiveReplyStreamEvent {
+      request_id: request_id.to_string(),
+      phase: "chunk".into(),
+      transcript_text: None,
+      reply_text: None,
+      reply_mode: Some("fallback".into()),
+      text_chunk: Some(fallback.clone()),
+      audio_base64: Some(STANDARD.encode(audio_bytes)),
+      sample_rate: Some(settings.tts_sample_rate),
+      chunk_index: Some(0),
+      message: None,
+    })?;
+    return Ok((fallback.clone(), "fallback".into(), vec![fallback]));
+  }
+
+  let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
+  let system_prompt = "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning. If the user asks for an explanation, give the explanation itself instead of only acknowledging the question.";
+  let user_prompt = format!(
+    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. If the user asks how, why, or what something is, actually explain it instead of merely acknowledging the question. Do not stall with phrases like 'That's a great question', 'I'd love to help', or 'Sure' unless they are immediately followed by the real answer in the same reply. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
+  );
+
+  let client = Client::new();
+  let response = client
+    .post(format!("{endpoint}/v1/chat/completions"))
+    .bearer_auth(&settings.lm_studio_api_key)
+    .json(&json!({
+      "model": settings.lm_studio_model,
+      "temperature": 0.45,
+      "max_tokens": 180,
+      "stream": true,
+      "messages": [
+        { "role": "system", "content": system_prompt },
+        { "role": "user", "content": user_prompt }
+      ]
+    }))
+    .send()?;
+
+  if !response.status().is_success() {
+    return Err(AppError::Message(format!("LM Studio streaming reply failed with {}.", response.status())));
+  }
+
+  let mut reader = BufReader::new(response);
+  let mut line = String::new();
+  let mut accumulated = String::new();
+  let mut flushed_visible_prefix = String::new();
+  let mut chunk_index = 0usize;
+  let mut chunk_texts = Vec::new();
+
+  loop {
+    line.clear();
+    if reader.read_line(&mut line)? == 0 {
+      break;
+    }
+    let trimmed = line.trim();
+    if !trimmed.starts_with("data:") {
+      continue;
+    }
+    let data = trimmed.trim_start_matches("data:").trim();
+    if data == "[DONE]" {
+      break;
+    }
+    let value: Value = match serde_json::from_str(data) {
+      Ok(value) => value,
+      Err(_) => continue,
+    };
+    let delta = value
+      .get("choices")
+      .and_then(|v| v.as_array())
+      .and_then(|choices| choices.first())
+      .and_then(|choice| choice.get("delta"))
+      .and_then(|delta| delta.get("content"))
+      .and_then(|content| content.as_str())
+      .unwrap_or("");
+    if delta.is_empty() {
+      continue;
+    }
+    accumulated.push_str(delta);
+    let visible_accumulated = sanitize_text(&strip_think_text(&accumulated));
+    while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, false) {
+      let cleaned = sanitize_text(&segment);
+      if cleaned.is_empty() {
+        continue;
+      }
+      let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &cleaned, reply_voice)?;
+      emit_event(NorthStarLiveReplyStreamEvent {
+        request_id: request_id.to_string(),
+        phase: "chunk".into(),
+        transcript_text: None,
+        reply_text: None,
+        reply_mode: Some("model_stream".into()),
+        text_chunk: Some(cleaned.clone()),
+        audio_base64: Some(STANDARD.encode(audio_bytes)),
+        sample_rate: Some(settings.tts_sample_rate),
+        chunk_index: Some(chunk_index),
+        message: None,
+      })?;
+      chunk_texts.push(cleaned);
+      chunk_index += 1;
+    }
+  }
+
+  let visible_accumulated = sanitize_text(&strip_think_text(&accumulated));
+  while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, true) {
+    let cleaned = sanitize_text(&segment);
+    if cleaned.is_empty() {
+      continue;
+    }
+    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &cleaned, reply_voice)?;
+    emit_event(NorthStarLiveReplyStreamEvent {
+      request_id: request_id.to_string(),
+      phase: "chunk".into(),
+      transcript_text: None,
+      reply_text: None,
+      reply_mode: Some("model_stream".into()),
+      text_chunk: Some(cleaned.clone()),
+      audio_base64: Some(STANDARD.encode(audio_bytes)),
+      sample_rate: Some(settings.tts_sample_rate),
+      chunk_index: Some(chunk_index),
+      message: None,
+    })?;
+    chunk_texts.push(cleaned);
+    chunk_index += 1;
+  }
+
+  let reply_text = sanitize_text(&strip_think_text(&accumulated));
+  if reply_text.is_empty() {
+    let fallback = fallback_call_reply(transcript_text);
+    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &fallback, reply_voice)?;
+    emit_event(NorthStarLiveReplyStreamEvent {
+      request_id: request_id.to_string(),
+      phase: "chunk".into(),
+      transcript_text: None,
+      reply_text: None,
+      reply_mode: Some("fallback".into()),
+      text_chunk: Some(fallback.clone()),
+      audio_base64: Some(STANDARD.encode(audio_bytes)),
+      sample_rate: Some(settings.tts_sample_rate),
+      chunk_index: Some(chunk_index),
+      message: None,
+    })?;
+    return Ok((fallback.clone(), "fallback".into(), vec![fallback]));
+  }
+  if chunk_texts.is_empty() {
+    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &reply_text, reply_voice)?;
+    emit_event(NorthStarLiveReplyStreamEvent {
+      request_id: request_id.to_string(),
+      phase: "chunk".into(),
+      transcript_text: None,
+      reply_text: None,
+      reply_mode: Some("model_stream".into()),
+      text_chunk: Some(reply_text.clone()),
+      audio_base64: Some(STANDARD.encode(audio_bytes)),
+      sample_rate: Some(settings.tts_sample_rate),
+      chunk_index: Some(chunk_index),
+      message: None,
+    })?;
+    chunk_texts.push(reply_text.clone());
+  }
+  Ok((reply_text, "model_stream".into(), chunk_texts))
+}
+
+fn next_streamable_segment(
+  accumulated: &str,
+  flushed_prefix: &mut String,
+  force_flush: bool,
+) -> Option<String> {
+  if accumulated.len() <= flushed_prefix.len() {
+    return None;
+  }
+  let pending = &accumulated[flushed_prefix.len()..];
+  let mut boundary: Option<usize> = None;
+  let mut last_space: Option<usize> = None;
+  for (index, ch) in pending.char_indices() {
+    if ch.is_whitespace() {
+      last_space = Some(index + ch.len_utf8());
+    }
+    if matches!(ch, '.' | '!' | '?' | '\n' | ',' | ';' | ':') {
+      boundary = Some(index + ch.len_utf8());
+    }
+  }
+  let cut = if let Some(boundary) = boundary {
+    Some(boundary)
+  } else if pending.len() > 48 {
+    last_space
+  } else if force_flush {
+    Some(pending.len())
+  } else {
+    None
+  }?;
+  let segment = pending[..cut].trim().to_string();
+  *flushed_prefix = accumulated[..flushed_prefix.len() + cut].to_string();
+  if segment.is_empty() {
+    return None;
+  }
+  Some(segment)
+}
+
 fn strip_think_text(content: &str) -> String {
   let mut cleaned = content.to_string();
   while let Some(start) = cleaned.find("<think>") {
@@ -662,7 +1679,42 @@ fn strip_think_text(content: &str) -> String {
       break;
     }
   }
-  cleaned
+  let mut normalized = cleaned
+    .lines()
+    .filter_map(|line| {
+      let trimmed = line.trim();
+      let lowered = trimmed.to_ascii_lowercase();
+      if trimmed.is_empty() {
+        return None;
+      }
+      if lowered == "flash think"
+        || lowered == "flash-think"
+        || lowered == "thinking"
+        || lowered == "thinking:"
+        || lowered == "internal reasoning"
+        || lowered == "internal reasoning:"
+      {
+        return None;
+      }
+      if lowered.starts_with("flash think:") || lowered.starts_with("flash-think:") {
+        return Some(trimmed[trimmed.find(':').map(|idx| idx + 1).unwrap_or(0)..].trim().to_string());
+      }
+      Some(trimmed.to_string())
+    })
+    .collect::<Vec<_>>()
+    .join(" ");
+
+  for prefix in [
+    "flash think:",
+    "flash-think:",
+    "thinking:",
+    "internal reasoning:",
+  ] {
+    if normalized.to_ascii_lowercase().starts_with(prefix) {
+      normalized = normalized[prefix.len()..].trim().to_string();
+    }
+  }
+  normalized
 }
 
 fn sanitize_text(text: &str) -> String {
@@ -678,6 +1730,45 @@ fn sanitize_text(text: &str) -> String {
 fn is_usable_call_reply(text: &str) -> bool {
   let lowered = text.to_lowercase();
   !lowered.contains("<think>") && !lowered.contains("thinking process") && !text.trim().is_empty()
+}
+
+fn wants_explanatory_answer(transcript_text: &str) -> bool {
+  let lowered = transcript_text.to_lowercase();
+  lowered.contains("how ")
+    || lowered.starts_with("how")
+    || lowered.contains("why ")
+    || lowered.starts_with("why")
+    || lowered.contains("what is ")
+    || lowered.contains("what are ")
+    || lowered.contains("tell me how")
+    || lowered.contains("tell me about")
+    || lowered.contains("can you explain")
+    || lowered.contains("explain ")
+}
+
+fn is_acknowledgment_only_reply(reply_text: &str) -> bool {
+  let normalized = reply_text.trim().to_lowercase();
+  let short_reply = normalized.len() <= 140;
+  short_reply
+    && [
+      "that's a great",
+      "that is a great",
+      "good question",
+      "i'd love to help",
+      "i would love to help",
+      "sure,",
+      "sure.",
+      "absolutely,",
+      "absolutely.",
+      "of course,",
+      "of course.",
+      "okay,",
+      "okay.",
+      "alright,",
+      "alright.",
+    ]
+    .iter()
+    .any(|needle| normalized.starts_with(needle))
 }
 
 fn fallback_call_reply(transcript_text: &str) -> String {

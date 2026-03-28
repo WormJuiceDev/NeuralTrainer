@@ -57,6 +57,14 @@ struct RuntimeConfig {
     state_path: PathBuf,
     vapid_subject: String,
     allowed_origins: Vec<HeaderValue>,
+    rtc_ice_servers: Vec<IceServerConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct IceServerConfig {
+    urls: Vec<String>,
+    username: Option<String>,
+    credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -444,6 +452,11 @@ struct WebRtcSignalsResponse {
     signals: Vec<WebRtcSignal>,
 }
 
+#[derive(Debug, Serialize)]
+struct RtcConfigResponse {
+    ice_servers: Vec<IceServerConfig>,
+}
+
 #[derive(Debug, Deserialize)]
 struct CreateMobileCallTurnRequest {
     call_id: String,
@@ -555,6 +568,7 @@ async fn main() {
         .route("/api/companion/call-turns/desktop-pull", get(pull_desktop_call_turn))
         .route("/api/companion/call-turns/desktop-complete", post(complete_desktop_call_turn))
         .route("/api/companion/push-subscriptions", get(get_push_status).post(upsert_push_subscription))
+        .route("/api/companion/rtc-config", get(get_rtc_config))
         .route("/api/companion/webrtc-signals", get(list_mobile_webrtc_signals).post(create_mobile_webrtc_signal))
         .route("/api/companion/webrtc-signals/from-desktop", post(create_desktop_webrtc_signal))
         .route("/api/companion/webrtc-signals/desktop-pull", get(list_desktop_webrtc_signals))
@@ -601,11 +615,44 @@ fn load_runtime_config() -> RuntimeConfig {
         })
         .unwrap_or_default();
 
+    let mut rtc_ice_servers = vec![
+        IceServerConfig {
+            urls: vec!["stun:stun.l.google.com:19302".to_string()],
+            username: None,
+            credential: None,
+        },
+        IceServerConfig {
+            urls: vec!["stun:stun.cloudflare.com:3478".to_string()],
+            username: None,
+            credential: None,
+        },
+    ];
+
+    let turn_urls = env::var("NORTHSTAR_TURN_URLS")
+        .ok()
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if !turn_urls.is_empty() {
+        rtc_ice_servers.push(IceServerConfig {
+            urls: turn_urls,
+            username: env::var("NORTHSTAR_TURN_USERNAME").ok().filter(|value| !value.trim().is_empty()),
+            credential: env::var("NORTHSTAR_TURN_CREDENTIAL").ok().filter(|value| !value.trim().is_empty()),
+        });
+    }
+
     RuntimeConfig {
         bind_addr,
         state_path,
         vapid_subject,
         allowed_origins,
+        rtc_ice_servers,
     }
 }
 
@@ -1483,6 +1530,17 @@ async fn create_signal(
     });
 
     Ok(())
+}
+
+async fn get_rtc_config(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<RtcConfigResponse>, AppError> {
+    let _ = require_session(&state, &headers).await?;
+    let config = load_runtime_config();
+    Ok(Json(RtcConfigResponse {
+        ice_servers: config.rtc_ice_servers,
+    }))
 }
 
 async fn create_message_for_user(

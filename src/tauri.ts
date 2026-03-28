@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type {
   AppSettings,
   CallSessionSnapshot,
@@ -17,6 +18,7 @@ import type {
   MemoryGrowthSnapshot,
   MvpRealityCheckSnapshot,
   NorthStarSnapshot,
+  NorthStarRtcIceServer,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
   OutreachDispatchResult,
@@ -34,6 +36,7 @@ import type {
   SpeechStreamSnapshot,
   StartSpeechStreamInput,
   StopSpeechStreamInput,
+  PushSpeechStreamAudioInput,
   VoiceSnapshot,
   VoiceSynthesisResult,
   PassiveContextSnapshot,
@@ -87,11 +90,37 @@ export const processNextNorthStarCallTurn = () =>
 export const processNorthStarLiveTurn = (sessionId: number, audioBase64: string) =>
   invoke<CallTurnResult>("process_north_star_live_turn", { sessionId, audioBase64 });
 
+export type NorthStarLiveReplyStreamEvent = {
+  requestId: string;
+  phase: string;
+  transcriptText?: string | null;
+  replyText?: string | null;
+  replyMode?: string | null;
+  textChunk?: string | null;
+  audioBase64?: string | null;
+  sampleRate?: number | null;
+  chunkIndex?: number | null;
+  message?: string | null;
+};
+
+export const startNorthStarLiveTurnStream = (sessionId: number, audioBase64: string, requestId: string) =>
+  invoke<void>("start_north_star_live_turn_stream", { sessionId, audioBase64, requestId });
+
+export const completeNorthStarLiveSpeechStream = (sessionId: number, requestId: string) =>
+  invoke<void>("complete_north_star_live_speech_stream", { sessionId, requestId });
+
+export const listenNorthStarLiveReplyStream = (
+  handler: (payload: NorthStarLiveReplyStreamEvent) => void,
+) => listen<NorthStarLiveReplyStreamEvent>("north-star-live-reply-stream", (event) => handler(event.payload));
+
 export const sendNorthStarWebRtcSignal = (callId: string, signalKind: string, payloadJson: string) =>
   invoke<void>("send_north_star_webrtc_signal", { callId, signalKind, payloadJson });
 
 export const pullNorthStarWebRtcSignals = (callId: string) =>
   invoke<NorthStarWebRtcSignal[]>("pull_north_star_webrtc_signals", { callId });
+
+export const getNorthStarRtcConfig = () =>
+  invoke<NorthStarRtcIceServer[]>("get_north_star_rtc_config");
 
 export const getVoiceSnapshot = () => invoke<VoiceSnapshot>("get_voice_snapshot");
 
@@ -113,11 +142,17 @@ export const setupLocalSpeech = () =>
 export const synthesizeVoicePreview = () =>
   invoke<VoiceSynthesisResult>("synthesize_voice_preview");
 
+export const synthesizeNorthStarPhrase = (text: string) =>
+  invoke<VoiceSynthesisResult>("synthesize_north_star_phrase", { text });
+
 export const getSpeechStreamSnapshot = () =>
   invoke<SpeechStreamSnapshot>("get_speech_stream_snapshot");
 
 export const startSpeechStream = (payload: StartSpeechStreamInput) =>
   invoke<SpeechStreamSnapshot>("start_speech_stream", { payload });
+
+export const pushSpeechStreamAudio = (payload: PushSpeechStreamAudioInput) =>
+  invoke<SpeechStreamSnapshot>("push_speech_stream_audio", { payload });
 
 export const stopSpeechStreamAndReply = (payload: StopSpeechStreamInput) =>
   invoke<CallTurnResult>("stop_speech_stream_and_reply", { payload });

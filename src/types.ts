@@ -20,6 +20,8 @@ export type AppSettings = {
   lmStudioApiKey: string;
   lmStudioModel: string;
   ttsProvider: string;
+  ttsEndpoint: string;
+  ttsApiKey: string;
   ttsModelId: string;
   ttsSampleRate: number;
   ttsDefaultVoice: string;
@@ -107,6 +109,12 @@ export type NorthStarWebRtcSignal = {
   signalKind: string;
   payloadJson: string;
   createdAt: string;
+};
+
+export type NorthStarRtcIceServer = {
+  urls: string[];
+  username: string | null;
+  credential: string | null;
 };
 
 export type NorthStarSnapshot = {
@@ -599,6 +607,11 @@ export type VoiceSnapshot = {
   missingFiles: string[];
   runtimeReady: boolean;
   runtimeDetail: string;
+  managedRuntime: boolean;
+  runtimeEndpoint: string;
+  runtimeRoot: string;
+  runtimeStdoutLog: string;
+  runtimeStderrLog: string;
   speechReady: boolean;
   speechRuntimeReady: boolean;
   speechRuntimeDetail: string;
@@ -640,6 +653,13 @@ export type StartSpeechStreamInput = {
 
 export type StopSpeechStreamInput = {
   sessionId: number;
+};
+
+export type PushSpeechStreamAudioInput = {
+  sessionId: number;
+  audioBase64: string;
+  sampleRate: number;
+  audioFormat?: string | null;
 };
 
 export type RunCallTurnInput = {

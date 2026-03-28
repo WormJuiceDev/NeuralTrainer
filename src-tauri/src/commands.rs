@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use serde_json::json;
-use tauri::State;
+use tauri::{async_runtime, AppHandle, Emitter, State};
 
 use crate::{
   db,
@@ -8,9 +8,9 @@ use crate::{
   models::{
     AppSettings, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompleteTelegramUserLoginInput, DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
-    MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
-    SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarWebRtcSignal,
-    PhaseThreeSnapshot, Place, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
+    MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
+    SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
+    PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, SubmitFeedbackInput, UpdateMemoryItemInput,
     TelegramCallActionResult, TelegramCallTransportSnapshot, TelegramConnectionSnapshot, TelegramSendResult, TelegramUserActionResult, TelegramUserSnapshot, UpdatePlaceInput, UpdateRuleInput,
   },
@@ -167,9 +167,8 @@ pub fn import_north_star_call_reviews(
   )
 }
 
-#[tauri::command]
-pub fn process_next_north_star_call_turn(
-  state: State<'_, AppState>,
+fn process_next_north_star_call_turn_impl(
+  state: &AppState,
 ) -> Result<NorthStarTurnProcessingResult, AppError> {
   let settings = db::load_settings(&state.db_path)?;
   let session_snapshot = db::call_session_snapshot(&state.db_path, None)?;
@@ -198,6 +197,7 @@ pub fn process_next_north_star_call_turn(
       state.app_data_dir.as_ref().as_path(),
       &settings,
       &state.voice_worker,
+      &state.kokoro_fastapi_runtime,
       local_session.id,
       &input_audio,
       &session_context,
@@ -220,8 +220,17 @@ pub fn process_next_north_star_call_turn(
 }
 
 #[tauri::command]
-pub fn process_north_star_live_turn(
+pub async fn process_next_north_star_call_turn(
   state: State<'_, AppState>,
+) -> Result<NorthStarTurnProcessingResult, AppError> {
+  let state = state.inner().clone();
+  async_runtime::spawn_blocking(move || process_next_north_star_call_turn_impl(&state))
+    .await
+    .map_err(|caught| AppError::Message(format!("North Star turn processor task failed: {caught}")))?
+}
+
+fn process_north_star_live_turn_impl(
+  state: &AppState,
   session_id: i64,
   audio_base64: String,
 ) -> Result<CallTurnResult, AppError> {
@@ -252,6 +261,7 @@ pub fn process_north_star_live_turn(
     state.app_data_dir.as_ref().as_path(),
     &settings,
     &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
     session.id,
     &input_audio,
     &session_context,
@@ -267,6 +277,198 @@ pub fn process_north_star_live_turn(
 
   state.push_event(format!("Processed a live North Star turn for session {}.", session.id));
   Ok(result)
+}
+
+#[tauri::command]
+pub async fn process_north_star_live_turn(
+  state: State<'_, AppState>,
+  session_id: i64,
+  audio_base64: String,
+) -> Result<CallTurnResult, AppError> {
+  let state = state.inner().clone();
+  async_runtime::spawn_blocking(move || process_north_star_live_turn_impl(&state, session_id, audio_base64))
+    .await
+    .map_err(|caught| AppError::Message(format!("North Star live turn task failed: {caught}")))?
+}
+
+fn stream_north_star_live_turn_impl(
+  app: AppHandle,
+  state: &AppState,
+  session_id: i64,
+  audio_base64: String,
+  request_id: String,
+) -> Result<(), AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let session_snapshot = db::call_session_snapshot(&state.db_path, Some(session_id))?;
+  let session = session_snapshot
+    .active_session
+    .ok_or_else(|| AppError::Message("There is no active North Star live call session.".into()))?;
+
+  if session.handoff_kind != "north_star_companion" {
+    return Err(AppError::Message("The active session is not a North Star call.".into()));
+  }
+
+  let input_audio = base64::engine::general_purpose::STANDARD
+    .decode(audio_base64.as_bytes())
+    .map_err(|caught| AppError::Message(format!("North Star live audio was invalid: {caught}")))?;
+
+  let session_context = format!(
+    "handoff kind: {}\nnotes: {}\noutcome so far: {}\ntranscript summary so far: {}\nrecent exchange:\n{}",
+    session.handoff_kind,
+    session.notes,
+    session.outcome,
+    session.transcript_summary,
+    db::build_call_turn_context(&state.db_path, session.id, 3)?,
+  );
+
+  let result = voice::run_uploaded_call_turn_streaming(
+    state.app_data_dir.as_ref().as_path(),
+    &settings,
+    &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
+    session.id,
+    &input_audio,
+    &session_context,
+    &request_id,
+    |event: NorthStarLiveReplyStreamEvent| {
+      app.emit("north-star-live-reply-stream", &event)
+        .map_err(|caught| AppError::Message(format!("Could not emit North Star live reply event: {caught}")))?;
+      Ok(())
+    },
+  )?;
+
+  db::save_call_turn(
+    &state.db_path,
+    session.id,
+    &result.transcript_text,
+    &result.reply_text,
+    &result.reply_mode,
+  )?;
+
+  state.push_event(format!("Streamed a live North Star turn for session {}.", session.id));
+  Ok(())
+}
+
+fn complete_north_star_live_speech_stream_impl(
+  app: AppHandle,
+  state: &AppState,
+  session_id: i64,
+  request_id: String,
+) -> Result<(), AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let session_snapshot = db::call_session_snapshot(&state.db_path, Some(session_id))?;
+  let session = session_snapshot
+    .active_session
+    .ok_or_else(|| AppError::Message("There is no active North Star live call session.".into()))?;
+
+  if session.handoff_kind != "north_star_companion" {
+    return Err(AppError::Message("The active session is not a North Star call.".into()));
+  }
+
+  let session_context = format!(
+    "handoff kind: {}\nnotes: {}\noutcome so far: {}\ntranscript summary so far: {}\nrecent exchange:\n{}",
+    session.handoff_kind,
+    session.notes,
+    session.outcome,
+    session.transcript_summary,
+    db::build_call_turn_context(&state.db_path, session.id, 3)?,
+  );
+
+  let result = voice::stop_speech_stream_and_stream_reply(
+    state.app_data_dir.as_ref().as_path(),
+    &settings,
+    &state.voice_worker,
+    &state.speech_stream_worker,
+    &state.kokoro_fastapi_runtime,
+    session.id,
+    &session_context,
+    &request_id,
+    |event: NorthStarLiveReplyStreamEvent| {
+      app.emit("north-star-live-reply-stream", &event)
+        .map_err(|caught| AppError::Message(format!("Could not emit North Star live reply event: {caught}")))?;
+      Ok(())
+    },
+  )?;
+
+  db::save_call_turn(
+    &state.db_path,
+    session.id,
+    &result.transcript_text,
+    &result.reply_text,
+    &result.reply_mode,
+  )?;
+
+  state.push_event(format!("Completed a streamed North Star speech turn for session {}.", session.id));
+  Ok(())
+}
+
+#[tauri::command]
+pub async fn start_north_star_live_turn_stream(
+  app: AppHandle,
+  state: State<'_, AppState>,
+  session_id: i64,
+  audio_base64: String,
+  request_id: String,
+) -> Result<(), AppError> {
+  let state = state.inner().clone();
+  async_runtime::spawn_blocking(move || {
+    let result = stream_north_star_live_turn_impl(app.clone(), &state, session_id, audio_base64, request_id.clone());
+    if let Err(error) = result {
+      let _ = app.emit(
+        "north-star-live-reply-stream",
+        &NorthStarLiveReplyStreamEvent {
+          request_id,
+          phase: "error".into(),
+          transcript_text: None,
+          reply_text: None,
+          reply_mode: None,
+          text_chunk: None,
+          audio_base64: None,
+          sample_rate: None,
+          chunk_index: None,
+          message: Some(error.to_string()),
+        },
+      );
+      return Err(error);
+    }
+    Ok(())
+  })
+    .await
+    .map_err(|caught| AppError::Message(format!("North Star live stream task failed: {caught}")))?
+}
+
+#[tauri::command]
+pub async fn complete_north_star_live_speech_stream(
+  app: AppHandle,
+  state: State<'_, AppState>,
+  session_id: i64,
+  request_id: String,
+) -> Result<(), AppError> {
+  let state = state.inner().clone();
+  async_runtime::spawn_blocking(move || {
+    let result = complete_north_star_live_speech_stream_impl(app.clone(), &state, session_id, request_id.clone());
+    if let Err(error) = result {
+      let _ = app.emit(
+        "north-star-live-reply-stream",
+        &NorthStarLiveReplyStreamEvent {
+          request_id,
+          phase: "error".into(),
+          transcript_text: None,
+          reply_text: None,
+          reply_mode: None,
+          text_chunk: None,
+          audio_base64: None,
+          sample_rate: None,
+          chunk_index: None,
+          message: Some(error.to_string()),
+        },
+      );
+      return Err(error);
+    }
+    Ok(())
+  })
+    .await
+    .map_err(|caught| AppError::Message(format!("North Star live speech completion task failed: {caught}")))?
 }
 
 #[tauri::command]
@@ -296,6 +498,14 @@ pub fn pull_north_star_webrtc_signals(
 }
 
 #[tauri::command]
+pub fn get_north_star_rtc_config(
+  state: State<'_, AppState>,
+) -> Result<Vec<NorthStarRtcIceServer>, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  north_star::fetch_rtc_config(&settings)
+}
+
+#[tauri::command]
 pub fn get_voice_snapshot(state: State<'_, AppState>) -> Result<VoiceSnapshot, AppError> {
   let settings = db::load_settings(&state.db_path)?;
   let worker_loaded = state
@@ -303,7 +513,7 @@ pub fn get_voice_snapshot(state: State<'_, AppState>) -> Result<VoiceSnapshot, A
     .lock()
     .map_err(|_| AppError::Message("Voice worker mutex was poisoned.".into()))?
     .is_some();
-  voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded)
+  voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded, &state.kokoro_fastapi_runtime)
 }
 
 #[tauri::command]
@@ -336,7 +546,7 @@ pub fn download_kokoro_assets(
     .lock()
     .map_err(|_| AppError::Message("Voice worker mutex was poisoned.".into()))?
     .is_some();
-  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded)?;
+  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded, &state.kokoro_fastapi_runtime)?;
   state.push_event("Downloaded Kokoro voice model files.");
   Ok(snapshot)
 }
@@ -350,8 +560,9 @@ pub fn prepare_kokoro_runtime(
     state.app_data_dir.as_ref().as_path(),
     &settings,
     &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
   )?;
-  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, true)?;
+  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, true, &state.kokoro_fastapi_runtime)?;
   state.push_event("Prepared Kokoro Python runtime.");
   Ok(snapshot)
 }
@@ -367,7 +578,7 @@ pub fn setup_local_speech(
     .lock()
     .map_err(|_| AppError::Message("Voice worker mutex was poisoned.".into()))?
     .is_some();
-  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded)?;
+  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, worker_loaded, &state.kokoro_fastapi_runtime)?;
   state.push_event("Prepared local speech-input runtime.");
   Ok(snapshot)
 }
@@ -381,8 +592,26 @@ pub fn synthesize_voice_preview(
     state.app_data_dir.as_ref().as_path(),
     &settings,
     &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
   )?;
   state.push_event(format!("Synthesized Kokoro voice preview at {}.", result.output_path));
+  Ok(result)
+}
+
+#[tauri::command]
+pub fn synthesize_north_star_phrase(
+  state: State<'_, AppState>,
+  text: String,
+) -> Result<VoiceSynthesisResult, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let result = voice::synthesize_phrase(
+    state.app_data_dir.as_ref().as_path(),
+    &settings,
+    &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
+    text.trim(),
+  )?;
+  state.push_event(format!("Synthesized North Star line at {}.", result.output_path));
   Ok(result)
 }
 
@@ -450,6 +679,7 @@ pub fn stop_speech_stream_and_reply(
     &settings,
     &state.voice_worker,
     &state.speech_stream_worker,
+    &state.kokoro_fastapi_runtime,
     payload.session_id,
     &session_context,
   )?;
@@ -462,6 +692,32 @@ pub fn stop_speech_stream_and_reply(
   )?;
   state.push_event(format!("Stopped live speech stream for session {} and generated a reply.", payload.session_id));
   Ok(result)
+}
+
+#[tauri::command]
+pub fn push_speech_stream_audio(
+  state: State<'_, AppState>,
+  payload: PushSpeechStreamAudioInput,
+) -> Result<SpeechStreamSnapshot, AppError> {
+  let call_session_snapshot = db::call_session_snapshot(&state.db_path, Some(payload.session_id))?;
+  if call_session_snapshot.active_session.is_none() {
+    return Err(AppError::Message("There is no active call session to feed.".into()));
+  }
+  let snapshot = voice::push_speech_stream_audio(
+    &state.speech_stream_worker,
+    payload.session_id,
+    &payload.audio_base64,
+    payload.sample_rate as i32,
+    payload.audio_format.as_deref().unwrap_or("pcm16le"),
+  )?;
+  Ok(SpeechStreamSnapshot {
+    active: snapshot.active,
+    started_at: snapshot.started_at,
+    partial_text: snapshot.partial_text,
+    final_text: snapshot.final_text,
+    status: snapshot.status,
+    last_error: snapshot.last_error,
+  })
 }
 
 #[tauri::command]
@@ -486,6 +742,7 @@ pub fn run_call_turn(
     state.app_data_dir.as_ref().as_path(),
     &settings,
     &state.voice_worker,
+    &state.kokoro_fastapi_runtime,
     payload.session_id,
     payload.duration_seconds,
     &session_context,
@@ -510,9 +767,10 @@ pub fn clear_voice_assets(state: State<'_, AppState>) -> Result<VoiceSnapshot, A
     state.app_data_dir.as_ref().as_path(),
     &state.voice_worker,
     &state.speech_stream_worker,
+    &state.kokoro_fastapi_runtime,
   )?;
   let settings = db::load_settings(&state.db_path)?;
-  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, false)?;
+  let snapshot = voice::voice_snapshot(state.app_data_dir.as_ref().as_path(), &settings, false, &state.kokoro_fastapi_runtime)?;
   state.push_event("Cleared local voice assets.");
   Ok(snapshot)
 }
@@ -524,6 +782,7 @@ pub fn clear_all_local_data(state: State<'_, AppState>) -> Result<(), AppError> 
     state.app_data_dir.as_ref().as_path(),
     &state.voice_worker,
     &state.speech_stream_worker,
+    &state.kokoro_fastapi_runtime,
   )?;
   telegram_user::clear_local_session(state.app_data_dir.as_ref().as_path())?;
   telegram_call::clear_local_state(state.app_data_dir.as_ref().as_path())?;

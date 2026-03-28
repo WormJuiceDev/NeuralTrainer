@@ -198,7 +198,14 @@ const SESSION_STORAGE_KEY = "northstar.session";
 const DEVICE_STORAGE_KEY = "northstar.deviceToken";
 const LOCATION_QUEUE_KEY = "northstar.locationQueue";
 const CALL_REVIEW_QUEUE_KEY = "northstar.pendingCallReviews";
-const LIVE_CHANNEL_CHUNK_SIZE = 48_000;
+const LIVE_CHANNEL_CHUNK_SIZE = 6_000;
+const LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
+const LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
+const MOBILE_OUTBOUND_CALL_NOTE = "North Star is calling from your phone.";
+const LIVE_CALL_OPENING_TEXT = "Hi, you wanted to talk?";
+const NORTHSTAR_MOBILE_VERSION = "v48";
+const MIN_SETUP_TONE_MS = 1500;
+const LIVE_TURN_DATA_CHANNEL_MAX_BASE64 = 180_000;
 
 const CALL_STATUS_LABELS: Record<CallStatus, string> = {
   pending: "Ringing",
@@ -214,6 +221,134 @@ const SENTIMENT_LABELS: Record<CallReviewSentiment, string> = {
   mistimed: "Mistimed",
   intrusive: "Too intrusive",
 };
+
+type LiveCallDiagnostics = {
+  phase: string;
+  signalingState: string;
+  iceGatheringState: string;
+  iceConnectionState: string;
+  connectionState: string;
+  dataChannelState: string;
+  remoteTrackState: string;
+  lastSignal: string;
+  localIceCandidates: number;
+  remoteIceCandidates: number;
+  localCandidateKinds: string;
+  remoteCandidateKinds: string;
+  icePolicy: string;
+  iceServerKinds: string;
+  issue: string;
+};
+
+type LiveInputMeter = {
+  rms: number;
+  peak: number;
+  speaking: boolean;
+  trackEnabled: boolean;
+  trackMuted: boolean;
+  trackReadyState: string;
+};
+
+type LiveTurnTransportStats = {
+  liveTurnsSent: number;
+  liveTurnChunksSent: number;
+  lastLiveTurnRequestId: string;
+};
+
+type LiveConversationPhase =
+  | "idle"
+  | "connecting_transport"
+  | "waiting_for_opening_audio"
+  | "ready_for_user"
+  | "assistant_processing"
+  | "assistant_speaking";
+
+type RtcIceServer = {
+  urls: string[];
+  username: string | null;
+  credential: string | null;
+};
+
+const defaultLiveCallDiagnostics: LiveCallDiagnostics = {
+  phase: "idle",
+  signalingState: "idle",
+  iceGatheringState: "idle",
+  iceConnectionState: "idle",
+  connectionState: "idle",
+  dataChannelState: "idle",
+  remoteTrackState: "waiting",
+  lastSignal: "none",
+  localIceCandidates: 0,
+  remoteIceCandidates: 0,
+  localCandidateKinds: "none",
+  remoteCandidateKinds: "none",
+  icePolicy: "all",
+  iceServerKinds: "stun",
+  issue: "",
+};
+
+const defaultLiveInputMeter: LiveInputMeter = {
+  rms: 0,
+  peak: 0,
+  speaking: false,
+  trackEnabled: false,
+  trackMuted: true,
+  trackReadyState: "missing",
+};
+
+const defaultLiveTurnTransportStats: LiveTurnTransportStats = {
+  liveTurnsSent: 0,
+  liveTurnChunksSent: 0,
+  lastLiveTurnRequestId: "none",
+};
+
+const LIVE_WEBRTC_CONFIG: RTCConfiguration = {
+  iceServers: [
+    { urls: "stun:stun.l.google.com:19302" },
+    { urls: "stun:stun.cloudflare.com:3478" },
+  ],
+};
+
+function detectCandidateKind(candidateLine: string) {
+  const match = candidateLine.match(/\btyp\s+([a-z0-9]+)/i);
+  return match?.[1]?.toLowerCase() ?? "unknown";
+}
+
+function mergeCandidateKindList(current: string, nextKind: string) {
+  const existing = current === "none" ? [] : current.split(",").map((value) => value.trim()).filter(Boolean);
+  if (!existing.includes(nextKind)) {
+    existing.push(nextKind);
+  }
+  return existing.length ? existing.join(", ") : "none";
+}
+
+function describeIceServerKinds(servers: RTCIceServer[]) {
+  const kinds = new Set<string>();
+  servers.forEach((server) => {
+    const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+    urls.forEach((url) => {
+      if (typeof url !== "string") return;
+      const normalized = url.trim().toLowerCase();
+      if (normalized.startsWith("turn:")) {
+        kinds.add("turn");
+      } else if (normalized.startsWith("turns:")) {
+        kinds.add("turns");
+      } else if (normalized.startsWith("stun:")) {
+        kinds.add("stun");
+      }
+    });
+  });
+  return Array.from(kinds).join(", ") || "none";
+}
+
+function hasStableLiveMedia(peer: RTCPeerConnection | null, remoteStream: MediaStream | null) {
+  return Boolean(
+    peer
+    && peer.connectionState === "connected"
+    && peer.iceConnectionState === "connected"
+    && remoteStream,
+  );
+}
 
 function formatDateTime(value: string | null, options?: Intl.DateTimeFormatOptions) {
   if (!value) return "Not yet";
@@ -276,8 +411,76 @@ function replyAudioUrl(base64: string | null) {
   return `data:audio/wav;base64,${base64}`;
 }
 
+function createSetupToneUrl() {
+  const sampleRate = 24_000;
+  const durationSeconds = 2.5;
+  const totalSamples = Math.floor(sampleRate * durationSeconds);
+  const pcm = new Int16Array(totalSamples);
+  const attackSeconds = 0.02;
+  const releaseSeconds = 0.08;
+
+  const addDualTone = (startSeconds: number, toneSeconds: number, frequencyA: number, frequencyB: number, gain = 0.22) => {
+    const startIndex = Math.floor(startSeconds * sampleRate);
+    const toneSamples = Math.floor(toneSeconds * sampleRate);
+    const attackSamples = Math.max(1, Math.floor(attackSeconds * sampleRate));
+    const releaseSamples = Math.max(1, Math.floor(releaseSeconds * sampleRate));
+    for (let offset = 0; offset < toneSamples && startIndex + offset < pcm.length; offset += 1) {
+      let envelope = 1;
+      if (offset < attackSamples) {
+        envelope = offset / attackSamples;
+      } else if (offset > toneSamples - releaseSamples) {
+        envelope = Math.max(0, (toneSamples - offset) / releaseSamples);
+      }
+      const time = offset / sampleRate;
+      const sample =
+        gain
+        * envelope
+        * (
+          Math.sin(2 * Math.PI * frequencyA * time)
+          + Math.sin(2 * Math.PI * frequencyB * time)
+        )
+        * 0.5;
+      pcm[startIndex + offset] = Math.max(-32767, Math.min(32767, Math.round(sample * 32767)));
+    }
+  };
+
+  addDualTone(0.0, 0.42, 425, 480);
+  addDualTone(1.25, 0.42, 425, 480);
+
+  const buffer = new ArrayBuffer(44 + pcm.length * 2);
+  const view = new DataView(buffer);
+  const writeAscii = (offset: number, value: string) => {
+    for (let index = 0; index < value.length; index += 1) {
+      view.setUint8(offset + index, value.charCodeAt(index));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + pcm.length * 2, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, pcm.length * 2, true);
+  for (let index = 0; index < pcm.length; index += 1) {
+    view.setInt16(44 + index * 2, pcm[index], true);
+  }
+  return URL.createObjectURL(new Blob([buffer], { type: "audio/wav" }));
+}
+
+function callWasStartedFromPhone(call: CompanionCallSession | null) {
+  if (!call) return false;
+  return call.note.trim() === MOBILE_OUTBOUND_CALL_NOTE;
+}
+
 function getLiveCallStatusCopy(
-  callLoopState: "idle" | "listening" | "processing" | "speaking",
+  liveConversationPhase: LiveConversationPhase,
   callLoopMuted: boolean,
 ) {
   if (callLoopMuted) {
@@ -286,19 +489,31 @@ function getLiveCallStatusCopy(
       detail: "North Star will keep the line open until you unmute.",
     };
   }
-  if (callLoopState === "processing") {
+  if (liveConversationPhase === "connecting_transport") {
+    return {
+      headline: "Connecting the line",
+      detail: "Stay on the line while North Star finishes connecting everything.",
+    };
+  }
+  if (liveConversationPhase === "waiting_for_opening_audio") {
+    return {
+      headline: "NeuralTrainer is joining",
+      detail: "The line is ready. Hold on while NeuralTrainer opens the conversation.",
+    };
+  }
+  if (liveConversationPhase === "assistant_processing") {
     return {
       headline: "North Star is responding",
       detail: "Hold on for a moment while NeuralTrainer prepares the reply.",
     };
   }
-  if (callLoopState === "speaking") {
+  if (liveConversationPhase === "assistant_speaking") {
     return {
       headline: "North Star is speaking",
       detail: "NeuralTrainer is answering you out loud right now.",
     };
   }
-  if (callLoopState === "listening") {
+  if (liveConversationPhase === "ready_for_user") {
     return {
       headline: "North Star is listening",
       detail: "Speak naturally. North Star is waiting for what you say next.",
@@ -349,7 +564,9 @@ function urlBase64ToUint8Array(base64String: string): ArrayBuffer {
 }
 
 function audioBufferToWavBase64(channelData: Float32Array[], sampleRate: number) {
-  const totalSamples = channelData.reduce((count, chunk) => count + chunk.length, 0);
+  const trimmedChunks = trimCallAudioSilence(channelData, sampleRate);
+  const normalizedChunks = normalizeCallAudio(trimmedChunks);
+  const totalSamples = normalizedChunks.reduce((count, chunk) => count + chunk.length, 0);
   const bytesPerSample = 2;
   const blockAlign = bytesPerSample;
   const buffer = new ArrayBuffer(44 + totalSamples * bytesPerSample);
@@ -375,7 +592,6 @@ function audioBufferToWavBase64(channelData: Float32Array[], sampleRate: number)
   view.setUint32(40, totalSamples * bytesPerSample, true);
 
   let offset = 44;
-  const normalizedChunks = normalizeCallAudio(channelData);
   for (const chunk of normalizedChunks) {
     for (let index = 0; index < chunk.length; index += 1) {
       const sample = Math.max(-1, Math.min(1, chunk[index]));
@@ -390,6 +606,61 @@ function audioBufferToWavBase64(channelData: Float32Array[], sampleRate: number)
     binary += String.fromCharCode(bytes[index]);
   }
   return window.btoa(binary);
+}
+
+function float32ChunkToPcm16Base64(chunk: Float32Array) {
+  const buffer = new ArrayBuffer(chunk.length * 2);
+  const view = new DataView(buffer);
+  for (let index = 0; index < chunk.length; index += 1) {
+    const sample = Math.max(-1, Math.min(1, chunk[index]));
+    view.setInt16(index * 2, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true);
+  }
+  let binary = "";
+  const bytes = new Uint8Array(buffer);
+  for (let index = 0; index < bytes.length; index += 1) {
+    binary += String.fromCharCode(bytes[index]);
+  }
+  return window.btoa(binary);
+}
+
+function trimCallAudioSilence(channelData: Float32Array[], sampleRate: number) {
+  const flattened = new Float32Array(channelData.reduce((count, chunk) => count + chunk.length, 0));
+  let offset = 0;
+  for (const chunk of channelData) {
+    flattened.set(chunk, offset);
+    offset += chunk.length;
+  }
+  if (flattened.length === 0) {
+    return channelData;
+  }
+
+  const threshold = 0.008;
+  const paddingSamples = Math.floor(sampleRate * 0.18);
+  let first = -1;
+  let last = -1;
+  for (let index = 0; index < flattened.length; index += 1) {
+    if (Math.abs(flattened[index]) >= threshold) {
+      first = index;
+      break;
+    }
+  }
+  for (let index = flattened.length - 1; index >= 0; index -= 1) {
+    if (Math.abs(flattened[index]) >= threshold) {
+      last = index;
+      break;
+    }
+  }
+  if (first === -1 || last === -1) {
+    return channelData;
+  }
+
+  const start = Math.max(0, first - paddingSamples);
+  const end = Math.min(flattened.length, last + paddingSamples);
+  const trimmed = flattened.slice(start, end);
+  if (trimmed.length === 0 || trimmed.length === flattened.length) {
+    return channelData;
+  }
+  return [trimmed];
 }
 
 function normalizeCallAudio(channelData: Float32Array[]) {
@@ -466,8 +737,9 @@ function App() {
   });
   const [watchingLocation, setWatchingLocation] = useState(false);
   const [recordingTurn, setRecordingTurn] = useState(false);
-  const [callLoopState, setCallLoopState] = useState<"idle" | "listening" | "processing" | "speaking">("idle");
+  const [callLoopState, setCallLoopState] = useState<"idle" | "connecting" | "opening" | "listening" | "processing" | "speaking">("idle");
   const [callLoopMuted, setCallLoopMuted] = useState(false);
+  const [liveConversationPhase, setLiveConversationPhase] = useState<LiveConversationPhase>("idle");
   const [liveReplyAudioSrc, setLiveReplyAudioSrc] = useState<string | null>(null);
   const [message, setMessage] = useState("North Star is ready to keep you and NeuralTrainer in sync.");
 
@@ -482,20 +754,273 @@ function App() {
   const liveReplyAudioRef = useRef<HTMLAudioElement | null>(null);
   const lastPlayedReplyTurnIdRef = useRef<string | null>(null);
   const handsFreeCallIdRef = useRef<string | null>(null);
+  const pendingRecordingStartCallIdRef = useRef<string | null>(null);
+  const recordingTurnActiveRef = useRef(false);
   const speechDetectedRef = useRef(false);
   const silenceFrameCountRef = useRef(0);
   const speechFrameCountRef = useRef(0);
   const sendingTurnRef = useRef(false);
+  const liveStreamingTurnRequestIdRef = useRef<string | null>(null);
+  const liveStreamingTurnStartPromiseRef = useRef<Promise<string> | null>(null);
+  const callTurnUsesLivePeerStreamRef = useRef(false);
   const livePeerRef = useRef<RTCPeerConnection | null>(null);
   const liveDataChannelRef = useRef<RTCDataChannel | null>(null);
   const liveSignalCallIdRef = useRef<string | null>(null);
   const processedLiveSignalIdsRef = useRef<Set<string>>(new Set());
   const liveReplyChunksRef = useRef<Map<string, string[]>>(new Map());
+  const liveOpeningChunksRef = useRef<Map<string, string[]>>(new Map());
+  const liveReplyStreamChunkPartsRef = useRef<Map<string, string[]>>(new Map());
+  const liveStreamReplyQueueRef = useRef<Array<{ requestId: string; chunkIndex: number; audioBase64: string }>>([]);
+  const liveStreamReplySeenChunksRef = useRef<Map<string, Set<number>>>(new Map());
+  const liveStreamReplyRequestIdRef = useRef<string | null>(null);
+  const liveStreamReplyPlayingRef = useRef(false);
+  const liveStreamReplyCompletedRef = useRef(false);
   const liveRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const liveRemoteStreamRef = useRef<MediaStream | null>(null);
   const liveRemotePlaybackTimerRef = useRef<number | null>(null);
   const livePeerInputStreamRef = useRef<MediaStream | null>(null);
+  const liveInputMeterAudioContextRef = useRef<AudioContext | null>(null);
+  const liveInputMeterSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const liveInputMeterProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const liveInputMeterSinkRef = useRef<GainNode | null>(null);
+  const liveRtcIceServersRef = useRef<RTCIceServer[] | null>(null);
+  const liveNegotiationStartedAtRef = useRef<number | null>(null);
+  const outboundCallIdsRef = useRef<Set<string>>(new Set());
+  const liveOpeningRequestedCallIdRef = useRef<string | null>(null);
+  const liveOpeningStartedCallIdRef = useRef<string | null>(null);
+  const liveOpeningCompletedCallIdRef = useRef<string | null>(null);
+  const liveOpeningPlaybackTimerRef = useRef<number | null>(null);
+  const liveOpeningRequestTimeoutRef = useRef<number | null>(null);
+  const liveSetupTonePlayerRef = useRef<HTMLAudioElement | null>(null);
+  const liveSetupToneUrlRef = useRef<string | null>(null);
+  const liveSetupToneStartedAtRef = useRef<number | null>(null);
+  const liveDataChannelRecoveryTimerRef = useRef<number | null>(null);
+  const [liveCallDiagnostics, setLiveCallDiagnostics] = useState<LiveCallDiagnostics>(defaultLiveCallDiagnostics);
+  const [liveInputMeter, setLiveInputMeter] = useState<LiveInputMeter>(defaultLiveInputMeter);
+  const [liveTurnTransportStats, setLiveTurnTransportStats] = useState<LiveTurnTransportStats>(defaultLiveTurnTransportStats);
+  const [liveFallbackAllowed, setLiveFallbackAllowed] = useState(false);
   const wsBase = useMemo(() => apiBase.replace(/^http/i, "ws"), [apiBase]);
+
+  function teardownLiveInputMeter() {
+    liveInputMeterProcessorRef.current?.disconnect();
+    liveInputMeterSourceRef.current?.disconnect();
+    liveInputMeterSinkRef.current?.disconnect();
+    liveInputMeterAudioContextRef.current?.close().catch(() => undefined);
+    liveInputMeterProcessorRef.current = null;
+    liveInputMeterSourceRef.current = null;
+    liveInputMeterSinkRef.current = null;
+    liveInputMeterAudioContextRef.current = null;
+    setLiveInputMeter(defaultLiveInputMeter);
+  }
+
+  function startLiveInputMeter(stream: MediaStream) {
+    teardownLiveInputMeter();
+    const track = stream.getAudioTracks()[0] ?? null;
+    if (!track) {
+      setLiveInputMeter(defaultLiveInputMeter);
+      return;
+    }
+
+    const context = new AudioContext({ sampleRate: 16000 });
+    const source = context.createMediaStreamSource(stream);
+    const processor = context.createScriptProcessor(2048, 1, 1);
+    const sink = context.createGain();
+    sink.gain.value = 0;
+    source.connect(processor);
+    processor.connect(sink);
+    sink.connect(context.destination);
+    liveInputMeterAudioContextRef.current = context;
+    liveInputMeterSourceRef.current = source;
+    liveInputMeterProcessorRef.current = processor;
+    liveInputMeterSinkRef.current = sink;
+
+    const syncTrackState = () => {
+      setLiveInputMeter((current) => ({
+        ...current,
+        trackEnabled: track.enabled,
+        trackMuted: track.muted,
+        trackReadyState: track.readyState,
+      }));
+    };
+
+    track.onmute = syncTrackState;
+    track.onunmute = syncTrackState;
+    track.onended = syncTrackState;
+    syncTrackState();
+
+    if (context.state === "suspended") {
+      void context.resume().catch(() => undefined);
+    }
+
+    processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      let sum = 0;
+      let peak = 0;
+      for (let index = 0; index < input.length; index += 1) {
+        const sample = input[index];
+        const abs = Math.abs(sample);
+        if (abs > peak) {
+          peak = abs;
+        }
+        sum += sample * sample;
+      }
+      const rms = Math.sqrt(sum / input.length);
+      setLiveInputMeter({
+        rms,
+        peak,
+        speaking: rms > 0.008 || peak > 0.06,
+        trackEnabled: track.enabled,
+        trackMuted: track.muted,
+        trackReadyState: track.readyState,
+      });
+    };
+  }
+
+  function ensureLiveSetupTonePlayer() {
+    if (liveSetupTonePlayerRef.current) {
+      return liveSetupTonePlayerRef.current;
+    }
+    const audio = new Audio();
+    audio.loop = true;
+    audio.preload = "auto";
+    audio.setAttribute("playsinline", "true");
+    liveSetupTonePlayerRef.current = audio;
+    return audio;
+  }
+
+  function stopLiveSetupTone() {
+    const audio = liveSetupTonePlayerRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+    }
+    liveSetupToneStartedAtRef.current = null;
+  }
+
+  function resetLiveStreamReplyState() {
+    liveReplyStreamChunkPartsRef.current = new Map();
+    liveStreamReplyQueueRef.current = [];
+    liveStreamReplySeenChunksRef.current = new Map();
+    liveStreamReplyRequestIdRef.current = null;
+    liveStreamReplyPlayingRef.current = false;
+    liveStreamReplyCompletedRef.current = false;
+  }
+
+  function finishLiveStreamReplyPlayback() {
+    liveStreamReplyPlayingRef.current = false;
+    if (liveStreamReplyQueueRef.current.length > 0) {
+      const next = liveStreamReplyQueueRef.current.shift();
+      if (next) {
+        liveStreamReplyPlayingRef.current = true;
+        setLiveReplyAudioSrc(replyAudioUrl(next.audioBase64));
+      }
+      return;
+    }
+    if (!liveStreamReplyCompletedRef.current) {
+      return;
+    }
+    resetLiveStreamReplyState();
+    handleLiveReplyEnded();
+  }
+
+  function queueLiveStreamReplyChunk(requestId: string, chunkIndex: number, audioBase64: string) {
+    const activeRequestId = liveStreamReplyRequestIdRef.current;
+    if (activeRequestId && activeRequestId !== requestId) {
+      resetLiveStreamReplyState();
+    }
+    liveStreamReplyRequestIdRef.current = requestId;
+    const seen = liveStreamReplySeenChunksRef.current.get(requestId) ?? new Set<number>();
+    if (seen.has(chunkIndex)) {
+      return;
+    }
+    seen.add(chunkIndex);
+    liveStreamReplySeenChunksRef.current.set(requestId, seen);
+    liveStreamReplyQueueRef.current.push({ requestId, chunkIndex, audioBase64 });
+    liveStreamReplyQueueRef.current.sort((left, right) => left.chunkIndex - right.chunkIndex);
+    if (!liveStreamReplyPlayingRef.current) {
+      const next = liveStreamReplyQueueRef.current.shift();
+      if (next) {
+        liveStreamReplyPlayingRef.current = true;
+        setLiveReplyAudioSrc(replyAudioUrl(next.audioBase64));
+      }
+    }
+  }
+
+  function queueLiveStreamReplyChunkPart(
+    requestId: string,
+    chunkIndex: number,
+    partIndex: number,
+    totalParts: number,
+    audioSlice: string,
+  ) {
+    const key = `${requestId}:${chunkIndex}`;
+    const parts = liveReplyStreamChunkPartsRef.current.get(key) ?? new Array(totalParts).fill("");
+    parts[partIndex] = audioSlice;
+    liveReplyStreamChunkPartsRef.current.set(key, parts);
+    if (parts.filter(Boolean).length !== totalParts) {
+      return;
+    }
+    liveReplyStreamChunkPartsRef.current.delete(key);
+    queueLiveStreamReplyChunk(requestId, chunkIndex, parts.join(""));
+  }
+
+  function hasPendingLiveStreamReplyParts() {
+    return liveReplyStreamChunkPartsRef.current.size > 0;
+  }
+
+  function completeLiveOpening(callId: string, options?: { message?: string }) {
+    if (liveOpeningRequestTimeoutRef.current !== null) {
+      window.clearTimeout(liveOpeningRequestTimeoutRef.current);
+      liveOpeningRequestTimeoutRef.current = null;
+    }
+    if (liveOpeningPlaybackTimerRef.current !== null) {
+      window.clearTimeout(liveOpeningPlaybackTimerRef.current);
+      liveOpeningPlaybackTimerRef.current = null;
+    }
+    liveOpeningCompletedCallIdRef.current = callId;
+    liveOpeningStartedCallIdRef.current = null;
+    stopLiveSetupTone();
+    if (options?.message) {
+      setMessage(options.message);
+    }
+  }
+
+  async function startLiveSetupTone() {
+    try {
+      const audio = ensureLiveSetupTonePlayer();
+      if (!liveSetupToneUrlRef.current) {
+        liveSetupToneUrlRef.current = createSetupToneUrl();
+      }
+      if (audio.src !== liveSetupToneUrlRef.current) {
+        audio.src = liveSetupToneUrlRef.current;
+      }
+      audio.loop = true;
+      audio.volume = 0.22;
+      if (!audio.paused) {
+        return;
+      }
+      audio.currentTime = 0;
+      await audio.play();
+      liveSetupToneStartedAtRef.current = Date.now();
+    } catch {
+      return;
+    }
+  }
+
+  function delayForMinimumSetupToneLead() {
+    const startedAt = liveSetupToneStartedAtRef.current;
+    if (!startedAt) {
+      return Promise.resolve();
+    }
+    const elapsed = Date.now() - startedAt;
+    const remaining = MIN_SETUP_TONE_MS - elapsed;
+    if (remaining <= 0) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, remaining);
+    });
+  }
 
   useEffect(() => {
     const storedSession = localStorage.getItem(SESSION_STORAGE_KEY);
@@ -561,7 +1086,7 @@ function App() {
         } else if (parsed.kind === "call_updated") {
           setView("chats");
           setSelectedCallId(parsed.call_id);
-          setMessage(parsed.status === "accepted" ? "Call connected." : `Call ${CALL_STATUS_LABELS[parsed.status].toLowerCase()}.`);
+          setMessage(parsed.status === "accepted" ? "Call is connecting." : `Call ${CALL_STATUS_LABELS[parsed.status].toLowerCase()}.`);
         } else if (parsed.kind === "message_created" && parsed.source === "desktop") {
           setView("chats");
           setMessage("NeuralTrainer sent a new message.");
@@ -648,7 +1173,88 @@ function App() {
     return fetch(`${apiBase}${path}`, { ...init, headers });
   }
 
-  function teardownLivePeerConnection() {
+  function waitForIceGathering(peer: RTCPeerConnection) {
+    if (peer.iceGatheringState === "complete") {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      const handleStateChange = () => {
+        if (peer.iceGatheringState === "complete") {
+          peer.removeEventListener("icegatheringstatechange", handleStateChange);
+          resolve();
+        }
+      };
+      peer.addEventListener("icegatheringstatechange", handleStateChange);
+      window.setTimeout(() => {
+        peer.removeEventListener("icegatheringstatechange", handleStateChange);
+        resolve();
+      }, 2500);
+    });
+  }
+
+  function updateLiveCallDiagnostics(patch: Partial<LiveCallDiagnostics>) {
+    setLiveCallDiagnostics((current) => {
+      const next = { ...current, ...patch };
+      console.info("[NorthStar live mobile]", next);
+      return next;
+    });
+  }
+
+  function mapRtcIceServers(servers: RtcIceServer[]): RTCIceServer[] {
+    if (servers.length === 0) {
+      return LIVE_WEBRTC_CONFIG.iceServers ?? [];
+    }
+    return servers.map((server) => ({
+      urls: server.urls,
+      username: server.username ?? undefined,
+      credential: server.credential ?? undefined,
+    }));
+  }
+
+  function shouldPreferLiveRelay(servers: RTCIceServer[]) {
+    return servers.some((server) => {
+      const urls = Array.isArray(server.urls) ? server.urls : [server.urls];
+      return urls.some((url) => typeof url === "string" && url.trim().toLowerCase().startsWith("turn:"));
+    });
+  }
+
+  async function getLiveRtcConfig() {
+    if (liveRtcIceServersRef.current) {
+      const icePolicy = shouldPreferLiveRelay(liveRtcIceServersRef.current) ? "relay" : "all";
+      updateLiveCallDiagnostics({
+        icePolicy,
+        iceServerKinds: describeIceServerKinds(liveRtcIceServersRef.current),
+      });
+      return {
+        iceServers: liveRtcIceServersRef.current,
+        iceTransportPolicy: icePolicy,
+      } satisfies RTCConfiguration;
+    }
+    try {
+      const response = await authedFetch("/api/companion/rtc-config", { method: "GET" });
+      if (!response.ok) {
+        throw new Error("RTC config request failed");
+      }
+      const payload = (await response.json()) as { ice_servers?: RtcIceServer[] };
+      liveRtcIceServersRef.current = mapRtcIceServers(payload.ice_servers ?? []);
+    } catch {
+      liveRtcIceServersRef.current = LIVE_WEBRTC_CONFIG.iceServers ?? [];
+    }
+    const icePolicy = shouldPreferLiveRelay(liveRtcIceServersRef.current) ? "relay" : "all";
+    updateLiveCallDiagnostics({
+      icePolicy,
+      iceServerKinds: describeIceServerKinds(liveRtcIceServersRef.current),
+    });
+    return {
+      iceServers: liveRtcIceServersRef.current,
+      iceTransportPolicy: icePolicy,
+    } satisfies RTCConfiguration;
+  }
+
+  function teardownLivePeerConnection(options?: { resetProcessedSignals?: boolean; preserveSetupTone?: boolean; preserveReplyPlayback?: boolean }) {
+    const resetProcessedSignals = options?.resetProcessedSignals ?? true;
+    const preserveSetupTone = options?.preserveSetupTone ?? false;
+    const preserveReplyPlayback = options?.preserveReplyPlayback ?? false;
     liveDataChannelRef.current?.close();
     livePeerRef.current?.close();
     if (liveRemotePlaybackTimerRef.current !== null) {
@@ -659,36 +1265,211 @@ function App() {
       liveRemoteAudioRef.current.srcObject = null;
     }
     livePeerInputStreamRef.current?.getTracks().forEach((track) => track.stop());
+    teardownLiveInputMeter();
     liveDataChannelRef.current = null;
     livePeerRef.current = null;
     liveSignalCallIdRef.current = null;
-    processedLiveSignalIdsRef.current = new Set();
+    liveOpeningRequestedCallIdRef.current = null;
+    liveOpeningStartedCallIdRef.current = null;
+    liveOpeningCompletedCallIdRef.current = null;
+    if (liveOpeningRequestTimeoutRef.current !== null) {
+      window.clearTimeout(liveOpeningRequestTimeoutRef.current);
+      liveOpeningRequestTimeoutRef.current = null;
+    }
+    if (liveOpeningPlaybackTimerRef.current !== null) {
+      window.clearTimeout(liveOpeningPlaybackTimerRef.current);
+      liveOpeningPlaybackTimerRef.current = null;
+    }
+    if (liveDataChannelRecoveryTimerRef.current !== null) {
+      window.clearTimeout(liveDataChannelRecoveryTimerRef.current);
+      liveDataChannelRecoveryTimerRef.current = null;
+    }
+    if (!preserveSetupTone) {
+      stopLiveSetupTone();
+      liveSetupTonePlayerRef.current = null;
+    }
+    if (resetProcessedSignals) {
+      processedLiveSignalIdsRef.current = new Set();
+    }
     liveReplyChunksRef.current = new Map();
+    liveOpeningChunksRef.current = new Map();
+    liveStreamingTurnRequestIdRef.current = null;
+    liveStreamingTurnStartPromiseRef.current = null;
+    if (!preserveReplyPlayback) {
+      resetLiveStreamReplyState();
+    }
     liveRemoteStreamRef.current = null;
     livePeerInputStreamRef.current = null;
+    liveNegotiationStartedAtRef.current = null;
+    setLiveFallbackAllowed(false);
+    setLiveCallDiagnostics(defaultLiveCallDiagnostics);
+    setLiveTurnTransportStats(defaultLiveTurnTransportStats);
   }
 
-  function sendChunkedLiveTurn(channel: RTCDataChannel, requestId: string, audioBase64: string) {
+  function waitForLiveDataChannelCapacity(channel: RTCDataChannel) {
+    if (channel.readyState !== "open") {
+      return Promise.reject(new Error("Live data channel is not open."));
+    }
+    if (channel.bufferedAmount <= LIVE_CHANNEL_BUFFER_HIGH_WATER) {
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        window.clearTimeout(timeout);
+        channel.removeEventListener("bufferedamountlow", handleBufferedLow);
+        channel.removeEventListener("close", handleClosed);
+        channel.removeEventListener("error", handleClosed);
+      };
+      const handleBufferedLow = () => {
+        if (channel.bufferedAmount <= LIVE_CHANNEL_BUFFER_LOW_WATER) {
+          cleanup();
+          resolve();
+        }
+      };
+      const handleClosed = () => {
+        cleanup();
+        reject(new Error("Live data channel closed while waiting to send."));
+      };
+      const timeout = window.setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 800);
+      channel.bufferedAmountLowThreshold = LIVE_CHANNEL_BUFFER_LOW_WATER;
+      channel.addEventListener("bufferedamountlow", handleBufferedLow);
+      channel.addEventListener("close", handleClosed);
+      channel.addEventListener("error", handleClosed);
+      handleBufferedLow();
+    });
+  }
+
+  function waitForLiveChannelSendYield() {
+    return new Promise<void>((resolve) => {
+      window.setTimeout(resolve, 0);
+    });
+  }
+
+  async function sendLiveChannelJson(channel: RTCDataChannel, payload: unknown) {
+    await waitForLiveDataChannelCapacity(channel);
+    if (channel.readyState !== "open") {
+      throw new Error("Live data channel is not open.");
+    }
+    channel.send(JSON.stringify(payload));
+  }
+
+  async function sendChunkedLiveTurn(channel: RTCDataChannel, requestId: string, audioBase64: string) {
     if (audioBase64.length <= LIVE_CHANNEL_CHUNK_SIZE) {
-      channel.send(JSON.stringify({
+      setLiveTurnTransportStats((current) => ({
+        liveTurnsSent: current.liveTurnsSent + 1,
+        liveTurnChunksSent: current.liveTurnChunksSent,
+        lastLiveTurnRequestId: requestId,
+      }));
+      await sendLiveChannelJson(channel, {
         type: "live_turn",
         requestId,
         audioBase64,
-      }));
+      });
       return;
     }
 
     const total = Math.ceil(audioBase64.length / LIVE_CHANNEL_CHUNK_SIZE);
+    setLiveTurnTransportStats((current) => ({
+      liveTurnsSent: current.liveTurnsSent + 1,
+      liveTurnChunksSent: current.liveTurnChunksSent + total,
+      lastLiveTurnRequestId: requestId,
+    }));
     for (let index = 0; index < total; index += 1) {
       const slice = audioBase64.slice(index * LIVE_CHANNEL_CHUNK_SIZE, (index + 1) * LIVE_CHANNEL_CHUNK_SIZE);
-      channel.send(JSON.stringify({
+      await sendLiveChannelJson(channel, {
         type: "live_turn_chunk",
         requestId,
         index,
         total,
         audioSlice: slice,
-      }));
+      });
+      await waitForLiveChannelSendYield();
     }
+  }
+
+  function canUseLiveSpeechStreaming(callId: string) {
+    return (
+      liveSignalCallIdRef.current === callId
+      && !!liveDataChannelRef.current
+      && liveDataChannelRef.current.readyState === "open"
+    );
+  }
+
+  async function beginLiveSpeechTurn(channel: RTCDataChannel, callId: string, sampleRate: number) {
+    const activeRequestId = liveStreamingTurnRequestIdRef.current;
+    if (activeRequestId) {
+      return activeRequestId;
+    }
+    const existingStart = liveStreamingTurnStartPromiseRef.current;
+    if (existingStart) {
+      return existingStart;
+    }
+    const requestId = `${callId}-${Date.now()}`;
+    liveStreamingTurnRequestIdRef.current = requestId;
+    const startPromise = (async () => {
+      try {
+        await sendLiveChannelJson(channel, {
+          type: "live_speech_start",
+          requestId,
+          sampleRate,
+          audioFormat: "pcm16le",
+        });
+        setLiveTurnTransportStats((current) => ({
+          liveTurnsSent: current.liveTurnsSent + 1,
+          liveTurnChunksSent: current.liveTurnChunksSent,
+          lastLiveTurnRequestId: requestId,
+        }));
+        return requestId;
+      } catch (error) {
+        if (liveStreamingTurnRequestIdRef.current === requestId) {
+          liveStreamingTurnRequestIdRef.current = null;
+        }
+        throw error;
+      } finally {
+        if (liveStreamingTurnRequestIdRef.current === requestId || !liveStreamingTurnRequestIdRef.current) {
+          liveStreamingTurnStartPromiseRef.current = null;
+        }
+      }
+    })();
+    liveStreamingTurnStartPromiseRef.current = startPromise;
+    return startPromise;
+  }
+
+  async function sendLiveSpeechFrame(channel: RTCDataChannel, callId: string, chunk: Float32Array, sampleRate: number) {
+    const requestId = await beginLiveSpeechTurn(channel, callId, sampleRate);
+    await sendLiveChannelJson(channel, {
+      type: "live_speech_frame",
+      requestId,
+      sampleRate,
+      audioFormat: "pcm16le",
+      audioBase64: float32ChunkToPcm16Base64(chunk),
+    });
+    setLiveTurnTransportStats((current) => ({
+      liveTurnsSent: current.liveTurnsSent,
+      liveTurnChunksSent: current.liveTurnChunksSent + 1,
+      lastLiveTurnRequestId: requestId,
+    }));
+  }
+
+  async function finishLiveSpeechTurn(channel: RTCDataChannel) {
+    const startPromise = liveStreamingTurnStartPromiseRef.current;
+    if (startPromise) {
+      await startPromise.catch(() => undefined);
+    }
+    const requestId = liveStreamingTurnRequestIdRef.current;
+    if (!requestId) {
+      return false;
+    }
+    await sendLiveChannelJson(channel, {
+      type: "live_speech_end",
+      requestId,
+    });
+    liveStreamingTurnRequestIdRef.current = null;
+    liveStreamingTurnStartPromiseRef.current = null;
+    return true;
   }
 
   async function sendMobileWebRtcSignal(callId: string, signalKind: string, payload: RTCSessionDescriptionInit | RTCIceCandidateInit) {
@@ -713,9 +1494,26 @@ function App() {
 
   function attachLivePeer(callId: string, peer: RTCPeerConnection, channel?: RTCDataChannel) {
     liveSignalCallIdRef.current = callId;
+    updateLiveCallDiagnostics({
+      phase: "mobile_peer_attached",
+      signalingState: peer.signalingState,
+      iceGatheringState: peer.iceGatheringState,
+      iceConnectionState: peer.iceConnectionState,
+      connectionState: peer.connectionState,
+      dataChannelState: channel?.readyState ?? "waiting",
+      remoteTrackState: "waiting",
+      issue: "",
+    });
     if (channel) {
       liveDataChannelRef.current = channel;
-      channel.onopen = () => setMessage("North Star live call channel connected.");
+      channel.onopen = () => {
+        setMessage("North Star live call channel connected.");
+        updateLiveCallDiagnostics({
+          phase: "mobile_data_channel_open",
+          dataChannelState: channel.readyState,
+          issue: "",
+        });
+      };
       channel.onmessage = (event) => {
         try {
           const payload = JSON.parse(String(event.data)) as
@@ -738,8 +1536,114 @@ function App() {
                 total: number;
                 payloadSlice: string;
               }
+            | {
+                type: "live_opening_audio";
+                openerId: string;
+                text: string;
+                audioBase64: string;
+              }
+            | {
+                type: "live_opening_chunk";
+                openerId: string;
+                index: number;
+                total: number;
+                payloadSlice: string;
+              }
+            | {
+                type: "live_opening_error";
+                openerId: string;
+                message?: string;
+              }
+            | {
+                type: "live_reply_stream_chunk";
+                requestId: string;
+                chunkIndex: number;
+                textChunk?: string;
+                audioBase64: string;
+                sampleRate?: number;
+              }
+            | {
+                type: "live_reply_stream_chunk_part";
+                requestId: string;
+                chunkIndex: number;
+                partIndex: number;
+                totalParts: number;
+                audioSlice: string;
+                textChunk?: string;
+                sampleRate?: number;
+              }
+            | {
+                type: "live_reply_stream_complete";
+                requestId: string;
+                transcriptText?: string;
+                replyText?: string;
+                replyMode?: string;
+              }
+            | {
+                type: "live_reply_stream_error";
+                requestId: string;
+                message?: string;
+              }
             | { type: "live_reply_error"; message?: string }
             | { type: string };
+          if (payload.type === "live_reply_stream_chunk") {
+            const requestId = "requestId" in payload ? payload.requestId : "";
+            const chunkIndex = "chunkIndex" in payload ? payload.chunkIndex : -1;
+            const audioBase64 = "audioBase64" in payload ? payload.audioBase64 : "";
+            if (!requestId || chunkIndex < 0 || !audioBase64) {
+              return;
+            }
+            setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
+            setMessage("NeuralTrainer is answering.");
+            queueLiveStreamReplyChunk(requestId, chunkIndex, audioBase64);
+            return;
+          }
+          if (payload.type === "live_reply_stream_chunk_part") {
+            const requestId = "requestId" in payload ? payload.requestId : "";
+            const chunkIndex = "chunkIndex" in payload ? payload.chunkIndex : -1;
+            const partIndex = "partIndex" in payload ? payload.partIndex : -1;
+            const totalParts = "totalParts" in payload ? payload.totalParts : 0;
+            const audioSlice = "audioSlice" in payload ? payload.audioSlice : "";
+            if (!requestId || chunkIndex < 0 || partIndex < 0 || totalParts <= 0 || !audioSlice) {
+              return;
+            }
+            setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
+            setMessage("NeuralTrainer is answering.");
+            queueLiveStreamReplyChunkPart(requestId, chunkIndex, partIndex, totalParts, audioSlice);
+            return;
+          }
+          if (payload.type === "live_reply_stream_complete") {
+            liveStreamReplyCompletedRef.current = true;
+            setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
+            void refreshCallSessions();
+            void refreshCallTurns(callId);
+            if (
+              !liveStreamReplyPlayingRef.current
+              && liveStreamReplyQueueRef.current.length === 0
+              && !hasPendingLiveStreamReplyParts()
+            ) {
+              finishLiveStreamReplyPlayback();
+            }
+            return;
+          }
+          if (payload.type === "live_reply_stream_error") {
+            liveStreamReplyCompletedRef.current = true;
+            const errorMessage = "message" in payload ? payload.message : "";
+            setMessage(errorMessage || "North Star could not stream that spoken turn live.");
+            setLiveFallbackAllowed(true);
+            if (!liveStreamReplyPlayingRef.current && liveStreamReplyQueueRef.current.length === 0) {
+              resetLiveStreamReplyState();
+              if (!recordingTurn && activeAcceptedCall?.call_id === callId && !callLoopMuted) {
+                setCallLoopState("listening");
+                setLiveConversationPhase("ready_for_user");
+                void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
+              }
+            }
+            return;
+          }
           if (payload.type === "live_reply_chunk") {
             const requestId = "requestId" in payload ? payload.requestId : "";
             const index = "index" in payload ? payload.index : -1;
@@ -762,18 +1666,20 @@ function App() {
               sampleRate: number;
             };
             setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
             setLiveReplyAudioSrc(replyAudioUrl(mergedPayload.replyAudioBase64));
             setMessage("NeuralTrainer answered.");
             void refreshCallSessions();
             void refreshCallTurns(callId);
             return;
           }
-          if (payload.type === "live_reply") {
+            if (payload.type === "live_reply") {
             const result = "result" in payload ? payload.result : null;
             if (!result) {
               return;
             }
             setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
             setMessage("NeuralTrainer answered.");
             if (result.remoteAudio) {
               setLiveReplyAudioSrc(null);
@@ -794,12 +1700,84 @@ function App() {
               void refreshCallTurns(callId);
             }
             return;
+            }
+          if (payload.type === "live_opening_chunk") {
+            const openerId = "openerId" in payload ? payload.openerId : "";
+            const index = "index" in payload ? payload.index : -1;
+            const total = "total" in payload ? payload.total : 0;
+            const payloadSlice = "payloadSlice" in payload ? payload.payloadSlice : "";
+            if (!openerId || index < 0 || total <= 0 || !payloadSlice || liveOpeningRequestedCallIdRef.current !== callId) {
+              return;
+            }
+            const chunks = liveOpeningChunksRef.current.get(openerId) ?? new Array(total).fill("");
+            chunks[index] = payloadSlice;
+            liveOpeningChunksRef.current.set(openerId, chunks);
+            if (chunks.filter(Boolean).length !== total) {
+              return;
+            }
+            liveOpeningChunksRef.current.delete(openerId);
+            const mergedPayload = JSON.parse(chunks.join("")) as {
+              text: string;
+              audioBase64: string;
+            };
+            liveOpeningStartedCallIdRef.current = callId;
+            setCallLoopState("opening");
+            setLiveConversationPhase("waiting_for_opening_audio");
+            setMessage(mergedPayload.text || "NeuralTrainer is opening the conversation.");
+            if (liveOpeningRequestTimeoutRef.current !== null) {
+              window.clearTimeout(liveOpeningRequestTimeoutRef.current);
+              liveOpeningRequestTimeoutRef.current = null;
+            }
+            void delayForMinimumSetupToneLead().then(() => {
+              if (liveOpeningRequestedCallIdRef.current !== callId) {
+                return;
+              }
+              stopLiveSetupTone();
+              setLiveReplyAudioSrc(replyAudioUrl(mergedPayload.audioBase64));
+            });
+            return;
+          }
+          if (payload.type === "live_opening_audio") {
+            const openerId = "openerId" in payload ? payload.openerId : "";
+            const audioBase64 = "audioBase64" in payload ? payload.audioBase64 : "";
+            if (!openerId || !audioBase64 || liveOpeningRequestedCallIdRef.current !== callId) {
+              return;
+            }
+            liveOpeningStartedCallIdRef.current = callId;
+            setCallLoopState("opening");
+            setLiveConversationPhase("waiting_for_opening_audio");
+            setMessage(("text" in payload ? payload.text : "") || "NeuralTrainer is opening the conversation.");
+            if (liveOpeningRequestTimeoutRef.current !== null) {
+              window.clearTimeout(liveOpeningRequestTimeoutRef.current);
+              liveOpeningRequestTimeoutRef.current = null;
+            }
+            void delayForMinimumSetupToneLead().then(() => {
+              if (liveOpeningRequestedCallIdRef.current !== callId) {
+                return;
+              }
+              stopLiveSetupTone();
+              setLiveReplyAudioSrc(replyAudioUrl(audioBase64));
+            });
+            return;
+          }
+          if (payload.type === "live_opening_error") {
+            completeLiveOpening(callId, {
+              message: ("message" in payload ? payload.message : "") || "NeuralTrainer joined the line.",
+            });
+            setCallLoopState("listening");
+            setLiveConversationPhase("ready_for_user");
+            if (!recordingTurn && activeAcceptedCall?.call_id === callId && !callLoopMuted) {
+              void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true, reuseLiveStream: livePathReady });
+            }
+            return;
           }
           if (payload.type === "live_reply_error") {
             const errorMessage = "message" in payload ? payload.message : "";
             setMessage(errorMessage || "North Star could not process that spoken turn live.");
+            setLiveFallbackAllowed(true);
             if (!recordingTurn && activeAcceptedCall?.call_id === callId && !callLoopMuted) {
               setCallLoopState("listening");
+              setLiveConversationPhase("ready_for_user");
               void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
             }
           }
@@ -811,19 +1789,85 @@ function App() {
         if (liveDataChannelRef.current === channel) {
           liveDataChannelRef.current = null;
         }
+        const mediaStillStable = hasStableLiveMedia(peer, liveRemoteStreamRef.current);
+        updateLiveCallDiagnostics({
+          phase: mediaStillStable ? "mobile_data_channel_closed_media_still_live" : "mobile_data_channel_closed",
+          dataChannelState: "closed",
+          issue: mediaStillStable ? "" : "Mobile data channel closed before the live path completed.",
+        });
+        if (mediaStillStable) {
+          setMessage("North Star kept the live media path open.");
+          if (liveDataChannelRecoveryTimerRef.current !== null) {
+            window.clearTimeout(liveDataChannelRecoveryTimerRef.current);
+          }
+          liveDataChannelRecoveryTimerRef.current = window.setTimeout(() => {
+            liveDataChannelRecoveryTimerRef.current = null;
+            if (activeAcceptedCall?.call_id === callId) {
+              void ensureLiveCallOffer(callId);
+            }
+          }, 700);
+        }
+      };
+      channel.onerror = () => {
+        updateLiveCallDiagnostics({
+          phase: "mobile_data_channel_error",
+          dataChannelState: channel.readyState,
+          issue: "Mobile data channel reported an error.",
+        });
       };
     }
     peer.onicecandidate = (event) => {
       if (!event.candidate || liveSignalCallIdRef.current !== callId) {
         return;
       }
+      updateLiveCallDiagnostics({
+        phase: "mobile_ice_candidate_sent",
+        iceGatheringState: peer.iceGatheringState,
+        lastSignal: "ice_candidate_sent",
+        localIceCandidates: liveCallDiagnostics.localIceCandidates + 1,
+        localCandidateKinds: mergeCandidateKindList(
+          liveCallDiagnostics.localCandidateKinds,
+          detectCandidateKind(event.candidate.candidate),
+        ),
+      });
       void sendMobileWebRtcSignal(callId, "ice_candidate", event.candidate.toJSON()).catch(() => undefined);
+    };
+    peer.onsignalingstatechange = () => {
+      updateLiveCallDiagnostics({
+        phase: "mobile_signaling_state_changed",
+        signalingState: peer.signalingState,
+      });
+    };
+    peer.onicegatheringstatechange = () => {
+      updateLiveCallDiagnostics({
+        phase: "mobile_ice_gathering_state_changed",
+        iceGatheringState: peer.iceGatheringState,
+      });
+    };
+    peer.oniceconnectionstatechange = () => {
+      updateLiveCallDiagnostics({
+        phase: "mobile_ice_connection_state_changed",
+        iceConnectionState: peer.iceConnectionState,
+        issue: peer.iceConnectionState === "failed" ? "ICE connection failed on mobile." : "",
+      });
     };
     peer.onconnectionstatechange = () => {
       if (liveSignalCallIdRef.current !== callId) return;
+      const mediaStillStable = hasStableLiveMedia(peer, liveRemoteStreamRef.current);
+      updateLiveCallDiagnostics({
+        phase: "mobile_connection_state_changed",
+        connectionState: peer.connectionState,
+        issue:
+          (
+            peer.connectionState === "failed"
+            || peer.connectionState === "disconnected"
+          ) && !mediaStillStable
+            ? "Mobile peer connection dropped before the live call was stable."
+            : "",
+      });
       if (peer.connectionState === "connected") {
         setMessage("North Star live call channel connected.");
-      } else if (peer.connectionState === "failed" || peer.connectionState === "disconnected") {
+      } else if ((peer.connectionState === "failed" || peer.connectionState === "disconnected") && !mediaStillStable) {
         setMessage("North Star fell back to the existing call path.");
       }
     };
@@ -833,6 +1877,10 @@ function App() {
         return;
       }
       liveRemoteStreamRef.current = stream;
+      updateLiveCallDiagnostics({
+        phase: "mobile_remote_track_received",
+        remoteTrackState: "received",
+      });
       if (liveRemoteAudioRef.current) {
         liveRemoteAudioRef.current.srcObject = stream;
         void liveRemoteAudioRef.current.play().catch(() => undefined);
@@ -841,23 +1889,66 @@ function App() {
   }
 
   async function ensureLiveCallOffer(callId: string) {
-    if (liveSignalCallIdRef.current === callId && livePeerRef.current) {
+    const existingPeer = livePeerRef.current;
+    const existingChannel = liveDataChannelRef.current;
+    const existingChannelUsable =
+      !!existingChannel
+      && existingChannel.readyState !== "closing"
+      && existingChannel.readyState !== "closed";
+    const existingPeerUsable =
+      liveSignalCallIdRef.current === callId
+      && existingPeer
+      && existingPeer.connectionState !== "closed"
+      && existingPeer.connectionState !== "failed"
+      && existingPeer.iceConnectionState !== "failed"
+      && existingPeer.iceConnectionState !== "closed"
+      && existingChannelUsable;
+    if (existingPeerUsable) {
       return;
     }
-    teardownLivePeerConnection();
-    const peer = new RTCPeerConnection();
+    teardownLivePeerConnection({
+      resetProcessedSignals: false,
+      preserveSetupTone: liveConversationPhase === "connecting_transport" || liveConversationPhase === "waiting_for_opening_audio",
+      preserveReplyPlayback:
+        liveConversationPhase === "assistant_speaking"
+        || liveStreamReplyPlayingRef.current
+        || liveStreamReplyQueueRef.current.length > 0,
+    });
+    liveNegotiationStartedAtRef.current = Date.now();
+    setLiveFallbackAllowed(false);
+    const peer = new RTCPeerConnection(await getLiveRtcConfig());
+    updateLiveCallDiagnostics({
+      phase: "mobile_requesting_microphone",
+      connectionState: peer.connectionState,
+      signalingState: peer.signalingState,
+      iceGatheringState: peer.iceGatheringState,
+      iceConnectionState: peer.iceConnectionState,
+      lastSignal: "offer_pending",
+    });
     const inputStream = await navigator.mediaDevices.getUserMedia({ audio: true });
     livePeerInputStreamRef.current = inputStream;
+    startLiveInputMeter(inputStream);
     inputStream.getTracks().forEach((track) => {
       peer.addTrack(track, inputStream);
+    });
+    updateLiveCallDiagnostics({
+      phase: "mobile_microphone_attached",
+      dataChannelState: "creating",
     });
     const channel = peer.createDataChannel("northstar-call");
     attachLivePeer(callId, peer, channel);
     livePeerRef.current = peer;
     const offer = await peer.createOffer();
     await peer.setLocalDescription(offer);
+    await waitForIceGathering(peer);
     if (peer.localDescription) {
       await sendMobileWebRtcSignal(callId, "offer", peer.localDescription);
+      updateLiveCallDiagnostics({
+        phase: "mobile_offer_sent",
+        lastSignal: "offer_sent",
+        signalingState: peer.signalingState,
+        iceGatheringState: peer.iceGatheringState,
+      });
     }
   }
 
@@ -871,13 +1962,45 @@ function App() {
       const peer = livePeerRef.current;
       if (!peer) return;
       await peer.setRemoteDescription(JSON.parse(signal.payload_json) as RTCSessionDescriptionInit);
+      updateLiveCallDiagnostics({
+        phase: "mobile_answer_applied",
+        lastSignal: "answer_applied",
+        signalingState: peer.signalingState,
+      });
       return;
     }
 
     if (signal.signal_kind === "ice_candidate") {
       const peer = livePeerRef.current;
-      if (!peer) return;
-      await peer.addIceCandidate(JSON.parse(signal.payload_json) as RTCIceCandidateInit);
+      if (!peer) {
+        updateLiveCallDiagnostics({
+          phase: "mobile_ice_candidate_skipped",
+          lastSignal: "ice_candidate_received_without_peer",
+          issue: "Mobile received an ICE candidate before the peer was ready.",
+        });
+        return;
+      }
+      const parsedCandidate = JSON.parse(signal.payload_json) as RTCIceCandidateInit;
+      await peer.addIceCandidate(parsedCandidate);
+      updateLiveCallDiagnostics({
+        phase: "mobile_ice_candidate_applied",
+        lastSignal: "ice_candidate_applied",
+        iceConnectionState: peer.iceConnectionState,
+        remoteIceCandidates: liveCallDiagnostics.remoteIceCandidates + 1,
+        remoteCandidateKinds: mergeCandidateKindList(
+          liveCallDiagnostics.remoteCandidateKinds,
+          detectCandidateKind(parsedCandidate.candidate ?? ""),
+        ),
+      });
+    }
+
+    if (signal.signal_kind === "reconnect_request") {
+      updateLiveCallDiagnostics({
+        phase: "mobile_reconnect_requested",
+        lastSignal: "reconnect_requested",
+        issue: "",
+      });
+      await ensureLiveCallOffer(callId);
     }
   }
 
@@ -1114,13 +2237,16 @@ function App() {
       return;
     }
 
+    void startLiveSetupTone();
+
     const response = await authedFetch("/api/companion/call-sessions/from-mobile", {
       method: "POST",
       body: JSON.stringify({
-        note: "North Star is calling from your phone.",
+        note: MOBILE_OUTBOUND_CALL_NOTE,
       }),
     });
     if (!response.ok) {
+      stopLiveSetupTone();
       setMessage("North Star could not reach NeuralTrainer just then.");
       return;
     }
@@ -1129,12 +2255,14 @@ function App() {
     stopRemoteTurnRecording();
     setCallLoopMuted(false);
     setCallLoopState("idle");
+    setLiveConversationPhase("connecting_transport");
     setLiveReplyAudioSrc(null);
     lastPlayedReplyTurnIdRef.current = null;
     setCallTurns([]);
     setView("chats");
     setSelectedCallId(call.call_id);
     setMenuOpen(false);
+    outboundCallIdsRef.current.add(call.call_id);
     setMessage("Calling NeuralTrainer now.");
     await refreshCallSessions();
   }
@@ -1181,13 +2309,17 @@ function App() {
         message: "Call declined.",
       });
     } else if (action === "accept") {
+      void startLiveSetupTone();
       setSelectedCallId(callId);
-      setMessage("Call connected.");
+      setMessage("Call is connecting.");
+      setLiveConversationPhase("connecting_transport");
     } else if (action === "end") {
       setSelectedCallId("");
       setMessage("Call ended.");
+      setLiveConversationPhase("idle");
     } else {
       setMessage(`Call marked as ${action}.`);
+      setLiveConversationPhase("idle");
     }
     await refreshCallSessions();
   }
@@ -1411,15 +2543,25 @@ function App() {
     callTurnAudioChunksRef.current = [];
   }
 
-  async function startRemoteTurnRecording(targetCall = selectedCall, options?: { handsFree?: boolean }) {
+  async function startRemoteTurnRecording(targetCall = selectedCall, options?: { handsFree?: boolean; reuseLiveStream?: boolean }) {
     if (!targetCall) {
       setMessage("Choose a call first.");
       return;
     }
+    if (
+      recordingTurnActiveRef.current
+      || !!callTurnAudioContextRef.current
+      || pendingRecordingStartCallIdRef.current === targetCall.call_id
+    ) {
+      return;
+    }
+    pendingRecordingStartCallIdRef.current = targetCall.call_id;
     setSelectedCallId(targetCall.call_id);
     handsFreeCallIdRef.current = options?.handsFree ? targetCall.call_id : null;
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = options?.reuseLiveStream && livePeerInputStreamRef.current
+        ? livePeerInputStreamRef.current
+        : await navigator.mediaDevices.getUserMedia({ audio: true });
       const context = new AudioContext({ sampleRate: 16000 });
       const source = context.createMediaStreamSource(stream);
       const processor = context.createScriptProcessor(4096, 1, 1);
@@ -1431,7 +2573,12 @@ function App() {
         const input = event.inputBuffer.getChannelData(0);
         const chunk = new Float32Array(input);
         callTurnAudioChunksRef.current.push(chunk);
+        const liveChannel = canUseLiveSpeechStreaming(targetCall.call_id) ? liveDataChannelRef.current : null;
+        const sampleRate = context.sampleRate;
         if (!options?.handsFree || sendingTurnRef.current) {
+          if (!options?.handsFree && liveChannel) {
+            void sendLiveSpeechFrame(liveChannel, targetCall.call_id, chunk, sampleRate).catch(() => undefined);
+          }
           return;
         }
 
@@ -1446,7 +2593,13 @@ function App() {
           speechDetectedRef.current = true;
           silenceFrameCountRef.current = 0;
           speechFrameCountRef.current += 1;
+          if (liveChannel) {
+            void sendLiveSpeechFrame(liveChannel, targetCall.call_id, chunk, sampleRate).catch(() => undefined);
+          }
         } else if (speechDetectedRef.current) {
+          if (liveChannel) {
+            void sendLiveSpeechFrame(liveChannel, targetCall.call_id, chunk, sampleRate).catch(() => undefined);
+          }
           silenceFrameCountRef.current += 1;
           if (speechFrameCountRef.current >= 3 && silenceFrameCountRef.current >= 10) {
             void stopAndSendRemoteTurn(targetCall, { handsFree: true });
@@ -1459,14 +2612,18 @@ function App() {
       sink.connect(context.destination);
 
       callTurnStreamRef.current = stream;
+      callTurnUsesLivePeerStreamRef.current = Boolean(options?.reuseLiveStream && livePeerInputStreamRef.current === stream);
       callTurnAudioContextRef.current = context;
       callTurnProcessorRef.current = processor;
       callTurnSourceRef.current = source;
       callTurnSinkRef.current = sink;
+      recordingTurnActiveRef.current = true;
+      pendingRecordingStartCallIdRef.current = null;
       setRecordingTurn(true);
       setCallLoopState(options?.handsFree ? "listening" : "idle");
       setMessage(options?.handsFree ? "NeuralTrainer is listening." : "Listening now. Send the turn when you're ready.");
     } catch {
+      pendingRecordingStartCallIdRef.current = null;
       stopRemoteTurnRecording();
       setMessage("This phone could not open the microphone for North Star.");
     }
@@ -1477,16 +2634,22 @@ function App() {
     callTurnSourceRef.current?.disconnect();
     callTurnSinkRef.current?.disconnect();
     callTurnAudioContextRef.current?.close().catch(() => undefined);
-    callTurnStreamRef.current?.getTracks().forEach((track) => track.stop());
+    if (!callTurnUsesLivePeerStreamRef.current) {
+      callTurnStreamRef.current?.getTracks().forEach((track) => track.stop());
+    }
     callTurnProcessorRef.current = null;
     callTurnSourceRef.current = null;
     callTurnSinkRef.current = null;
     callTurnAudioContextRef.current = null;
     callTurnStreamRef.current = null;
+    callTurnUsesLivePeerStreamRef.current = false;
   }
 
   function stopRemoteTurnRecording() {
+    recordingTurnActiveRef.current = false;
+    pendingRecordingStartCallIdRef.current = null;
     setRecordingTurn(false);
+    handsFreeCallIdRef.current = null;
     resetHandsFreeDetection();
     teardownRemoteTurnRecording();
   }
@@ -1497,11 +2660,21 @@ function App() {
       return;
     }
     const context = callTurnAudioContextRef.current;
-    if (!context || callTurnAudioChunksRef.current.length === 0 || (options?.handsFree && !speechDetectedRef.current)) {
+    const liveChannel = canUseLiveSpeechStreaming(targetCall.call_id) ? liveDataChannelRef.current : null;
+    const streamedRequestId = liveStreamingTurnRequestIdRef.current;
+    if (
+      !context
+      || (
+        callTurnAudioChunksRef.current.length === 0
+        && !streamedRequestId
+      )
+      || (options?.handsFree && !speechDetectedRef.current && !streamedRequestId)
+    ) {
       stopRemoteTurnRecording();
       if (options?.handsFree) {
         setCallLoopState("listening");
-        void startRemoteTurnRecording(targetCall, { handsFree: true });
+        setLiveConversationPhase("ready_for_user");
+        void startRemoteTurnRecording(targetCall, { handsFree: true, reuseLiveStream: livePathReady });
       } else {
         setMessage("No voice was captured yet.");
       }
@@ -1509,18 +2682,30 @@ function App() {
     }
 
     sendingTurnRef.current = true;
-    const audioBase64 = audioBufferToWavBase64(callTurnAudioChunksRef.current, context.sampleRate);
-    stopRemoteTurnRecording();
     setCallLoopState("processing");
+    setLiveConversationPhase("assistant_processing");
 
     try {
+      if (liveChannel && streamedRequestId) {
+        stopRemoteTurnRecording();
+        await finishLiveSpeechTurn(liveChannel);
+        setMessage("Live speech turn sent. Waiting for NeuralTrainer's reply.");
+        return;
+      }
+
+      const audioBase64 = audioBufferToWavBase64(callTurnAudioChunksRef.current, context.sampleRate);
+      stopRemoteTurnRecording();
+      const shouldUseStableTurnUpload =
+        audioBase64.length > LIVE_TURN_DATA_CHANNEL_MAX_BASE64;
       if (
+        !shouldUseStableTurnUpload
+        &&
         liveSignalCallIdRef.current === targetCall.call_id
         && liveDataChannelRef.current
         && liveDataChannelRef.current.readyState === "open"
       ) {
         const requestId = `${targetCall.call_id}-${Date.now()}`;
-        sendChunkedLiveTurn(liveDataChannelRef.current, requestId, audioBase64);
+        await sendChunkedLiveTurn(liveDataChannelRef.current, requestId, audioBase64);
         setMessage("Turn sent live. Waiting for NeuralTrainer's reply.");
         return;
       }
@@ -1536,13 +2721,19 @@ function App() {
         setMessage("North Star could not send that spoken turn.");
         if (options?.handsFree) {
           setCallLoopState("listening");
-          void startRemoteTurnRecording(targetCall, { handsFree: true });
+          setLiveConversationPhase("ready_for_user");
+          void startRemoteTurnRecording(targetCall, { handsFree: true, reuseLiveStream: livePathReady });
         }
         return;
       }
-      setMessage("Turn sent. Waiting for NeuralTrainer's reply.");
+      setMessage(
+        shouldUseStableTurnUpload
+          ? "Turn sent on the stable path. Waiting for NeuralTrainer's reply."
+          : "Turn sent. Waiting for NeuralTrainer's reply.",
+      );
       await refreshCallTurns(targetCall.call_id);
     } finally {
+      liveStreamingTurnRequestIdRef.current = null;
       sendingTurnRef.current = false;
     }
   }
@@ -1603,16 +2794,75 @@ function App() {
       .reverse()
       .find((turn) => turn.call_id === activeAcceptedCall?.call_id && Boolean(turn.reply_audio_base64)) ??
     null;
-  const liveCallStatus = getLiveCallStatusCopy(callLoopState, callLoopMuted);
+  const liveCallStatus = getLiveCallStatusCopy(liveConversationPhase, callLoopMuted);
   const lastMessage = orderedMessages[0] ?? null;
   const activeCallCount = callSessions.filter((call) => call.status === "accepted" || call.status === "pending").length;
+  const outboundSelectedCall =
+    callOverlayCall && (outboundCallIdsRef.current.has(callOverlayCall.call_id) || callWasStartedFromPhone(callOverlayCall))
+      ? callOverlayCall
+      : null;
   const livePathReady =
     Boolean(
       activeAcceptedCall
       && liveSignalCallIdRef.current === activeAcceptedCall.call_id
-      && liveDataChannelRef.current
-      && liveDataChannelRef.current.readyState === "open",
+      && (
+        (liveDataChannelRef.current && liveDataChannelRef.current.readyState === "open")
+        || hasStableLiveMedia(livePeerRef.current, liveRemoteStreamRef.current)
+      ),
     );
+  const livePathNegotiating =
+    Boolean(
+      activeAcceptedCall
+      && liveSignalCallIdRef.current === activeAcceptedCall.call_id
+      && !livePathReady
+      && !liveFallbackAllowed,
+    );
+  const shouldAutoOpenLiveCall =
+    Boolean(activeAcceptedCall && (outboundCallIdsRef.current.has(activeAcceptedCall.call_id) || callWasStartedFromPhone(activeAcceptedCall)));
+  const liveOpeningStarted =
+    Boolean(activeAcceptedCall && liveOpeningStartedCallIdRef.current === activeAcceptedCall.call_id);
+  const liveConversationReadyTarget =
+    Boolean(
+      activeAcceptedCall
+      && (
+        liveFallbackAllowed
+        || (
+          livePathReady
+          && (
+            !shouldAutoOpenLiveCall
+            || liveOpeningCompletedCallIdRef.current === activeAcceptedCall.call_id
+          )
+        )
+      ),
+    );
+  const shouldPlaySetupTone =
+    Boolean(
+      callOverlayCall
+      && (
+        liveConversationPhase === "connecting_transport"
+        || liveConversationPhase === "waiting_for_opening_audio"
+      ),
+    );
+  const liveDataChannelOpen = liveCallDiagnostics.dataChannelState === "open";
+  const liveConversationReadyFlag =
+    liveConversationPhase === "ready_for_user"
+    || liveConversationPhase === "assistant_processing"
+    || liveConversationPhase === "assistant_speaking";
+  const openingAudioStatus =
+    !shouldAutoOpenLiveCall
+      ? "not needed"
+      : liveOpeningCompletedCallIdRef.current === activeAcceptedCall?.call_id
+        ? "played"
+        : liveOpeningStarted
+          ? "received"
+          : liveOpeningRequestedCallIdRef.current === activeAcceptedCall?.call_id
+            ? "waiting"
+            : "pending";
+  const livePathLabel = livePathReady
+    ? "Live channel connected"
+    : livePathNegotiating
+      ? "Connecting live path"
+      : "Fallback voice path";
   const locationReady = locationState.location_supported && locationState.permission_state !== "denied";
   const pushReady = Boolean(pushStatus?.push_supported && (pushStatus?.registered_subscriptions ?? 0) > 0);
   const sessionReady = Boolean(sessionToken);
@@ -1645,7 +2895,7 @@ function App() {
   const currentSettingsMeta = settingsMenuItems.find((item) => item.section === settingsSection) ?? null;
   const topBarTitle =
     view === "chats"
-      ? "NeuralTrainer"
+      ? `NeuralTrainer ${NORTHSTAR_MOBILE_VERSION}`
       : settingsSection === "menu"
         ? "Settings"
         : currentSettingsMeta?.label ?? "Settings";
@@ -1678,13 +2928,17 @@ function App() {
         setCallLoopState("idle");
         stopRemoteTurnRecording();
       } else {
-        setCallLoopState("listening");
+        if (liveConversationReadyFlag) {
+          setCallLoopState("listening");
+          setLiveConversationPhase("ready_for_user");
+        }
       }
       return;
     }
     if (callLoopMuted) {
       setCallLoopMuted(false);
-      if (activeAcceptedCall && !recordingTurn) {
+      if (activeAcceptedCall && !recordingTurn && liveConversationReadyFlag) {
+        setLiveConversationPhase("ready_for_user");
         void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
       }
       return;
@@ -1694,15 +2948,53 @@ function App() {
     stopRemoteTurnRecording();
   }
 
+  async function resumeLiveHandsFreeListening(call: CompanionCallSession) {
+    if (callLoopMuted || recordingTurn || handsFreeCallIdRef.current === call.call_id) {
+      return;
+    }
+    const liveChannel = canUseLiveSpeechStreaming(call.call_id) ? liveDataChannelRef.current : null;
+    if (livePathReady && liveChannel) {
+      try {
+        await waitForLiveDataChannelCapacity(liveChannel);
+      } catch {
+        return;
+      }
+      if (!canUseLiveSpeechStreaming(call.call_id) || recordingTurn || handsFreeCallIdRef.current === call.call_id) {
+        return;
+      }
+      await startRemoteTurnRecording(call, { handsFree: true, reuseLiveStream: true });
+      return;
+    }
+    await startRemoteTurnRecording(call, { handsFree: true });
+  }
+
   function handleLiveReplyEnded() {
+    if (liveStreamReplyPlayingRef.current || liveStreamReplyQueueRef.current.length > 0 || liveStreamReplyCompletedRef.current) {
+      setLiveReplyAudioSrc(null);
+      finishLiveStreamReplyPlayback();
+      return;
+    }
     setLiveReplyAudioSrc(null);
+    if (activeAcceptedCall && liveOpeningStartedCallIdRef.current === activeAcceptedCall.call_id) {
+      completeLiveOpening(activeAcceptedCall.call_id, {
+        message: "The line is open. North Star is listening for the next thing you say.",
+      });
+      setLiveConversationPhase("ready_for_user");
+    }
     if (!activeAcceptedCall || callLoopMuted) {
       setCallLoopState("idle");
+      setLiveConversationPhase("idle");
+      return;
+    }
+    if (!liveConversationReadyFlag) {
+      setCallLoopState(livePathReady && shouldAutoOpenLiveCall ? "opening" : "connecting");
+      setLiveConversationPhase(livePathReady && shouldAutoOpenLiveCall ? "waiting_for_opening_audio" : "connecting_transport");
       return;
     }
     setCallLoopState("listening");
-    if (!livePathReady && !recordingTurn) {
-      void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
+    setLiveConversationPhase("ready_for_user");
+    if (!recordingTurn) {
+      void resumeLiveHandsFreeListening(activeAcceptedCall);
     }
   }
 
@@ -1721,24 +3013,51 @@ function App() {
   }, [callOverlayCall?.call_id, selectedCallId]);
 
   useEffect(() => {
+    if (shouldPlaySetupTone) {
+      void startLiveSetupTone();
+      return;
+    }
+    stopLiveSetupTone();
+  }, [shouldPlaySetupTone]);
+
+  useEffect(() => {
     if (!activeAcceptedCall) {
       handsFreeCallIdRef.current = null;
       setCallLoopState("idle");
+      setLiveConversationPhase(
+        Boolean(callOverlayCall && outboundSelectedCall && callOverlayCall.status === "pending")
+          ? "connecting_transport"
+          : "idle",
+      );
       setCallLoopMuted(false);
+      setLiveFallbackAllowed(false);
       stopRemoteTurnRecording();
-      teardownLivePeerConnection();
+      teardownLivePeerConnection({
+        preserveSetupTone: liveConversationPhase === "connecting_transport" || liveConversationPhase === "waiting_for_opening_audio",
+      });
+      return;
+    }
+    if (!liveConversationReadyTarget) {
+      stopRemoteTurnRecording();
+      setCallLoopState(livePathReady && shouldAutoOpenLiveCall ? "opening" : "connecting");
+      setLiveConversationPhase(livePathReady && shouldAutoOpenLiveCall ? "waiting_for_opening_audio" : "connecting_transport");
       return;
     }
     if (livePathReady) {
       setCallLoopState("listening");
-      stopRemoteTurnRecording();
+      setLiveConversationPhase("ready_for_user");
+      if (callLoopMuted || recordingTurn || handsFreeCallIdRef.current === activeAcceptedCall.call_id || callLoopState === "processing" || callLoopState === "speaking") {
+        return;
+      }
+      void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true, reuseLiveStream: true });
       return;
     }
     if (callLoopMuted || recordingTurn || handsFreeCallIdRef.current === activeAcceptedCall.call_id || callLoopState === "processing" || callLoopState === "speaking") {
       return;
     }
+    setLiveConversationPhase("ready_for_user");
     void startRemoteTurnRecording(activeAcceptedCall, { handsFree: true });
-  }, [activeAcceptedCall?.call_id, callLoopMuted, recordingTurn, callLoopState, livePathReady]);
+  }, [activeAcceptedCall?.call_id, callOverlayCall?.status, outboundSelectedCall?.call_id, callLoopMuted, recordingTurn, callLoopState, livePathReady, liveFallbackAllowed, liveConversationReadyTarget, shouldAutoOpenLiveCall]);
 
   useEffect(() => {
     if (!activeAcceptedCall) {
@@ -1774,6 +3093,87 @@ function App() {
       window.clearInterval(timer);
     };
   }, [activeAcceptedCall?.call_id]);
+
+  useEffect(() => {
+    if (
+      !activeAcceptedCall
+      || livePathReady
+      || liveFallbackAllowed
+      || liveCallDiagnostics.connectionState === "connected"
+      || liveCallDiagnostics.iceConnectionState === "connected"
+    ) {
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      setLiveFallbackAllowed(true);
+      updateLiveCallDiagnostics({
+        phase: "mobile_live_negotiation_timed_out",
+        issue: "Live path did not stabilize quickly enough, so North Star opened the fallback voice path.",
+      });
+    }, 9000);
+    return () => window.clearTimeout(timer);
+  }, [
+    activeAcceptedCall?.call_id,
+    livePathReady,
+    liveFallbackAllowed,
+    liveCallDiagnostics.connectionState,
+    liveCallDiagnostics.iceConnectionState,
+  ]);
+
+  useEffect(() => {
+    if (!liveCallDiagnostics.issue || livePathReady) {
+      return;
+    }
+    setLiveFallbackAllowed(true);
+  }, [liveCallDiagnostics.issue, livePathReady]);
+
+  useEffect(() => {
+    if (livePathReady) {
+      setLiveFallbackAllowed(false);
+    }
+  }, [livePathReady]);
+
+  useEffect(() => {
+    if (
+      !activeAcceptedCall
+      || !livePathReady
+      || !shouldAutoOpenLiveCall
+      || !liveDataChannelOpen
+      || liveOpeningRequestedCallIdRef.current === activeAcceptedCall.call_id
+      || liveOpeningCompletedCallIdRef.current === activeAcceptedCall.call_id
+      || !liveDataChannelRef.current
+      || liveDataChannelRef.current.readyState !== "open"
+    ) {
+      return;
+    }
+    liveOpeningRequestedCallIdRef.current = activeAcceptedCall.call_id;
+    setCallLoopState("opening");
+    setLiveConversationPhase("waiting_for_opening_audio");
+    setMessage("The line is ready. NeuralTrainer is saying hello.");
+    if (liveOpeningRequestTimeoutRef.current !== null) {
+      window.clearTimeout(liveOpeningRequestTimeoutRef.current);
+    }
+    liveOpeningRequestTimeoutRef.current = window.setTimeout(() => {
+      liveOpeningRequestTimeoutRef.current = null;
+      if (!activeAcceptedCall || liveOpeningCompletedCallIdRef.current === activeAcceptedCall.call_id) {
+        return;
+      }
+      completeLiveOpening(activeAcceptedCall.call_id, {
+        message: "The line is open. Speak naturally while NeuralTrainer catches up.",
+      });
+      setCallLoopState("listening");
+      setLiveConversationPhase("ready_for_user");
+    }, 7000);
+    void sendLiveChannelJson(liveDataChannelRef.current, {
+      type: "live_opening_request",
+      openerId: activeAcceptedCall.call_id,
+      text: LIVE_CALL_OPENING_TEXT,
+    }).catch(() => {
+      if (liveOpeningRequestedCallIdRef.current === activeAcceptedCall.call_id) {
+        liveOpeningRequestedCallIdRef.current = null;
+      }
+    });
+  }, [activeAcceptedCall?.call_id, liveDataChannelOpen, livePathReady, shouldAutoOpenLiveCall]);
 
   useEffect(() => {
     setLiveReplyAudioSrc(null);
@@ -2208,12 +3608,88 @@ function App() {
                 <strong>North Star</strong>
                 <p>{liveCallStatus.headline}</p>
               </article>
-              <article className="call-live-chip call-live-chip--trainer">
-                <strong>Call path</strong>
-                <p>{livePathReady ? "Live channel connected" : "Fallback voice path"}</p>
-              </article>
+              <div className="call-live-diagnostics-grid">
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Call path</strong>
+                  <p>{livePathLabel}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Phase</strong>
+                  <p>{formatStatus(liveCallDiagnostics.phase)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Peer</strong>
+                  <p>{formatStatus(liveCallDiagnostics.connectionState)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>ICE</strong>
+                  <p>{formatStatus(liveCallDiagnostics.iceConnectionState)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Signal</strong>
+                  <p>{formatStatus(liveCallDiagnostics.lastSignal)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Channel</strong>
+                  <p>{formatStatus(liveCallDiagnostics.dataChannelState)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Remote audio</strong>
+                  <p>{formatStatus(liveCallDiagnostics.remoteTrackState)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>ICE candidates</strong>
+                  <p>{liveCallDiagnostics.localIceCandidates} out / {liveCallDiagnostics.remoteIceCandidates} in</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>ICE policy</strong>
+                  <p>{formatStatus(liveCallDiagnostics.icePolicy)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>ICE servers</strong>
+                  <p>{liveCallDiagnostics.iceServerKinds}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Candidate kinds</strong>
+                  <p>{liveCallDiagnostics.localCandidateKinds} / {liveCallDiagnostics.remoteCandidateKinds}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Phone mic</strong>
+                  <p>{liveInputMeter.speaking ? "Speech detected" : "Waiting for voice"}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Mic track</strong>
+                  <p>{liveInputMeter.trackEnabled ? "enabled" : "disabled"} / {liveInputMeter.trackMuted ? "muted" : "live"} / {liveInputMeter.trackReadyState}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Mic level</strong>
+                  <p>rms {liveInputMeter.rms.toFixed(4)} / peak {liveInputMeter.peak.toFixed(4)}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Live turns sent</strong>
+                  <p>{liveTurnTransportStats.liveTurnsSent} turns / {liveTurnTransportStats.liveTurnChunksSent} chunks</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Last turn id</strong>
+                  <p>{liveTurnTransportStats.lastLiveTurnRequestId}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Conversation ready</strong>
+                  <p>{liveConversationReadyFlag ? "yes" : "no"}</p>
+                </article>
+                <article className="call-live-chip call-live-chip--trainer">
+                  <strong>Opening audio</strong>
+                  <p>{openingAudioStatus}</p>
+                </article>
+              </div>
+              {liveCallDiagnostics.issue ? (
+                <div className="empty-state compact">
+                  <h3>Live call issue</h3>
+                  <p>{liveCallDiagnostics.issue}</p>
+                </div>
+              ) : null}
               <div className="empty-state compact">
-                <h3>Call is live</h3>
+                <h3>{liveConversationReadyFlag ? "Call is live" : "Connecting call"}</h3>
                 <p>{liveCallStatus.detail}</p>
               </div>
             </div>

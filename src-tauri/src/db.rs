@@ -106,6 +106,8 @@ pub fn load_settings(db_path: &PathBuf) -> Result<AppSettings, AppError> {
       "lm_studio_api_key" => settings.lm_studio_api_key = serde_json::from_str(&value_json)?,
       "lm_studio_model" => settings.lm_studio_model = serde_json::from_str(&value_json)?,
       "tts_provider" => settings.tts_provider = serde_json::from_str(&value_json)?,
+      "tts_endpoint" => settings.tts_endpoint = serde_json::from_str(&value_json)?,
+      "tts_api_key" => settings.tts_api_key = serde_json::from_str(&value_json)?,
       "tts_model_id" => settings.tts_model_id = serde_json::from_str(&value_json)?,
       "tts_sample_rate" => settings.tts_sample_rate = serde_json::from_str(&value_json)?,
       "tts_default_voice" => settings.tts_default_voice = serde_json::from_str(&value_json)?,
@@ -210,6 +212,14 @@ pub fn save_settings(
     (
       "tts_provider",
       serde_json::to_string(&payload.tts_provider)?,
+    ),
+    (
+      "tts_endpoint",
+      serde_json::to_string(&payload.tts_endpoint)?,
+    ),
+    (
+      "tts_api_key",
+      serde_json::to_string(&payload.tts_api_key)?,
     ),
     (
       "tts_model_id",
