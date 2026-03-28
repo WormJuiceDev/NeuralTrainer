@@ -40,6 +40,7 @@ pub fn run() {
       commands::save_settings,
       commands::get_diagnostics,
       commands::get_north_star_snapshot,
+      commands::get_north_star_runtime_snapshot,
       commands::create_north_star_session,
       commands::bind_north_star_desktop,
       commands::send_north_star_heartbeat,

@@ -200,6 +200,15 @@ pub struct NorthStarSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NorthStarRuntimeSnapshot {
+  pub configured: bool,
+  pub session_ready: bool,
+  pub desktop_bound: bool,
+  pub call_sessions: Vec<NorthStarCallSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NorthStarTurnProcessingResult {
   pub processed: bool,
   pub detail: String,

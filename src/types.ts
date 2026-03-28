@@ -135,6 +135,13 @@ export type NorthStarSnapshot = {
   detail: string;
 };
 
+export type NorthStarRuntimeSnapshot = {
+  configured: boolean;
+  sessionReady: boolean;
+  desktopBound: boolean;
+  callSessions: NorthStarCallSession[];
+};
+
 export type NorthStarTurnProcessingResult = {
   processed: boolean;
   detail: string;

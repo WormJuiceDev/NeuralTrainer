@@ -17,6 +17,7 @@ import {
   getCallSessionSnapshot,
   getMemoryGrowthSnapshot,
   getMvpRealityCheckSnapshot,
+  getNorthStarRuntimeSnapshot,
   getNorthStarSnapshot,
   getNorthStarRtcConfig,
   importNorthStarCallReviews,
@@ -93,6 +94,7 @@ import type {
   MvpRealityCheckSnapshot,
   NorthStarSnapshot,
   NorthStarRtcIceServer,
+  NorthStarRuntimeSnapshot,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
   SettingsEntry,
@@ -176,6 +178,31 @@ type NorthStarLiveTurnTransportStats = {
   lastLiveTurnRequestId: string;
 };
 
+type NorthStarRuntimeProjection = {
+  configured: boolean;
+  sessionReady: boolean;
+  desktopBound: boolean;
+  callSessions: NorthStarSnapshot["callSessions"];
+};
+
+type NorthStarConnectionsProjection = {
+  configured: boolean;
+  sessionReady: boolean;
+  desktopBound: boolean;
+  displayName: string;
+  desktopName: string;
+  detail: string;
+  callSessions: NorthStarSnapshot["callSessions"];
+  endpoint: string;
+  userHandle: string;
+  sessionTokenMasked: string;
+  deviceTokenMasked: string;
+  desktopCount: number;
+  messageCount: number;
+  locationEventCount: number;
+  callReviewCount: number;
+};
+
 const defaultNorthStarLiveDiagnostics: NorthStarLiveDiagnostics = {
   phase: "idle",
   signalingState: "idle",
@@ -217,6 +244,81 @@ const defaultNorthStarLiveTurnTransportStats: NorthStarLiveTurnTransportStats = 
   liveTurnChunksReceived: 0,
   lastLiveTurnRequestId: "none",
 };
+
+function buildNorthStarCallSessionsSignature(callSessions: NorthStarSnapshot["callSessions"]) {
+  return callSessions
+    .map((call) => `${call.callId}:${call.status}:${call.requestedAt}:${call.respondedAt ?? ""}:${call.note}`)
+    .join("|");
+}
+
+function projectNorthStarRuntimeSnapshot(snapshot: NorthStarSnapshot): NorthStarRuntimeProjection {
+  return {
+    configured: snapshot.configured,
+    sessionReady: snapshot.sessionReady,
+    desktopBound: snapshot.desktopBound,
+    callSessions: snapshot.callSessions,
+  };
+}
+
+function projectNorthStarRuntimeState(snapshot: NorthStarRuntimeSnapshot): NorthStarRuntimeProjection {
+  return {
+    configured: snapshot.configured,
+    sessionReady: snapshot.sessionReady,
+    desktopBound: snapshot.desktopBound,
+    callSessions: snapshot.callSessions,
+  };
+}
+
+function projectNorthStarConnectionsSnapshot(snapshot: NorthStarSnapshot): NorthStarConnectionsProjection {
+  return {
+    configured: snapshot.configured,
+    sessionReady: snapshot.sessionReady,
+    desktopBound: snapshot.desktopBound,
+    displayName: snapshot.displayName,
+    desktopName: snapshot.desktopName,
+    detail: snapshot.detail,
+    callSessions: snapshot.callSessions,
+    endpoint: snapshot.endpoint,
+    userHandle: snapshot.userHandle,
+    sessionTokenMasked: snapshot.sessionTokenMasked,
+    deviceTokenMasked: snapshot.deviceTokenMasked,
+    desktopCount: snapshot.desktops.length,
+    messageCount: snapshot.messages.length,
+    locationEventCount: snapshot.locationEvents.length,
+    callReviewCount: snapshot.callReviews.length,
+  };
+}
+
+function sameNorthStarRuntimeProjection(a: NorthStarRuntimeProjection | null, b: NorthStarRuntimeProjection) {
+  if (!a) return false;
+  return (
+    a.configured === b.configured
+    && a.sessionReady === b.sessionReady
+    && a.desktopBound === b.desktopBound
+    && buildNorthStarCallSessionsSignature(a.callSessions) === buildNorthStarCallSessionsSignature(b.callSessions)
+  );
+}
+
+function sameNorthStarConnectionsProjection(a: NorthStarConnectionsProjection | null, b: NorthStarConnectionsProjection) {
+  if (!a) return false;
+  return (
+    a.configured === b.configured
+    && a.sessionReady === b.sessionReady
+    && a.desktopBound === b.desktopBound
+    && a.displayName === b.displayName
+    && a.desktopName === b.desktopName
+    && a.detail === b.detail
+    && buildNorthStarCallSessionsSignature(a.callSessions) === buildNorthStarCallSessionsSignature(b.callSessions)
+    && a.endpoint === b.endpoint
+    && a.userHandle === b.userHandle
+    && a.sessionTokenMasked === b.sessionTokenMasked
+    && a.deviceTokenMasked === b.deviceTokenMasked
+    && a.desktopCount === b.desktopCount
+    && a.messageCount === b.messageCount
+    && a.locationEventCount === b.locationEventCount
+    && a.callReviewCount === b.callReviewCount
+  );
+}
 
 const NORTH_STAR_WEBRTC_CONFIG: RTCConfiguration = {
   iceServers: [
@@ -492,7 +594,8 @@ function App() {
   const [passiveSnapshot, setPassiveSnapshot] = useState<PassiveContextSnapshot | null>(null);
   const [phaseThreeSnapshot, setPhaseThreeSnapshot] = useState<PhaseThreeSnapshot | null>(null);
   const [decisionSnapshot, setDecisionSnapshot] = useState<DecisionSnapshot | null>(null);
-  const [northStarSnapshot, setNorthStarSnapshot] = useState<NorthStarSnapshot | null>(null);
+  const [northStarRuntimeSnapshot, setNorthStarRuntimeSnapshot] = useState<NorthStarRuntimeProjection | null>(null);
+  const [northStarConnectionsSnapshot, setNorthStarConnectionsSnapshot] = useState<NorthStarConnectionsProjection | null>(null);
   const [telegramSnapshot, setTelegramSnapshot] = useState<TelegramConnectionSnapshot | null>(null);
   const [telegramUserSnapshot, setTelegramUserSnapshot] = useState<TelegramUserSnapshot | null>(null);
   const [telegramCallTransportSnapshot, setTelegramCallTransportSnapshot] = useState<TelegramCallTransportSnapshot | null>(null);
@@ -579,8 +682,10 @@ function App() {
   const northStarReplyTransportQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarPeerReplyPlaybackQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarPeerReplyStartedRef = useRef<Set<string>>(new Set());
+  const northStarSnapshotCacheRef = useRef<NorthStarSnapshot | null>(null);
 
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
+  const northStarConnectionsVisible = activeTab === "settings" && settingsSection === "connections";
   const unresolvedMomentCount = phaseThreeSnapshot?.savedMoments.filter((moment) => !moment.resolvedAt).length ?? 0;
   const callReadyMomentCount = phaseThreeSnapshot?.savedMoments.filter((moment) => !moment.resolvedAt && moment.confidence >= settings.callConfidenceThreshold).length ?? 0;
   const selectedMemoryItem =
@@ -608,7 +713,7 @@ function App() {
     telegramSnapshot?.outreachEvents.find((event) => event.outreachKind === "call_request" && event.responseState === "accepted")
     ?? null;
   const latestAcceptedNorthStarCall =
-    northStarSnapshot?.callSessions.find((call) => call.status === "accepted")
+    northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
     ?? null;
   const activeNorthStarSession =
     callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
@@ -618,11 +723,11 @@ function App() {
   const activeNorthStarRemoteCallId = activeNorthStarSession?.notes.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? null;
   const activeNorthStarRemoteCall =
     activeNorthStarRemoteCallId
-      ? northStarSnapshot?.callSessions.find((call) => call.callId === activeNorthStarRemoteCallId) ?? null
+      ? northStarRuntimeSnapshot?.callSessions.find((call) => call.callId === activeNorthStarRemoteCallId) ?? null
       : null;
-  const northStarSessionReady = northStarSnapshot?.sessionReady ?? false;
-  const northStarDesktopBound = northStarSnapshot?.desktopBound ?? false;
-  const northStarReadyForCalls = northStarSnapshot?.configured && northStarSessionReady && northStarDesktopBound;
+  const northStarSessionReady = northStarRuntimeSnapshot?.sessionReady ?? false;
+  const northStarDesktopBound = northStarRuntimeSnapshot?.desktopBound ?? false;
+  const northStarReadyForCalls = northStarRuntimeSnapshot?.configured && northStarSessionReady && northStarDesktopBound;
 const northStarLiveTurnActive =
   northStarLiveDiagnostics.phase === "desktop_remote_turn_processing"
   || northStarLiveDiagnostics.phase === "desktop_remote_turn_processed";
@@ -1971,7 +2076,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       });
     }
 
-    if (signal.signalKind === "reconnect_request") {
+  if (signal.signalKind === "reconnect_request") {
       updateNorthStarLiveDiagnostics({
         phase: "desktop_reconnect_request_received",
         lastSignal: "reconnect_request_received",
@@ -1980,8 +2085,24 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
   }
 
+  function commitNorthStarSnapshot(snapshot: NorthStarSnapshot, options?: { forceConnections?: boolean }) {
+    northStarSnapshotCacheRef.current = snapshot;
+    const runtimeProjection = projectNorthStarRuntimeSnapshot(snapshot);
+    setNorthStarRuntimeSnapshot((current) => (sameNorthStarRuntimeProjection(current, runtimeProjection) ? current : runtimeProjection));
+    if (options?.forceConnections || northStarConnectionsVisible) {
+      const connectionsProjection = projectNorthStarConnectionsSnapshot(snapshot);
+      setNorthStarConnectionsSnapshot((current) => (sameNorthStarConnectionsProjection(current, connectionsProjection) ? current : connectionsProjection));
+    }
+  }
+
+  function commitNorthStarRuntimeSnapshot(snapshot: NorthStarRuntimeSnapshot) {
+    const runtimeProjection = projectNorthStarRuntimeState(snapshot);
+    setNorthStarRuntimeSnapshot((current) => (sameNorthStarRuntimeProjection(current, runtimeProjection) ? current : runtimeProjection));
+  }
+
   async function refreshDiagnostics() { setDiagnostics(await getDiagnostics()); }
-  async function refreshNorthStarSnapshot() { setNorthStarSnapshot(await getNorthStarSnapshot()); }
+  async function refreshNorthStarSnapshot() { commitNorthStarSnapshot(await getNorthStarSnapshot()); }
+  async function refreshNorthStarRuntimeSnapshot() { commitNorthStarRuntimeSnapshot(await getNorthStarRuntimeSnapshot()); }
   async function refreshVoiceSnapshot() { setVoiceSnapshot(await getVoiceSnapshot()); }
   async function refreshSpeechStreamSnapshot() { setSpeechStream(await getSpeechStreamSnapshot()); }
   async function refreshSnapshot() { setSnapshot(await getPhaseOneSnapshot()); }
@@ -2020,7 +2141,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         if (!active) return;
         setSettings(loadedSettings);
         setDiagnostics(loadedDiagnostics);
-        setNorthStarSnapshot(loadedNorthStarSnapshot);
+        commitNorthStarSnapshot(loadedNorthStarSnapshot);
         setVoiceSnapshot(loadedVoiceSnapshot);
         setSpeechStream(loadedSpeechStream);
         setSnapshot(loadedSnapshot);
@@ -2054,22 +2175,28 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }, [speechStream?.active]);
 
   useEffect(() => {
-    if (!northStarSnapshot?.configured) return;
+    if (!northStarRuntimeSnapshot?.configured) return;
     const timer = window.setInterval(() => {
-      void refreshNorthStarSnapshot();
+      void refreshNorthStarRuntimeSnapshot();
     }, 3000);
     return () => window.clearInterval(timer);
-  }, [northStarSnapshot?.configured]);
+  }, [northStarRuntimeSnapshot?.configured]);
 
   useEffect(() => {
     if (!northStarDesktopBound || busyPanel === "northStarHeartbeat") return;
     const timer = window.setInterval(() => {
       void sendNorthStarHeartbeat()
-        .then((snapshot) => setNorthStarSnapshot(snapshot))
+        .then((snapshot) => commitNorthStarSnapshot(snapshot))
         .catch(() => undefined);
     }, 15000);
     return () => window.clearInterval(timer);
   }, [northStarDesktopBound, busyPanel]);
+
+  useEffect(() => {
+    if (!northStarConnectionsVisible || !northStarSnapshotCacheRef.current) return;
+    const connectionsProjection = projectNorthStarConnectionsSnapshot(northStarSnapshotCacheRef.current);
+    setNorthStarConnectionsSnapshot((current) => (sameNorthStarConnectionsProjection(current, connectionsProjection) ? current : connectionsProjection));
+  }, [northStarConnectionsVisible]);
 
   useEffect(() => {
     if (
@@ -2104,7 +2231,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       missingAcceptedNorthStarPollsRef.current = 0;
       return;
     }
-    if (!northStarSnapshot?.configured || busyPanel === "callEnd" || busyPanel === "northStarAcceptedCall") {
+    if (!northStarRuntimeSnapshot?.configured || busyPanel === "callEnd" || busyPanel === "northStarAcceptedCall") {
       return;
     }
     if (activeNorthStarRemoteCall && activeNorthStarRemoteCall.status !== "accepted") {
@@ -2124,7 +2251,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
     missingAcceptedNorthStarPollsRef.current = 0;
     void handleEndCallSession("completed");
-  }, [activeNorthStarSession?.id, activeNorthStarRemoteCall?.callId, activeNorthStarRemoteCall?.status, northStarSnapshot?.configured, busyPanel]);
+  }, [activeNorthStarSession?.id, activeNorthStarRemoteCall?.callId, activeNorthStarRemoteCall?.status, northStarRuntimeSnapshot?.configured, busyPanel]);
 
   useEffect(() => {
     if (!activeNorthStarSession || !activeNorthStarRemoteCallId) {
@@ -2295,7 +2422,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await createNorthStarSession();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
       setSettings(loaded);
       setMessage(snapshot.detail);
@@ -2313,7 +2440,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await bindNorthStarDesktop();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
       setSettings(loaded);
       setMessage(snapshot.detail);
@@ -2330,17 +2457,17 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
-      let snapshot = northStarSnapshot;
+      let snapshot = northStarSnapshotCacheRef.current;
       if (!snapshot?.sessionReady) {
         snapshot = await createNorthStarSession();
-        setNorthStarSnapshot(snapshot);
+        commitNorthStarSnapshot(snapshot, { forceConnections: true });
       }
       if (!snapshot?.desktopBound) {
         snapshot = await bindNorthStarDesktop();
-        setNorthStarSnapshot(snapshot);
+        commitNorthStarSnapshot(snapshot, { forceConnections: true });
       }
       snapshot = await sendNorthStarHeartbeat();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
       setSettings(loaded);
       setMessage("North Star is linked and ready for calls.");
@@ -2358,7 +2485,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await sendNorthStarHeartbeat();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await refreshDiagnostics();
     } catch (caught) {
@@ -2374,7 +2501,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await sendNorthStarMessage(northStarMessageText);
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarMessageText("");
       setMessage(snapshot.detail);
       await refreshDiagnostics();
@@ -2391,7 +2518,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await pullNorthStarLocationEvents();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await Promise.all([refreshDiagnostics(), refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDecisionSnapshot()]);
     } catch (caught) {
@@ -2407,7 +2534,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await sendNorthStarCallRequest(northStarCallNote);
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarCallNote("");
       setMessage(snapshot.detail);
       await refreshDiagnostics();
@@ -2428,7 +2555,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       }
       const note = northStarCallNote.trim() || "NeuralTrainer is calling you now.";
       const snapshot = await sendNorthStarCallRequest(note);
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarCallNote("");
       setMessage("Calling North Star now. Accept on the phone to open the line.");
       await refreshDiagnostics();
@@ -2445,7 +2572,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       const snapshot = await importNorthStarCallReviews();
-      setNorthStarSnapshot(snapshot);
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await Promise.all([refreshDiagnostics(), refreshMemoryGrowthSnapshot(), refreshSnapshot()]);
     } catch (caught) {
@@ -3272,15 +3399,15 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     <div className="saved-state">
                       <h3>North Star companion</h3>
                       <p>Link once, then call North Star with a single button while the desktop keeps the line alive automatically.</p>
-                      {northStarSnapshot ? (
+                      {northStarConnectionsSnapshot ? (
                         <>
                           <dl className="facts">
                             <div><dt>Link</dt><dd>{northStarReadyForCalls ? "Ready" : "Needs setup"}</dd></div>
-                            <div><dt>Companion</dt><dd>{northStarSnapshot.displayName || "North Star"}</dd></div>
-                            <div><dt>Desktop</dt><dd>{northStarSnapshot.desktopName}</dd></div>
-                            <div><dt>Active phone calls</dt><dd>{northStarSnapshot.callSessions.filter((entry) => entry.status === "pending" || entry.status === "accepted").length}</dd></div>
+                            <div><dt>Companion</dt><dd>{northStarConnectionsSnapshot.displayName || "North Star"}</dd></div>
+                            <div><dt>Desktop</dt><dd>{northStarConnectionsSnapshot.desktopName}</dd></div>
+                            <div><dt>Active phone calls</dt><dd>{northStarConnectionsSnapshot.callSessions.filter((entry) => entry.status === "pending" || entry.status === "accepted").length}</dd></div>
                           </dl>
-                          <p><strong>Status</strong><br />{northStarSnapshot.detail}</p>
+                          <p><strong>Status</strong><br />{northStarConnectionsSnapshot.detail}</p>
                           <div className="button-row">
                             <button type="button" onClick={handleNorthStarQuickLink} disabled={busyPanel === "northStarLink"}>
                               {busyPanel === "northStarLink" ? "Linking..." : "Link North Star"}
@@ -3291,7 +3418,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                             <button type="button" className="ghost" onClick={handleNorthStarHeartbeat} disabled={busyPanel === "northStarHeartbeat" || !settings.northStarDeviceToken}>
                               {busyPanel === "northStarHeartbeat" ? "Refreshing..." : "Refresh link"}
                             </button>
-                            <button type="button" className="ghost" onClick={handleImportNorthStarCallReviews} disabled={busyPanel === "northStarImportReviews" || !northStarSnapshot.callReviews.length}>
+                            <button type="button" className="ghost" onClick={handleImportNorthStarCallReviews} disabled={busyPanel === "northStarImportReviews" || !northStarConnectionsSnapshot.callReviewCount}>
                               {busyPanel === "northStarImportReviews" ? "Importing..." : "Import call reviews"}
                             </button>
                           </div>
@@ -3303,8 +3430,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                             </div>
                             <label><span>North Star display name</span><input value={settings.northStarDisplayName} onChange={(event) => setSettings((current) => ({ ...current, northStarDisplayName: event.target.value }))} placeholder="Savvy" /></label>
                             <div className="split">
-                              <div><strong>Session token</strong><br />{northStarSnapshot.sessionTokenMasked || "Not created yet"}</div>
-                              <div><strong>Device token</strong><br />{northStarSnapshot.deviceTokenMasked || "Not bound yet"}</div>
+                              <div><strong>Session token</strong><br />{northStarConnectionsSnapshot.sessionTokenMasked || "Not created yet"}</div>
+                              <div><strong>Device token</strong><br />{northStarConnectionsSnapshot.deviceTokenMasked || "Not bound yet"}</div>
                             </div>
                             <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional note for the phone call request..." /></label>
                             <label><span>Desktop companion message</span><textarea rows={3} value={northStarMessageText} onChange={(event) => setNorthStarMessageText(event.target.value)} placeholder="Send a message into the North Star companion thread..." /></label>

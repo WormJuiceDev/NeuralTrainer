@@ -17,6 +17,7 @@ import type {
   ManualReflection,
   MemoryGrowthSnapshot,
   MvpRealityCheckSnapshot,
+  NorthStarRuntimeSnapshot,
   NorthStarSnapshot,
   NorthStarRtcIceServer,
   NorthStarTurnProcessingResult,
@@ -62,6 +63,9 @@ export const getDiagnostics = () => invoke<DiagnosticStatus>("get_diagnostics");
 
 export const getNorthStarSnapshot = () =>
   invoke<NorthStarSnapshot>("get_north_star_snapshot");
+
+export const getNorthStarRuntimeSnapshot = () =>
+  invoke<NorthStarRuntimeSnapshot>("get_north_star_runtime_snapshot");
 
 export const createNorthStarSession = () =>
   invoke<NorthStarSnapshot>("create_north_star_session");

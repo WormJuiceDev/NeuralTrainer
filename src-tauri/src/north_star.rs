@@ -8,7 +8,7 @@ use crate::{
   error::AppError,
   models::{
     AppSettings, CallTurnResult, LocationEventInput, NorthStarCallReview, NorthStarCallSession, NorthStarCallTurn,
-    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarRtcIceServer, NorthStarSnapshot,
+    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarRtcIceServer, NorthStarRuntimeSnapshot, NorthStarSnapshot,
     NorthStarTurnProcessingResult, NorthStarWebRtcSignal,
   },
 };
@@ -649,6 +649,40 @@ pub fn fetch_snapshot(
     call_sessions: calls.calls.into_iter().map(Into::into).collect(),
     call_reviews: reviews.reviews.into_iter().map(Into::into).collect(),
     detail: detail_override.unwrap_or_else(|| "North Star desktop link is ready.".into()),
+  })
+}
+
+pub fn fetch_runtime_snapshot(settings: &AppSettings) -> Result<NorthStarRuntimeSnapshot, AppError> {
+  let configured = !settings.north_star_endpoint.trim().is_empty() && !settings.north_star_user_handle.trim().is_empty();
+
+  if !configured {
+    return Ok(NorthStarRuntimeSnapshot {
+      configured: false,
+      session_ready: false,
+      desktop_bound: false,
+      call_sessions: Vec::new(),
+    });
+  }
+
+  if settings.north_star_session_token.trim().is_empty() {
+    return Ok(NorthStarRuntimeSnapshot {
+      configured: true,
+      session_ready: false,
+      desktop_bound: !settings.north_star_device_token.trim().is_empty(),
+      call_sessions: Vec::new(),
+    });
+  }
+
+  let calls = auth_request(&client(), settings, reqwest::Method::GET, "/api/companion/call-sessions")?
+    .send()?
+    .error_for_status()?
+    .json::<CallSessionsResponse>()?;
+
+  Ok(NorthStarRuntimeSnapshot {
+    configured: true,
+    session_ready: true,
+    desktop_bound: !settings.north_star_device_token.trim().is_empty(),
+    call_sessions: calls.calls.into_iter().map(Into::into).collect(),
   })
 }
 

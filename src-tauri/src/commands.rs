@@ -9,7 +9,7 @@ use crate::{
     AppSettings, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompleteTelegramUserLoginInput, DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
     MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
-    SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
+    NorthStarRuntimeSnapshot, SimulationSuiteResult, OutreachDispatchResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, SubmitFeedbackInput, UpdateMemoryItemInput,
     TelegramCallActionResult, TelegramCallTransportSnapshot, TelegramConnectionSnapshot, TelegramSendResult, TelegramUserActionResult, TelegramUserSnapshot, UpdatePlaceInput, UpdateRuleInput,
@@ -51,6 +51,12 @@ pub fn get_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticStatus, A
 pub fn get_north_star_snapshot(state: State<'_, AppState>) -> Result<NorthStarSnapshot, AppError> {
   let settings = db::load_settings(&state.db_path)?;
   north_star::fetch_snapshot(&settings, None)
+}
+
+#[tauri::command]
+pub fn get_north_star_runtime_snapshot(state: State<'_, AppState>) -> Result<NorthStarRuntimeSnapshot, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  north_star::fetch_runtime_snapshot(&settings)
 }
 
 #[tauri::command]
