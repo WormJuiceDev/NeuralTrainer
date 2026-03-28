@@ -1,9 +1,10 @@
 use std::{
+  collections::BTreeMap,
   fs,
   io::{BufRead, BufReader, Write},
   path::{Path, PathBuf},
   process::{Child, ChildStdin, ChildStdout, Command, Stdio},
-  sync::Mutex,
+  sync::{mpsc, Mutex},
   thread,
   time::{Duration, Instant},
 };
@@ -42,7 +43,7 @@ const MOONSHINE_MODEL_FILES: [&str; 7] = [
   "tokenizer.bin",
 ];
 const DEFAULT_TEST_PHRASE: &str = "Hey, I am here with you for a moment.";
-const DEFAULT_CALL_REPLY: &str = "I hear you. I'm here with you.";
+const DEFAULT_CALL_REPLY: &str = "I had a little trouble with that reply just then. Can you ask it once more?";
 const DEFAULT_CALL_REPLY_PLAYFUL: &str = "Maybe just a croak or two.";
 const DEFAULT_CALL_REPLY_POSITIVE: &str = "That sounds really nice.";
 const DEFAULT_CALL_REPLY_MODEL_ISSUE: &str = "I had a little trouble responding just then. Can you say that again?";
@@ -834,8 +835,11 @@ where
     reply_mode: None,
     text_chunk: None,
     audio_base64: None,
+    audio_slice: None,
     sample_rate: None,
     chunk_index: None,
+    part_index: None,
+    total_parts: None,
     message: None,
   })?;
 
@@ -878,8 +882,11 @@ where
     reply_mode: Some(reply_mode),
     text_chunk: Some(chunk_texts.join(" ").trim().to_string()),
     audio_base64: None,
+    audio_slice: None,
     sample_rate: Some(settings.tts_sample_rate),
     chunk_index: None,
+    part_index: None,
+    total_parts: None,
     message: None,
   })?;
   Ok(result)
@@ -1465,24 +1472,79 @@ fn generate_streamed_call_reply<F>(
 where
   F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
 {
+  const NORTH_STAR_LIVE_REPLY_AUDIO_SLICE_SIZE: usize = 6_000;
+
+  fn emit_streamed_reply_audio<F>(
+    request_id: &str,
+    reply_mode: &str,
+    text_chunk: &str,
+    audio_bytes: Vec<u8>,
+    sample_rate: i64,
+    chunk_index: usize,
+    emit_event: &mut F,
+  ) -> Result<(), AppError>
+  where
+    F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+  {
+    let audio_base64 = STANDARD.encode(audio_bytes);
+    if audio_base64.len() <= NORTH_STAR_LIVE_REPLY_AUDIO_SLICE_SIZE {
+      emit_event(NorthStarLiveReplyStreamEvent {
+        request_id: request_id.to_string(),
+        phase: "chunk".into(),
+        transcript_text: None,
+        reply_text: None,
+        reply_mode: Some(reply_mode.into()),
+        text_chunk: Some(text_chunk.to_string()),
+        audio_base64: Some(audio_base64),
+        audio_slice: None,
+        sample_rate: Some(sample_rate),
+        chunk_index: Some(chunk_index),
+        part_index: None,
+        total_parts: None,
+        message: None,
+      })?;
+      return Ok(());
+    }
+
+    let total_parts = audio_base64.len().div_ceil(NORTH_STAR_LIVE_REPLY_AUDIO_SLICE_SIZE);
+    for part_index in 0..total_parts {
+      let start = part_index * NORTH_STAR_LIVE_REPLY_AUDIO_SLICE_SIZE;
+      let end = ((part_index + 1) * NORTH_STAR_LIVE_REPLY_AUDIO_SLICE_SIZE).min(audio_base64.len());
+      emit_event(NorthStarLiveReplyStreamEvent {
+        request_id: request_id.to_string(),
+        phase: "chunk_part".into(),
+        transcript_text: None,
+        reply_text: None,
+        reply_mode: Some(reply_mode.into()),
+        text_chunk: Some(if part_index == 0 { text_chunk.to_string() } else { String::new() }),
+        audio_base64: None,
+        audio_slice: Some(audio_base64[start..end].to_string()),
+        sample_rate: Some(sample_rate),
+        chunk_index: Some(chunk_index),
+        part_index: Some(part_index),
+        total_parts: Some(total_parts),
+        message: None,
+      })?;
+    }
+
+    Ok(())
+  }
+
   if settings.lm_studio_endpoint.trim().is_empty()
     || settings.lm_studio_model.trim().is_empty()
     || settings.lm_studio_api_key.trim().is_empty()
   {
     let fallback = fallback_call_reply(transcript_text);
     let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &fallback, reply_voice)?;
-    emit_event(NorthStarLiveReplyStreamEvent {
-      request_id: request_id.to_string(),
-      phase: "chunk".into(),
-      transcript_text: None,
-      reply_text: None,
-      reply_mode: Some("fallback".into()),
-      text_chunk: Some(fallback.clone()),
-      audio_base64: Some(STANDARD.encode(audio_bytes)),
-      sample_rate: Some(settings.tts_sample_rate),
-      chunk_index: Some(0),
-      message: None,
-    })?;
+    emit_streamed_reply_audio(
+      request_id,
+      "fallback",
+      &fallback,
+      audio_bytes,
+      settings.tts_sample_rate,
+      0,
+      emit_event,
+    )?;
     return Ok((fallback.clone(), "fallback".into(), vec![fallback]));
   }
 
@@ -1511,125 +1573,272 @@ where
   if !response.status().is_success() {
     return Err(AppError::Message(format!("LM Studio streaming reply failed with {}.", response.status())));
   }
+  thread::scope(|scope| -> Result<(String, String, Vec<String>), AppError> {
+    let (tts_request_tx, tts_request_rx) = mpsc::channel::<(usize, String)>();
+    let (tts_result_tx, tts_result_rx) = mpsc::channel::<Result<(usize, String, Vec<u8>), String>>();
+    let tts_worker = scope.spawn(move || {
+      while let Ok((queued_index, queued_text)) = tts_request_rx.recv() {
+        let synthesis = synthesize_text_once(
+          app_data_dir,
+          settings,
+          worker_slot,
+          kokoro_runtime_slot,
+          &queued_text,
+          reply_voice,
+        )
+        .map(|audio_bytes| (queued_index, queued_text, audio_bytes))
+        .map_err(|error| error.to_string());
+        if tts_result_tx.send(synthesis).is_err() {
+          break;
+        }
+      }
+    });
 
-  let mut reader = BufReader::new(response);
-  let mut line = String::new();
-  let mut accumulated = String::new();
-  let mut flushed_visible_prefix = String::new();
-  let mut chunk_index = 0usize;
-  let mut chunk_texts = Vec::new();
+    let mut reader = BufReader::new(response);
+    let mut line = String::new();
+    let mut accumulated = String::new();
+    let mut flushed_visible_prefix = String::new();
+    let mut queued_chunk_count = 0usize;
+    let mut next_emit_index = 0usize;
+    let mut emitted_chunk_texts = Vec::new();
+    let mut pending_tts_results = BTreeMap::<usize, (String, Vec<u8>)>::new();
 
-  loop {
-    line.clear();
-    if reader.read_line(&mut line)? == 0 {
-      break;
+    fn flush_tts_results<F>(
+      block_until_next: bool,
+      queued_chunk_count: usize,
+      next_emit_index: &mut usize,
+      pending_tts_results: &mut BTreeMap<usize, (String, Vec<u8>)>,
+      emitted_chunk_texts: &mut Vec<String>,
+      tts_result_rx: &mpsc::Receiver<Result<(usize, String, Vec<u8>), String>>,
+      request_id: &str,
+      sample_rate: i64,
+      emit_event: &mut F,
+    ) -> Result<(), AppError>
+    where
+      F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+    {
+      loop {
+        if let Some((text_chunk, audio_bytes)) = pending_tts_results.remove(next_emit_index) {
+          emit_streamed_reply_audio(
+            request_id,
+            "model_stream",
+            &text_chunk,
+            audio_bytes,
+            sample_rate,
+            *next_emit_index,
+            emit_event,
+          )?;
+          emitted_chunk_texts.push(text_chunk);
+          *next_emit_index += 1;
+          continue;
+        }
+
+        if block_until_next && *next_emit_index < queued_chunk_count {
+          let result = tts_result_rx
+            .recv()
+            .map_err(|_| AppError::Message("Live reply TTS worker stopped before all chunks were synthesized.".into()))?;
+          let (completed_index, completed_text, completed_audio) = result
+            .map_err(AppError::Message)?;
+          pending_tts_results.insert(completed_index, (completed_text, completed_audio));
+          continue;
+        }
+
+        match tts_result_rx.try_recv() {
+          Ok(result) => {
+            let (completed_index, completed_text, completed_audio) = result
+              .map_err(AppError::Message)?;
+            pending_tts_results.insert(completed_index, (completed_text, completed_audio));
+          }
+          Err(mpsc::TryRecvError::Empty) => break,
+          Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+      }
+      Ok(())
     }
-    let trimmed = line.trim();
-    if !trimmed.starts_with("data:") {
-      continue;
+
+    fn queue_stream_segment<F>(
+      text: String,
+      queued_chunk_count: &mut usize,
+      tts_request_tx: &mpsc::Sender<(usize, String)>,
+      request_id: &str,
+      emit_event: &mut F,
+    ) -> Result<(), AppError>
+    where
+      F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
+    {
+      if text.is_empty() {
+        return Ok(());
+      }
+      emit_event(NorthStarLiveReplyStreamEvent {
+        request_id: request_id.to_string(),
+        phase: "text_preview".into(),
+        transcript_text: None,
+        reply_text: None,
+        reply_mode: Some("model_stream".into()),
+        text_chunk: Some(text.clone()),
+        audio_base64: None,
+        audio_slice: None,
+        sample_rate: None,
+        chunk_index: Some(*queued_chunk_count),
+        part_index: None,
+        total_parts: None,
+        message: None,
+      })?;
+      let queued_index = *queued_chunk_count;
+      *queued_chunk_count += 1;
+      tts_request_tx
+        .send((queued_index, text))
+        .map_err(|_| AppError::Message("Could not queue live reply chunk for synthesis.".into()))
     }
-    let data = trimmed.trim_start_matches("data:").trim();
-    if data == "[DONE]" {
-      break;
+
+    loop {
+      line.clear();
+      if reader.read_line(&mut line)? == 0 {
+        break;
+      }
+      let trimmed = line.trim();
+      if !trimmed.starts_with("data:") {
+        flush_tts_results(
+          false,
+          queued_chunk_count,
+          &mut next_emit_index,
+          &mut pending_tts_results,
+          &mut emitted_chunk_texts,
+          &tts_result_rx,
+          request_id,
+          settings.tts_sample_rate,
+          emit_event,
+        )?;
+        continue;
+      }
+      let data = trimmed.trim_start_matches("data:").trim();
+      if data == "[DONE]" {
+        break;
+      }
+      let value: Value = match serde_json::from_str(data) {
+        Ok(value) => value,
+        Err(_) => {
+          flush_tts_results(
+            false,
+            queued_chunk_count,
+            &mut next_emit_index,
+            &mut pending_tts_results,
+            &mut emitted_chunk_texts,
+            &tts_result_rx,
+            request_id,
+            settings.tts_sample_rate,
+            emit_event,
+          )?;
+          continue;
+        }
+      };
+      let delta = value
+        .get("choices")
+        .and_then(|v| v.as_array())
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("delta"))
+        .and_then(|delta| delta.get("content"))
+        .and_then(|content| content.as_str())
+        .unwrap_or("");
+      if delta.is_empty() {
+        flush_tts_results(
+          false,
+          queued_chunk_count,
+          &mut next_emit_index,
+          &mut pending_tts_results,
+          &mut emitted_chunk_texts,
+          &tts_result_rx,
+          request_id,
+          settings.tts_sample_rate,
+          emit_event,
+        )?;
+        continue;
+      }
+      accumulated.push_str(delta);
+      let visible_accumulated = sanitize_text(&strip_think_text(&accumulated));
+      while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, false) {
+        let cleaned = sanitize_text(&segment);
+        if cleaned.is_empty() {
+          continue;
+        }
+        queue_stream_segment(cleaned, &mut queued_chunk_count, &tts_request_tx, request_id, emit_event)?;
+      }
+      flush_tts_results(
+        false,
+        queued_chunk_count,
+        &mut next_emit_index,
+        &mut pending_tts_results,
+        &mut emitted_chunk_texts,
+        &tts_result_rx,
+        request_id,
+        settings.tts_sample_rate,
+        emit_event,
+      )?;
     }
-    let value: Value = match serde_json::from_str(data) {
-      Ok(value) => value,
-      Err(_) => continue,
-    };
-    let delta = value
-      .get("choices")
-      .and_then(|v| v.as_array())
-      .and_then(|choices| choices.first())
-      .and_then(|choice| choice.get("delta"))
-      .and_then(|delta| delta.get("content"))
-      .and_then(|content| content.as_str())
-      .unwrap_or("");
-    if delta.is_empty() {
-      continue;
-    }
-    accumulated.push_str(delta);
+
     let visible_accumulated = sanitize_text(&strip_think_text(&accumulated));
-    while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, false) {
+    while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, true) {
       let cleaned = sanitize_text(&segment);
       if cleaned.is_empty() {
         continue;
       }
-      let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &cleaned, reply_voice)?;
-      emit_event(NorthStarLiveReplyStreamEvent {
-        request_id: request_id.to_string(),
-        phase: "chunk".into(),
-        transcript_text: None,
-        reply_text: None,
-        reply_mode: Some("model_stream".into()),
-        text_chunk: Some(cleaned.clone()),
-        audio_base64: Some(STANDARD.encode(audio_bytes)),
-        sample_rate: Some(settings.tts_sample_rate),
-        chunk_index: Some(chunk_index),
-        message: None,
-      })?;
-      chunk_texts.push(cleaned);
-      chunk_index += 1;
+      queue_stream_segment(cleaned, &mut queued_chunk_count, &tts_request_tx, request_id, emit_event)?;
     }
-  }
 
-  let visible_accumulated = sanitize_text(&strip_think_text(&accumulated));
-  while let Some(segment) = next_streamable_segment(&visible_accumulated, &mut flushed_visible_prefix, true) {
-    let cleaned = sanitize_text(&segment);
-    if cleaned.is_empty() {
-      continue;
+    let reply_text = sanitize_text(&strip_think_text(&accumulated));
+    if reply_text.is_empty() {
+      drop(tts_request_tx);
+      while next_emit_index < queued_chunk_count {
+        flush_tts_results(
+          true,
+          queued_chunk_count,
+          &mut next_emit_index,
+          &mut pending_tts_results,
+          &mut emitted_chunk_texts,
+          &tts_result_rx,
+          request_id,
+          settings.tts_sample_rate,
+          emit_event,
+        )?;
+      }
+      let _ = tts_worker.join();
+
+      let fallback = fallback_call_reply(transcript_text);
+      let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &fallback, reply_voice)?;
+      emit_streamed_reply_audio(
+        request_id,
+        "fallback",
+        &fallback,
+        audio_bytes,
+        settings.tts_sample_rate,
+        0,
+        emit_event,
+      )?;
+      return Ok((fallback.clone(), "fallback".into(), vec![fallback]));
     }
-    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &cleaned, reply_voice)?;
-    emit_event(NorthStarLiveReplyStreamEvent {
-      request_id: request_id.to_string(),
-      phase: "chunk".into(),
-      transcript_text: None,
-      reply_text: None,
-      reply_mode: Some("model_stream".into()),
-      text_chunk: Some(cleaned.clone()),
-      audio_base64: Some(STANDARD.encode(audio_bytes)),
-      sample_rate: Some(settings.tts_sample_rate),
-      chunk_index: Some(chunk_index),
-      message: None,
-    })?;
-    chunk_texts.push(cleaned);
-    chunk_index += 1;
-  }
 
-  let reply_text = sanitize_text(&strip_think_text(&accumulated));
-  if reply_text.is_empty() {
-    let fallback = fallback_call_reply(transcript_text);
-    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &fallback, reply_voice)?;
-    emit_event(NorthStarLiveReplyStreamEvent {
-      request_id: request_id.to_string(),
-      phase: "chunk".into(),
-      transcript_text: None,
-      reply_text: None,
-      reply_mode: Some("fallback".into()),
-      text_chunk: Some(fallback.clone()),
-      audio_base64: Some(STANDARD.encode(audio_bytes)),
-      sample_rate: Some(settings.tts_sample_rate),
-      chunk_index: Some(chunk_index),
-      message: None,
-    })?;
-    return Ok((fallback.clone(), "fallback".into(), vec![fallback]));
-  }
-  if chunk_texts.is_empty() {
-    let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &reply_text, reply_voice)?;
-    emit_event(NorthStarLiveReplyStreamEvent {
-      request_id: request_id.to_string(),
-      phase: "chunk".into(),
-      transcript_text: None,
-      reply_text: None,
-      reply_mode: Some("model_stream".into()),
-      text_chunk: Some(reply_text.clone()),
-      audio_base64: Some(STANDARD.encode(audio_bytes)),
-      sample_rate: Some(settings.tts_sample_rate),
-      chunk_index: Some(chunk_index),
-      message: None,
-    })?;
-    chunk_texts.push(reply_text.clone());
-  }
-  Ok((reply_text, "model_stream".into(), chunk_texts))
+    if queued_chunk_count == 0 {
+      queue_stream_segment(reply_text.clone(), &mut queued_chunk_count, &tts_request_tx, request_id, emit_event)?;
+    }
+
+    drop(tts_request_tx);
+    while next_emit_index < queued_chunk_count {
+      flush_tts_results(
+        true,
+        queued_chunk_count,
+        &mut next_emit_index,
+        &mut pending_tts_results,
+        &mut emitted_chunk_texts,
+        &tts_result_rx,
+        request_id,
+        settings.tts_sample_rate,
+        emit_event,
+      )?;
+    }
+    let _ = tts_worker.join();
+
+    Ok((reply_text, "model_stream".into(), emitted_chunk_texts))
+  })
 }
 
 fn next_streamable_segment(
@@ -1647,13 +1856,13 @@ fn next_streamable_segment(
     if ch.is_whitespace() {
       last_space = Some(index + ch.len_utf8());
     }
-    if matches!(ch, '.' | '!' | '?' | '\n' | ',' | ';' | ':') {
+    if matches!(ch, '.' | '!' | '?' | '\n') {
       boundary = Some(index + ch.len_utf8());
     }
   }
   let cut = if let Some(boundary) = boundary {
     Some(boundary)
-  } else if pending.len() > 48 {
+  } else if pending.len() > 160 {
     last_space
   } else if force_flush {
     Some(pending.len())
@@ -1777,6 +1986,17 @@ fn fallback_call_reply(transcript_text: &str) -> String {
     DEFAULT_CALL_REPLY_PLAYFUL.to_string()
   } else if ["was really nice", "good morning", "that was lovely"].iter().any(|needle| lowered.contains(needle)) {
     DEFAULT_CALL_REPLY_POSITIVE.to_string()
+  } else if lowered.contains('?')
+    || lowered.starts_with("can ")
+    || lowered.starts_with("could ")
+    || lowered.starts_with("would ")
+    || lowered.starts_with("what ")
+    || lowered.starts_with("why ")
+    || lowered.starts_with("how ")
+    || lowered.contains("recommend")
+    || lowered.contains("tell me")
+  {
+    DEFAULT_CALL_REPLY_MODEL_ISSUE.to_string()
   } else {
     DEFAULT_CALL_REPLY.to_string()
   }

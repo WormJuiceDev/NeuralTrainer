@@ -203,7 +203,7 @@ const LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
 const LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
 const MOBILE_OUTBOUND_CALL_NOTE = "North Star is calling from your phone.";
 const LIVE_CALL_OPENING_TEXT = "Hi, you wanted to talk?";
-const NORTHSTAR_MOBILE_VERSION = "v48";
+const NORTHSTAR_MOBILE_VERSION = "v50";
 const MIN_SETUP_TONE_MS = 1500;
 const LIVE_TURN_DATA_CHANNEL_MAX_BASE64 = 180_000;
 
@@ -778,6 +778,9 @@ function App() {
   const liveRemoteAudioRef = useRef<HTMLAudioElement | null>(null);
   const liveRemoteStreamRef = useRef<MediaStream | null>(null);
   const liveRemotePlaybackTimerRef = useRef<number | null>(null);
+  const liveRemoteAudioContextRef = useRef<AudioContext | null>(null);
+  const liveRemoteAudioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const liveRemoteAudioGainRef = useRef<GainNode | null>(null);
   const livePeerInputStreamRef = useRef<MediaStream | null>(null);
   const liveInputMeterAudioContextRef = useRef<AudioContext | null>(null);
   const liveInputMeterSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -811,6 +814,40 @@ function App() {
     liveInputMeterSinkRef.current = null;
     liveInputMeterAudioContextRef.current = null;
     setLiveInputMeter(defaultLiveInputMeter);
+  }
+
+  function teardownLiveRemoteAudioBoost() {
+    liveRemoteAudioSourceRef.current?.disconnect();
+    liveRemoteAudioGainRef.current?.disconnect();
+    liveRemoteAudioContextRef.current?.close().catch(() => undefined);
+    liveRemoteAudioSourceRef.current = null;
+    liveRemoteAudioGainRef.current = null;
+    liveRemoteAudioContextRef.current = null;
+  }
+
+  async function ensureLiveRemoteAudioBoost() {
+    const audio = liveRemoteAudioRef.current;
+    if (!audio) {
+      return;
+    }
+    audio.volume = 1;
+    let context = liveRemoteAudioContextRef.current;
+    if (!context) {
+      context = new AudioContext();
+      const source = context.createMediaElementSource(audio);
+      const gain = context.createGain();
+      gain.gain.value = 2.3;
+      source.connect(gain);
+      gain.connect(context.destination);
+      liveRemoteAudioContextRef.current = context;
+      liveRemoteAudioSourceRef.current = source;
+      liveRemoteAudioGainRef.current = gain;
+    } else if (liveRemoteAudioGainRef.current) {
+      liveRemoteAudioGainRef.current.gain.value = 2.3;
+    }
+    if (context.state === "suspended") {
+      await context.resume().catch(() => undefined);
+    }
   }
 
   function startLiveInputMeter(stream: MediaStream) {
@@ -1264,6 +1301,7 @@ function App() {
     if (liveRemoteAudioRef.current) {
       liveRemoteAudioRef.current.srcObject = null;
     }
+    teardownLiveRemoteAudioBoost();
     livePeerInputStreamRef.current?.getTracks().forEach((track) => track.stop());
     teardownLiveInputMeter();
     liveDataChannelRef.current = null;
@@ -1555,6 +1593,11 @@ function App() {
                 message?: string;
               }
             | {
+                type: "live_reply_remote_audio_started";
+                requestId: string;
+                textChunk?: string;
+              }
+            | {
                 type: "live_reply_stream_chunk";
                 requestId: string;
                 chunkIndex: number;
@@ -1612,6 +1655,12 @@ function App() {
             setLiveConversationPhase("assistant_speaking");
             setMessage("NeuralTrainer is answering.");
             queueLiveStreamReplyChunkPart(requestId, chunkIndex, partIndex, totalParts, audioSlice);
+            return;
+          }
+          if (payload.type === "live_reply_remote_audio_started") {
+            setCallLoopState("speaking");
+            setLiveConversationPhase("assistant_speaking");
+            setMessage("NeuralTrainer is answering.");
             return;
           }
           if (payload.type === "live_reply_stream_complete") {
@@ -1883,7 +1932,9 @@ function App() {
       });
       if (liveRemoteAudioRef.current) {
         liveRemoteAudioRef.current.srcObject = stream;
-        void liveRemoteAudioRef.current.play().catch(() => undefined);
+        void ensureLiveRemoteAudioBoost().then(() => {
+          void liveRemoteAudioRef.current?.play().catch(() => undefined);
+        });
       }
     };
   }
@@ -3249,7 +3300,9 @@ function App() {
       return;
     }
     liveRemoteAudioRef.current.srcObject = liveRemoteStreamRef.current;
-    void liveRemoteAudioRef.current.play().catch(() => undefined);
+    void ensureLiveRemoteAudioBoost().then(() => {
+      void liveRemoteAudioRef.current?.play().catch(() => undefined);
+    });
   }, [activeAcceptedCall?.call_id]);
 
   const chatsView = (

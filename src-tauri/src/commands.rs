@@ -1,6 +1,6 @@
 use base64::Engine as _;
 use serde_json::json;
-use tauri::{async_runtime, AppHandle, Emitter, State};
+use tauri::{async_runtime, ipc::Channel, AppHandle, Emitter, State};
 
 use crate::{
   db,
@@ -350,10 +350,10 @@ fn stream_north_star_live_turn_impl(
 }
 
 fn complete_north_star_live_speech_stream_impl(
-  app: AppHandle,
   state: &AppState,
   session_id: i64,
   request_id: String,
+  handler: &Channel<NorthStarLiveReplyStreamEvent>,
 ) -> Result<(), AppError> {
   let settings = db::load_settings(&state.db_path)?;
   let session_snapshot = db::call_session_snapshot(&state.db_path, Some(session_id))?;
@@ -384,8 +384,9 @@ fn complete_north_star_live_speech_stream_impl(
     &session_context,
     &request_id,
     |event: NorthStarLiveReplyStreamEvent| {
-      app.emit("north-star-live-reply-stream", &event)
-        .map_err(|caught| AppError::Message(format!("Could not emit North Star live reply event: {caught}")))?;
+      handler
+        .send(event)
+        .map_err(|caught| AppError::Message(format!("Could not send North Star live reply event over channel: {caught}")))?;
       Ok(())
     },
   )?;
@@ -424,8 +425,11 @@ pub async fn start_north_star_live_turn_stream(
           reply_mode: None,
           text_chunk: None,
           audio_base64: None,
+          audio_slice: None,
           sample_rate: None,
           chunk_index: None,
+          part_index: None,
+          total_parts: None,
           message: Some(error.to_string()),
         },
       );
@@ -439,36 +443,33 @@ pub async fn start_north_star_live_turn_stream(
 
 #[tauri::command]
 pub async fn complete_north_star_live_speech_stream(
-  app: AppHandle,
   state: State<'_, AppState>,
   session_id: i64,
   request_id: String,
+  handler: Channel<NorthStarLiveReplyStreamEvent>,
 ) -> Result<(), AppError> {
   let state = state.inner().clone();
   async_runtime::spawn_blocking(move || {
-    let result = complete_north_star_live_speech_stream_impl(app.clone(), &state, session_id, request_id.clone());
+    let result = complete_north_star_live_speech_stream_impl(&state, session_id, request_id.clone(), &handler);
     if let Err(error) = result {
-      let _ = app.emit(
-        "north-star-live-reply-stream",
-        &NorthStarLiveReplyStreamEvent {
-          request_id,
-          phase: "error".into(),
-          transcript_text: None,
-          reply_text: None,
-          reply_mode: None,
-          text_chunk: None,
-          audio_base64: None,
-          sample_rate: None,
-          chunk_index: None,
-          message: Some(error.to_string()),
-        },
-      );
-      return Err(error);
+      let _ = handler.send(NorthStarLiveReplyStreamEvent {
+        request_id,
+        phase: "error".into(),
+        transcript_text: None,
+        reply_text: None,
+        reply_mode: None,
+        text_chunk: None,
+        audio_base64: None,
+        audio_slice: None,
+        sample_rate: None,
+        chunk_index: None,
+        part_index: None,
+        total_parts: None,
+        message: Some(error.to_string()),
+      });
     }
-    Ok(())
-  })
-    .await
-    .map_err(|caught| AppError::Message(format!("North Star live speech completion task failed: {caught}")))?
+  });
+  Ok(())
 }
 
 #[tauri::command]

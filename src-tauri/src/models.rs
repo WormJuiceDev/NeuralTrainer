@@ -823,8 +823,11 @@ pub struct NorthStarLiveReplyStreamEvent {
   pub reply_mode: Option<String>,
   pub text_chunk: Option<String>,
   pub audio_base64: Option<String>,
+  pub audio_slice: Option<String>,
   pub sample_rate: Option<i64>,
   pub chunk_index: Option<usize>,
+  pub part_index: Option<usize>,
+  pub total_parts: Option<usize>,
   pub message: Option<String>,
 }
 

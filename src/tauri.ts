@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AppSettings,
@@ -98,16 +98,27 @@ export type NorthStarLiveReplyStreamEvent = {
   replyMode?: string | null;
   textChunk?: string | null;
   audioBase64?: string | null;
+  audioSlice?: string | null;
   sampleRate?: number | null;
   chunkIndex?: number | null;
+  partIndex?: number | null;
+  totalParts?: number | null;
   message?: string | null;
 };
 
 export const startNorthStarLiveTurnStream = (sessionId: number, audioBase64: string, requestId: string) =>
   invoke<void>("start_north_star_live_turn_stream", { sessionId, audioBase64, requestId });
 
-export const completeNorthStarLiveSpeechStream = (sessionId: number, requestId: string) =>
-  invoke<void>("complete_north_star_live_speech_stream", { sessionId, requestId });
+export const completeNorthStarLiveSpeechStream = (
+  sessionId: number,
+  requestId: string,
+  handler: (payload: NorthStarLiveReplyStreamEvent) => void,
+) =>
+  invoke<void>("complete_north_star_live_speech_stream", {
+    sessionId,
+    requestId,
+    handler: new Channel<NorthStarLiveReplyStreamEvent>(handler),
+  });
 
 export const listenNorthStarLiveReplyStream = (
   handler: (payload: NorthStarLiveReplyStreamEvent) => void,
