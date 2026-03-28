@@ -1,4 +1,4 @@
-import { FormEvent, startTransition, useEffect, useRef, useState } from "react";
+import { FormEvent, memo, startTransition, useEffect, useRef, useState } from "react";
 import {
   bindNorthStarDesktop,
   createPlace,
@@ -586,6 +586,116 @@ function describeMemoryBehavior(item: MemoryItem) {
   return "It is part of the current memory model and may change as more evidence arrives.";
 }
 
+const ConversationTurnsPanel = memo(function ConversationTurnsPanel({
+  turns,
+  liveReplyPreviewText,
+}: {
+  turns: CallTurnRecord[];
+  liveReplyPreviewText: string;
+}) {
+  if (!turns.length && !liveReplyPreviewText) {
+    return null;
+  }
+  return (
+    <div className="saved-state">
+      <h3>Conversation so far</h3>
+      <ul>
+        {turns.map((turn) => (
+          <li key={turn.id}>
+            <strong>{formatDateTime(turn.createdAt)}</strong>
+            <code>You said: {turn.transcriptText}</code>
+            <code>North Star answered: {turn.replyText}</code>
+          </li>
+        ))}
+        {liveReplyPreviewText ? (
+          <li key="live-reply-preview">
+            <strong>Now</strong>
+            <code>North Star answering: {liveReplyPreviewText}</code>
+          </li>
+        ) : null}
+      </ul>
+    </div>
+  );
+});
+
+const CallHistoryPanel = memo(function CallHistoryPanel({
+  sessions,
+}: {
+  sessions: CallSessionSnapshot["recentSessions"];
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-header"><h2>Call history</h2><p>Recent sessions with outcomes, timing, and call-derived notes.</p></div>
+      <div className="saved-state">
+        <ul>
+          {sessions.length ? sessions.map((session) => (
+            <li key={session.id}>
+              <strong>{session.handoffKind} / {session.outcome}</strong>
+              <code>session {session.id} / {session.sessionState}</code>
+              <code>{session.durationSeconds > 0 ? formatDuration(session.durationSeconds) : "not timed yet"}</code>
+              {session.transcriptSummary ? <code>{session.transcriptSummary}</code> : null}
+            </li>
+          )) : <li>No call sessions yet.</li>}
+        </ul>
+      </div>
+    </section>
+  );
+});
+
+const SavedMomentsPanel = memo(function SavedMomentsPanel({
+  savedMoments,
+  selectedSavedMomentId,
+  onSelect,
+}: {
+  savedMoments: PhaseThreeSnapshot["savedMoments"];
+  selectedSavedMomentId: number | null;
+  onSelect: (id: number) => void;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-header"><h2>Saved moments</h2><p>Phase 3 memory candidates with evidence attached.</p></div>
+      <div className="saved-state">
+        <ul>
+          {savedMoments.length ? savedMoments.map((moment) => (
+            <li key={moment.id}>
+              <button
+                type="button"
+                className={`memory-item-button ${selectedSavedMomentId === moment.id ? "active" : ""}`}
+                onClick={() => onSelect(moment.id)}
+              >
+                <strong>{moment.momentKind}</strong>
+                <code>confidence {moment.confidence.toFixed(2)} / {moment.inferredSignificance}</code>
+              </button>
+            </li>
+          )) : <li>No saved moments yet.</li>}
+        </ul>
+      </div>
+    </section>
+  );
+});
+
+const SelectedMomentPanel = memo(function SelectedMomentPanel({
+  selectedSavedMoment,
+}: {
+  selectedSavedMoment: PhaseThreeSnapshot["savedMoments"][number] | null;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-header"><h2>Selected moment</h2><p>Observed evidence and why the system thought this moment might matter.</p></div>
+      {selectedSavedMoment ? (
+        <div className="saved-state">
+          <h3>{selectedSavedMoment.momentKind}</h3>
+          <p className="memory-detail-lead">{selectedSavedMoment.inferredSignificance}</p>
+          <code>confidence {selectedSavedMoment.confidence.toFixed(2)} / action {selectedSavedMoment.actionTaken}</code>
+          <code>{selectedSavedMoment.observedContextJson}</code>
+        </div>
+      ) : (
+        <p>No saved moment selected yet.</p>
+      )}
+    </section>
+  );
+});
+
 function App() {
   const [activeTab, setActiveTab] = useState<TabId>("settings");
   const [settings, setSettings] = useState<AppSettings>(defaultSettings);
@@ -886,7 +996,6 @@ const northStarAwaitingConversationStart =
         const nextPreview = `${currentPreview} ${textChunk}`.trim();
         northStarLiveReplyPreviewTextRef.current.set(requestId, nextPreview);
         startTransition(() => {
-          setCallTranscriptSummary(nextPreview);
           setNorthStarLiveReplyPreviewText(nextPreview);
         });
         updateNorthStarLiveDiagnostics({
@@ -4162,65 +4271,24 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     {callReplyAudioSrc ? <audio className="voice-player" controls src={callReplyAudioSrc} /> : null}
                   </div>
                 ) : null}
-                {callSessionSnapshot.activeSessionTurns.length ? (
-                  <div className="saved-state">
-                    <h3>Conversation so far</h3>
-                    <ul>
-                      {callSessionSnapshot.activeSessionTurns.map((turn) => (
-                        <li key={turn.id}>
-                          <strong>{formatDateTime(turn.createdAt)}</strong>
-                          <code>You said: {turn.transcriptText}</code>
-                          <code>North Star answered: {turn.replyText}</code>
-                        </li>
-                      ))}
-                      {northStarLiveReplyPreviewText ? (
-                        <li key="live-reply-preview">
-                          <strong>Now</strong>
-                          <code>North Star answering: {northStarLiveReplyPreviewText}</code>
-                        </li>
-                      ) : null}
-                    </ul>
-                  </div>
-                ) : null}
+                <ConversationTurnsPanel
+                  turns={callSessionSnapshot.activeSessionTurns}
+                  liveReplyPreviewText={northStarLiveReplyPreviewText}
+                />
               </div>
             ) : null}
           </section>
 
-          <section className="panel">
-            <div className="panel-header"><h2>Call history</h2><p>Recent sessions with outcomes, timing, and call-derived notes.</p></div>
-            <div className="saved-state">
-              <ul>
-                {callSessionSnapshot?.recentSessions.length ? callSessionSnapshot.recentSessions.map((session) => (
-                  <li key={session.id}>
-                    <strong>{session.handoffKind} / {session.outcome}</strong>
-                    <code>session {session.id} / {session.sessionState}</code>
-                    <code>{session.durationSeconds > 0 ? formatDuration(session.durationSeconds) : "not timed yet"}</code>
-                    {session.transcriptSummary ? <code>{session.transcriptSummary}</code> : null}
-                  </li>
-                )) : <li>No call sessions yet.</li>}
-              </ul>
-            </div>
-          </section>
+          <CallHistoryPanel sessions={callSessionSnapshot?.recentSessions ?? []} />
         </div>
 
         <div className="grid two-up">
-          <section className="panel">
-            <div className="panel-header"><h2>Saved moments</h2><p>Phase 3 memory candidates with evidence attached.</p></div>
-            <div className="saved-state"><ul>{phaseThreeSnapshot?.savedMoments.length ? phaseThreeSnapshot.savedMoments.map((moment) => <li key={moment.id}><button type="button" className={`memory-item-button ${selectedSavedMoment?.id === moment.id ? "active" : ""}`} onClick={() => setSelectedSavedMomentId(moment.id)}><strong>{moment.momentKind}</strong><code>confidence {moment.confidence.toFixed(2)} / {moment.inferredSignificance}</code></button></li>) : <li>No saved moments yet.</li>}</ul></div>
-          </section>
-          <section className="panel">
-            <div className="panel-header"><h2>Selected moment</h2><p>Observed evidence and why the system thought this moment might matter.</p></div>
-            {selectedSavedMoment ? (
-              <div className="saved-state">
-                <h3>{selectedSavedMoment.momentKind}</h3>
-                <p className="memory-detail-lead">{selectedSavedMoment.inferredSignificance}</p>
-                <code>confidence {selectedSavedMoment.confidence.toFixed(2)} / action {selectedSavedMoment.actionTaken}</code>
-                <code>{selectedSavedMoment.observedContextJson}</code>
-              </div>
-            ) : (
-              <p>No saved moment selected yet.</p>
-            )}
-          </section>
+          <SavedMomentsPanel
+            savedMoments={phaseThreeSnapshot?.savedMoments ?? []}
+            selectedSavedMomentId={selectedSavedMoment?.id ?? null}
+            onSelect={setSelectedSavedMomentId}
+          />
+          <SelectedMomentPanel selectedSavedMoment={selectedSavedMoment} />
         </div>
         </>
         ) : null}

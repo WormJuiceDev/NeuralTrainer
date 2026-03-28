@@ -429,21 +429,24 @@ pub fn stop_speech_stream_and_reply(
   session_id: i64,
   session_context: &str,
 ) -> Result<CallTurnResult, AppError> {
-  let mut guard = speech_worker_slot
-    .lock()
-    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
-  let worker = guard
-    .as_mut()
-    .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
-  send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
-  wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
-    snapshot.status == "stopped" || snapshot.last_error.is_some()
-  })?;
-  let snapshot = worker
-    .snapshot
-    .lock()
-    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
-    .clone();
+  let snapshot = {
+    let mut guard = speech_worker_slot
+      .lock()
+      .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+    let worker = guard
+      .as_mut()
+      .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
+    send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
+    wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
+      snapshot.status == "stopped" || snapshot.last_error.is_some()
+    })?;
+    let snapshot = worker
+      .snapshot
+      .lock()
+      .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+      .clone();
+    snapshot
+  };
   if let Some(error) = snapshot.last_error.clone() {
     return Err(AppError::Message(error));
   }
@@ -480,21 +483,24 @@ pub fn stop_speech_stream_and_stream_reply<F>(
 where
   F: FnMut(NorthStarLiveReplyStreamEvent) -> Result<(), AppError>,
 {
-  let mut guard = speech_worker_slot
-    .lock()
-    .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
-  let worker = guard
-    .as_mut()
-    .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
-  send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
-  wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
-    snapshot.status == "stopped" || snapshot.last_error.is_some()
-  })?;
-  let snapshot = worker
-    .snapshot
-    .lock()
-    .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
-    .clone();
+  let snapshot = {
+    let mut guard = speech_worker_slot
+      .lock()
+      .map_err(|_| AppError::Message("Speech worker mutex was poisoned.".into()))?;
+    let worker = guard
+      .as_mut()
+      .ok_or_else(|| AppError::Message("Speech stream worker is not running.".into()))?;
+    send_speech_worker_command(worker, &json!({ "command": "stop" }))?;
+    wait_for_speech_stream_state(&worker.snapshot, Duration::from_secs(3), |snapshot| {
+      snapshot.status == "stopped" || snapshot.last_error.is_some()
+    })?;
+    let snapshot = worker
+      .snapshot
+      .lock()
+      .map_err(|_| AppError::Message("Speech stream snapshot mutex was poisoned.".into()))?
+      .clone();
+    snapshot
+  };
   if let Some(error) = snapshot.last_error.clone() {
     return Err(AppError::Message(error));
   }
