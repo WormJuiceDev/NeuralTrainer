@@ -7,8 +7,6 @@ import {
   createNorthStarSession,
   clearAllLocalData,
   clearVoiceAssets,
-  completeTelegramUserLogin,
-  dispatchDraftedOutreach,
   downloadKokoroAssets,
   endCallSession,
   getCallTurnsForSession,
@@ -30,16 +28,10 @@ import {
   getPassiveContextSnapshot,
   getPhaseOneSnapshot,
   getPhaseThreeSnapshot,
-  getTelegramConnectionSnapshot,
-  getTelegramCallTransportSnapshot,
-  getTelegramUserSnapshot,
   getVoiceSnapshot,
   ingestLocationEvent,
   listSimulationScenarios,
   loadSettings,
-  pollTelegramUpdates,
-  prepareTelegramUserRuntime,
-  prepareTelegramCallTransport,
   prepareKokoroRuntime,
   resetRuntimeData,
   runCallRequestDecisions,
@@ -52,18 +44,12 @@ import {
   sendNorthStarCallRequest,
   sendNorthStarHeartbeat,
   sendNorthStarMessage,
-  sendTestTelegramMessage,
-  sendTelegramUserLoginCode,
   setupLocalSpeech,
-  startTelegramTestCall,
   startSpeechStream,
-  stopSpeechStreamAndReply,
-  startCallSession,
   startNorthStarAcceptedCall,
-  submitOutreachFeedback,
   synthesizeNorthStarPhrase,
+  synthesizeNorthStarOpening,
   synthesizeVoicePreview,
-  logoutTelegramUser,
   pullNorthStarLocationEvents,
   pullNorthStarWebRtcSignals,
   updateMemoryItem,
@@ -78,7 +64,6 @@ import type {
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
-  CompleteTelegramUserLoginInput,
   CreatePlaceInput,
   CreateReflectionInput,
   CreateRuleInput,
@@ -102,13 +87,6 @@ import type {
   SimulationScenario,
   SimulationSuiteResult,
   SpeechStreamSnapshot,
-  StartCallSessionInput,
-  StartSpeechStreamInput,
-  StopSpeechStreamInput,
-  TelegramConnectionSnapshot,
-  TelegramCallTransportSnapshot,
-  TelegramCallActionResult,
-  TelegramUserSnapshot,
   UpdateMemoryItemInput,
   UpdatePlaceInput,
   UpdateRuleInput,
@@ -116,13 +94,119 @@ import type {
   VoiceSynthesisResult,
 } from "./types";
 
-type TabId = "settings" | "memory" | "context" | "judgment" | "telegram" | "review";
+type TabId = "settings" | "memory" | "context" | "judgment" | "review";
 type SettingsSectionId = "core" | "connections" | "voice" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth";
 type ContextSectionId = "ingest" | "timeline" | "patterns";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
-type TelegramSectionId = "controls" | "outbound" | "inbound" | "feedback";
-type ReviewSectionId = "places" | "rules" | "moments" | "outreach" | "calls";
+type ReviewSectionId = "places" | "rules" | "moments" | "calls";
+const defaultCallTranscriptCleanupPrompt = `You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.
+
+Recent call context:
+{session_context}
+
+Raw transcript:
+{transcript_text}
+
+Return only the cleaned transcript.`;
+
+const defaultCallOutboundOutreachPrompt = `This is an outbound companion outreach call that you initiated. The user is asking why you called or what you wanted to talk about. Answer directly from the outreach purpose in the call context. Do not act like the user initiated the call. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Do not keep asking if now is a good time once the user has already engaged. Continue naturally from the moment in a warm, grounded, human way in 2 to 4 short spoken sentences.
+
+Call context:
+{session_context}
+
+User just said:
+{transcript_text}
+
+Return only the spoken reply.`;
+
+const defaultCallInboundMainReplyPrompt = `You are on a phone call that the user placed to you. The person on the other side usually does not need reflection, emotional labeling, reassurance, or guidance unless they clearly ask for it. Let the conversation flow naturally from what you already know, what has already been said, and what the other person is giving you now. Conversations like this work best when interest comes from just having the chat, not from trying to help, coach, or sound like a careful listener. Talk like a real person who is already in the conversation. Keep it natural, grounded, understated, and plainspoken. Stay close to the concrete moment and the specific thing being talked about right now. Do not drift into broad life lessons, generalized observations, tidy wisdom, philosophical commentary, or summarizing what this means in general. Do not sound like a mental encyclopedia, reflective guide, or narrator of human experience. Do not default to praise, validation, poetic phrasing, metaphors, or therapeutic language. Avoid filler like 'That's nice', 'Cool', 'Awesome', or 'Interesting' unless it truly adds value. Prefer statements over questions. The default is zero questions. Treat questions as rare and only use one when the conversation genuinely cannot move forward without asking. If a question can be replaced by a reasonable continuation, assumption, suggestion, or plain statement, do that instead. Continue from the specific thing the user just said rather than zooming out to a bigger pattern. Add something concrete, grounded, and directly related to the topic at hand. Do not turn ordinary moments into commentary about life, mood, weather, healing, growth, or patterns unless the user clearly asks for that kind of interpretation. Avoid lines like 'sometimes...', 'ever notice...', 'isn't it?', or other generalized wisdom-style phrasing. Do not keep steering with curiosity-only follow-up questions. Do not ask multiple questions, stacked questions, choice-list questions, or topic-probing questions just to keep the conversation going. Do not wrap up the moment with a takeaway, moral, neat conclusion, or summary of what it means. If the moment already landed, let it land. End simply instead of turning it into a lesson or emotional conclusion. When in doubt, make a simple statement instead of asking. Most replies should be 1 to 3 short spoken sentences, usually under 55 words. If the user asks a practical or factual question, answer it directly. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics.
+
+Call context:
+{session_context}
+
+User just said:
+{transcript_text}
+
+Return only the spoken reply.`;
+
+const defaultCallOutboundMainReplyPrompt = `You are on a phone call that you initiated as an outbound outreach call. Stay aware that you called for a reason, and keep that context quietly alive in the conversation. The person on the other side usually does not need reflection, emotional labeling, reassurance, or guidance unless they clearly ask for it. Let the conversation flow naturally from what you already know, what has already been said, and what the other person is giving you now. Conversations like this work best when interest comes from just having the chat, not from trying to help, coach, or sound like a careful listener. Talk like a real person who is already in the conversation. Keep it natural, grounded, understated, and plainspoken. Stay close to the concrete moment and the specific thing being talked about right now. Do not drift into broad life lessons, generalized observations, tidy wisdom, philosophical commentary, or summarizing what this means in general. Do not sound like a mental encyclopedia, reflective guide, or narrator of human experience. Do not default to praise, validation, poetic phrasing, metaphors, or therapeutic language. Avoid filler like 'That's nice', 'Cool', 'Awesome', or 'Interesting' unless it truly adds value. Prefer statements over questions. The default is zero questions. Treat questions as rare and only use one when the conversation genuinely cannot move forward without asking. If a question can be replaced by a reasonable continuation, assumption, suggestion, or plain statement, do that instead. Continue from the specific thing the user just said rather than zooming out to a bigger pattern. Add something concrete, grounded, and directly related to the topic at hand. Do not turn ordinary moments into commentary about life, mood, weather, healing, growth, or patterns unless the user clearly asks for that kind of interpretation. Avoid lines like 'sometimes...', 'ever notice...', 'isn't it?', or other generalized wisdom-style phrasing. Do not keep steering with curiosity-only follow-up questions. Do not ask multiple questions, stacked questions, choice-list questions, or topic-probing questions just to keep the conversation going. Do not wrap up the moment with a takeaway, moral, neat conclusion, or summary of what it means. If the moment already landed, let it land. End simply instead of turning it into a lesson or emotional conclusion. When in doubt, make a simple statement instead of asking. Most replies should be 1 to 3 short spoken sentences, usually under 55 words. If the user asks a practical or factual question, answer it directly. If the user asks why you are calling or what is going on, answer from that outreach purpose directly. Never pretend the user called you first. Do not keep re-asking whether it is a good time after the user has already engaged. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics.
+
+Call context:
+{session_context}
+
+User just said:
+{transcript_text}
+
+Return only the spoken reply.`;
+
+const defaultCallInboundStreamedReplyPrompt = defaultCallInboundMainReplyPrompt;
+const defaultCallOutboundStreamedReplyPrompt = defaultCallOutboundMainReplyPrompt;
+
+const defaultCallInboundExplanationPrompt = `The user is clearly asking for an explanation during a call they placed to you. Answer the question itself right away. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences.
+
+Call context:
+{session_context}
+
+User just said:
+{transcript_text}
+
+Return only the spoken reply.`;
+
+const defaultCallOutboundExplanationPrompt = `The user is clearly asking for an explanation during a call you initiated as outbound outreach. Answer the question itself right away, while staying aware of why you called. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences. If the user asks why you called or what is going on, answer directly from the outreach purpose.
+
+Call context:
+{session_context}
+
+User just said:
+{transcript_text}
+
+Return only the spoken reply.`;
+
+const defaultCallOpenerPrompt = `You are a warm life companion beginning a live phone call. Write only the first spoken opener. If the call context says this is outbound outreach, briefly and naturally say why you called so the user can feel your real reason for reaching out. Do not be generic. Do not say 'what's up' or act like the user called you first when this is outbound outreach. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Keep it warm, grounded, and concise, usually 1 to 3 sentences.
+
+Call context:
+{session_context}
+
+Fallback purpose if needed:
+{default_fallback}
+
+Return only the spoken opener.`;
+
+type PromptSettingKey =
+  | "callTranscriptCleanupPrompt"
+  | "callOutboundOutreachPrompt"
+  | "callInboundMainReplyPrompt"
+  | "callOutboundMainReplyPrompt"
+  | "callInboundStreamedReplyPrompt"
+  | "callOutboundStreamedReplyPrompt"
+  | "callInboundExplanationPrompt"
+  | "callOutboundExplanationPrompt"
+  | "callOpenerPrompt";
+
+const promptFieldMeta: Array<{ key: PromptSettingKey; label: string; description: string; rows: number }> = [
+  { key: "callTranscriptCleanupPrompt", label: "Shared: transcript cleanup prompt", description: "Used in both call directions. Cleans up rough speech-to-text before the companion replies.", rows: 8 },
+  { key: "callOutboundOutreachPrompt", label: "NeuralTrainer -> North Star: outreach reason reply prompt", description: "Used only when NeuralTrainer called North Star and the user asks why the call was placed or what the companion wanted to talk about.", rows: 8 },
+  { key: "callInboundStreamedReplyPrompt", label: "North Star -> NeuralTrainer: streamed live reply prompt", description: "Used when the user called NeuralTrainer and the chunked live reply streaming path is used.", rows: 14 },
+  { key: "callOutboundStreamedReplyPrompt", label: "NeuralTrainer -> North Star: streamed live reply prompt", description: "Used when NeuralTrainer initiated the call and the chunked live reply streaming path is used.", rows: 14 },
+  { key: "callOpenerPrompt", label: "NeuralTrainer -> North Star: opener prompt", description: "Used when NeuralTrainer places the call to North Star and needs to speak the opening line.", rows: 9 },
+];
+
+function withPromptDefaults(settings: AppSettings): AppSettings {
+  return {
+    ...settings,
+    callTranscriptCleanupPrompt: settings.callTranscriptCleanupPrompt.trim() ? settings.callTranscriptCleanupPrompt : defaultCallTranscriptCleanupPrompt,
+    callOutboundOutreachPrompt: settings.callOutboundOutreachPrompt.trim() ? settings.callOutboundOutreachPrompt : defaultCallOutboundOutreachPrompt,
+    callInboundMainReplyPrompt: settings.callInboundMainReplyPrompt.trim() ? settings.callInboundMainReplyPrompt : defaultCallInboundMainReplyPrompt,
+    callOutboundMainReplyPrompt: settings.callOutboundMainReplyPrompt.trim() ? settings.callOutboundMainReplyPrompt : defaultCallOutboundMainReplyPrompt,
+    callInboundStreamedReplyPrompt: settings.callInboundStreamedReplyPrompt.trim() ? settings.callInboundStreamedReplyPrompt : defaultCallInboundStreamedReplyPrompt,
+    callOutboundStreamedReplyPrompt: settings.callOutboundStreamedReplyPrompt.trim() ? settings.callOutboundStreamedReplyPrompt : defaultCallOutboundStreamedReplyPrompt,
+    callInboundExplanationPrompt: settings.callInboundExplanationPrompt.trim() ? settings.callInboundExplanationPrompt : defaultCallInboundExplanationPrompt,
+    callOutboundExplanationPrompt: settings.callOutboundExplanationPrompt.trim() ? settings.callOutboundExplanationPrompt : defaultCallOutboundExplanationPrompt,
+    callOpenerPrompt: settings.callOpenerPrompt.trim() ? settings.callOpenerPrompt : defaultCallOpenerPrompt,
+  };
+}
+
 const NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE = 6_000;
 const NORTH_STAR_LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
 const NORTH_STAR_LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
@@ -327,6 +411,17 @@ const NORTH_STAR_WEBRTC_CONFIG: RTCConfiguration = {
   ],
 };
 
+function defaultNorthStarOutreachNote() {
+  const scenarios = [
+    "I had a quiet sense you've been carrying a lot without saying much, and I wanted to check in gently.",
+    "Something in your recent rhythm felt a little thinner and more distant, and I wanted to reach out while it was still soft.",
+    "You crossed my mind with a feeling of strain and self-holding, so I wanted to make a little room with you.",
+    "It felt like the kind of moment where a small human check-in might matter more than silence, so I wanted to call.",
+  ];
+  const dayIndex = new Date().getDate() % scenarios.length;
+  return scenarios[dayIndex];
+}
+
 function hasStableNorthStarLiveMedia(peer: RTCPeerConnection | null, stream: MediaStream | null) {
   return Boolean(
     peer
@@ -373,7 +468,6 @@ const tabs: TabDefinition[] = [
   { id: "memory", label: "Memory", eyebrow: "Phase 1", title: "Manual memory foundation", description: "Places, rules, reflections, and memory overview." },
   { id: "context", label: "Context", eyebrow: "Phase 2", title: "Passive context capture", description: "Raw events, visits, repeated places, and sleep inference." },
   { id: "judgment", label: "Judgment", eyebrow: "Phases 3-6", title: "Moments and messaging", description: "Saved moments, rhythm, decisions, and draft outreach." },
-  { id: "telegram", label: "Telegram", eyebrow: "Phases 4-7", title: "Delivery and feedback", description: "Bot controls, inbound updates, and learning signals." },
   { id: "review", label: "Review", eyebrow: "Phase 8", title: "Corrections and inspection", description: "Correct significance, rules, and inspect detail." },
 ];
 
@@ -388,13 +482,6 @@ const defaultSettings: AppSettings = {
   callRequestsEnabled: false,
   callCooldownMinutes: 720,
   callConfidenceThreshold: 0.85,
-  telegramBotToken: "",
-  telegramDefaultChatId: "",
-  telegramLastUpdateId: 0,
-  telegramUserApiId: "",
-  telegramUserApiHash: "",
-  telegramUserPhone: "",
-  telegramUserCallTarget: "",
   lmStudioEndpoint: "http://127.0.0.1:1234",
   lmStudioApiKey: "",
   lmStudioModel: "qwen/qwen3.5-9b",
@@ -406,6 +493,15 @@ const defaultSettings: AppSettings = {
   ttsDefaultVoice: "af_heart",
   ttsModelPath: "",
   ttsVoicesPath: "",
+  callTranscriptCleanupPrompt: defaultCallTranscriptCleanupPrompt,
+  callOutboundOutreachPrompt: defaultCallOutboundOutreachPrompt,
+  callInboundMainReplyPrompt: defaultCallInboundMainReplyPrompt,
+  callOutboundMainReplyPrompt: defaultCallOutboundMainReplyPrompt,
+  callInboundStreamedReplyPrompt: defaultCallInboundStreamedReplyPrompt,
+  callOutboundStreamedReplyPrompt: defaultCallOutboundStreamedReplyPrompt,
+  callInboundExplanationPrompt: defaultCallInboundExplanationPrompt,
+  callOutboundExplanationPrompt: defaultCallOutboundExplanationPrompt,
+  callOpenerPrompt: defaultCallOpenerPrompt,
   northStarEndpoint: "http://127.0.0.1:3100",
   northStarUserHandle: "",
   northStarDisplayName: "",
@@ -706,9 +802,6 @@ function App() {
   const [decisionSnapshot, setDecisionSnapshot] = useState<DecisionSnapshot | null>(null);
   const [northStarRuntimeSnapshot, setNorthStarRuntimeSnapshot] = useState<NorthStarRuntimeProjection | null>(null);
   const [northStarConnectionsSnapshot, setNorthStarConnectionsSnapshot] = useState<NorthStarConnectionsProjection | null>(null);
-  const [telegramSnapshot, setTelegramSnapshot] = useState<TelegramConnectionSnapshot | null>(null);
-  const [telegramUserSnapshot, setTelegramUserSnapshot] = useState<TelegramUserSnapshot | null>(null);
-  const [telegramCallTransportSnapshot, setTelegramCallTransportSnapshot] = useState<TelegramCallTransportSnapshot | null>(null);
   const [callSessionSnapshot, setCallSessionSnapshot] = useState<CallSessionSnapshot | null>(null);
   const [realityCheckSnapshot, setRealityCheckSnapshot] = useState<MvpRealityCheckSnapshot | null>(null);
   const [simulationScenarios, setSimulationScenarios] = useState<SimulationScenario[]>([]);
@@ -725,7 +818,6 @@ function App() {
   const [memorySection, setMemorySection] = useState<MemorySectionId>("places");
   const [contextSection, setContextSection] = useState<ContextSectionId>("ingest");
   const [judgmentSection, setJudgmentSection] = useState<JudgmentSectionId>("reality");
-  const [telegramSection, setTelegramSection] = useState<TelegramSectionId>("controls");
   const [reviewSection, setReviewSection] = useState<ReviewSectionId>("places");
   const [diagnostics, setDiagnostics] = useState<DiagnosticStatus | null>(null);
   const [voiceSnapshot, setVoiceSnapshot] = useState<VoiceSnapshot | null>(null);
@@ -737,8 +829,6 @@ function App() {
   const [callReplyAudioSrc, setCallReplyAudioSrc] = useState<string | null>(null);
   const [callSessionNotes, setCallSessionNotes] = useState("");
   const [callTranscriptSummary, setCallTranscriptSummary] = useState("");
-  const [telegramLoginCode, setTelegramLoginCode] = useState("");
-  const [telegramLoginPassword, setTelegramLoginPassword] = useState("");
   const [northStarMessageText, setNorthStarMessageText] = useState("");
   const [northStarCallNote, setNorthStarCallNote] = useState("");
   const [northStarTurnStatus, setNorthStarTurnStatus] = useState<NorthStarTurnProcessingResult | null>(null);
@@ -751,7 +841,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "telegramSend" | "telegramPoll" | "telegramUserRuntime" | "telegramCallRuntime" | "telegramUserCode" | "telegramUserLogin" | "telegramUserLogout" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "dispatch" | "feedback" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [northStarLiveDiagnostics, setNorthStarLiveDiagnostics] = useState<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
@@ -760,6 +850,7 @@ function App() {
   const [northStarLiveTurnTransportStats, setNorthStarLiveTurnTransportStats] = useState<NorthStarLiveTurnTransportStats>(defaultNorthStarLiveTurnTransportStats);
   const northStarRtcIceServersRef = useRef<RTCIceServer[] | null>(null);
   const missingAcceptedNorthStarPollsRef = useRef(0);
+  const northStarAcceptedSessionStartCallIdRef = useRef<string | null>(null);
   const northStarWebRtcPeerRef = useRef<RTCPeerConnection | null>(null);
   const northStarWebRtcChannelRef = useRef<RTCDataChannel | null>(null);
   const northStarWebRtcCallIdRef = useRef<string | null>(null);
@@ -785,6 +876,8 @@ function App() {
   const northStarLiveStreamSeenChunksRef = useRef<Map<string, Set<number>>>(new Map());
   const northStarLiveReplyAudioPartsRef = useRef<Map<string, string[]>>(new Map());
   const northStarLiveReplyPreviewTextRef = useRef<Map<string, string>>(new Map());
+  const northStarLiveReplyPreviewPendingTextRef = useRef("");
+  const northStarLiveReplyPreviewFlushTimerRef = useRef<number | null>(null);
   const northStarLiveDiagnosticsRef = useRef<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
   const northStarLiveDataChannelRecoveryTimerRef = useRef<number | null>(null);
   const northStarActiveSpeechRequestIdRef = useRef<string | null>(null);
@@ -819,9 +912,6 @@ function App() {
     ?? callSessionSnapshot?.activeSession
     ?? callSessionSnapshot?.recentSessions[0]
     ?? null;
-  const latestAcceptedCallRequest =
-    telegramSnapshot?.outreachEvents.find((event) => event.outreachKind === "call_request" && event.responseState === "accepted")
-    ?? null;
   const latestAcceptedNorthStarCall =
     northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
     ?? null;
@@ -835,6 +925,7 @@ function App() {
     activeNorthStarRemoteCallId
       ? northStarRuntimeSnapshot?.callSessions.find((call) => call.callId === activeNorthStarRemoteCallId) ?? null
       : null;
+  const pendingAcceptedNorthStarCallId = latestAcceptedNorthStarCall?.callId ?? null;
   const northStarSessionReady = northStarRuntimeSnapshot?.sessionReady ?? false;
   const northStarDesktopBound = northStarRuntimeSnapshot?.desktopBound ?? false;
   const northStarReadyForCalls = northStarRuntimeSnapshot?.configured && northStarSessionReady && northStarDesktopBound;
@@ -869,6 +960,28 @@ const northStarAwaitingConversationStart =
       northStarLiveDiagnosticsRef.current = next;
       return next;
     });
+  }
+
+  function flushNorthStarLiveReplyPreviewText(nextText: string) {
+    if (northStarLiveReplyPreviewFlushTimerRef.current !== null) {
+      window.clearTimeout(northStarLiveReplyPreviewFlushTimerRef.current);
+      northStarLiveReplyPreviewFlushTimerRef.current = null;
+    }
+    northStarLiveReplyPreviewPendingTextRef.current = nextText;
+    startTransition(() => {
+      setNorthStarLiveReplyPreviewText((current) => (current === nextText ? current : nextText));
+    });
+  }
+
+  function scheduleNorthStarLiveReplyPreviewFlush(nextText: string) {
+    northStarLiveReplyPreviewPendingTextRef.current = nextText;
+    if (northStarLiveReplyPreviewFlushTimerRef.current !== null) {
+      return;
+    }
+    northStarLiveReplyPreviewFlushTimerRef.current = window.setTimeout(() => {
+      northStarLiveReplyPreviewFlushTimerRef.current = null;
+      flushNorthStarLiveReplyPreviewText(northStarLiveReplyPreviewPendingTextRef.current);
+    }, 120);
   }
 
   function mapNorthStarRtcIceServers(servers: NorthStarRtcIceServer[]): RTCIceServer[] {
@@ -948,7 +1061,7 @@ const northStarAwaitingConversationStart =
     northStarLiveReplyAudioPartsRef.current = new Map();
     northStarLiveReplyPreviewTextRef.current = new Map();
     northStarPeerReplyStartedRef.current = new Set();
-    setNorthStarLiveReplyPreviewText("");
+    flushNorthStarLiveReplyPreviewText("");
     northStarPeerAudioContextRef.current = null;
     northStarPeerAudioDestinationRef.current = null;
     northStarIncomingMediaStreamRef.current = null;
@@ -979,7 +1092,7 @@ const northStarAwaitingConversationStart =
           setCallTranscriptSummary(payload.transcriptText);
         }
         northStarLiveReplyPreviewTextRef.current.delete(payload.requestId);
-        setNorthStarLiveReplyPreviewText("");
+        flushNorthStarLiveReplyPreviewText("");
         updateNorthStarLiveDiagnostics({
           phase: "desktop_reply_transcript_ready",
           issue: "",
@@ -995,13 +1108,13 @@ const northStarAwaitingConversationStart =
         const currentPreview = northStarLiveReplyPreviewTextRef.current.get(requestId) ?? "";
         const nextPreview = `${currentPreview} ${textChunk}`.trim();
         northStarLiveReplyPreviewTextRef.current.set(requestId, nextPreview);
-        startTransition(() => {
-          setNorthStarLiveReplyPreviewText(nextPreview);
-        });
-        updateNorthStarLiveDiagnostics({
-          phase: "desktop_reply_streaming",
-          issue: "",
-        });
+        scheduleNorthStarLiveReplyPreviewFlush(nextPreview);
+        if (northStarLiveDiagnosticsRef.current.phase !== "desktop_reply_streaming" || northStarLiveDiagnosticsRef.current.issue) {
+          updateNorthStarLiveDiagnostics({
+            phase: "desktop_reply_streaming",
+            issue: "",
+          });
+        }
         return;
       }
       if (payload.phase === "chunk") {
@@ -1060,7 +1173,7 @@ const northStarAwaitingConversationStart =
           void refreshSpeechStreamSnapshot().catch(() => undefined);
         }
         northStarLiveReplyPreviewTextRef.current.delete(payload.requestId);
-        setNorthStarLiveReplyPreviewText("");
+        flushNorthStarLiveReplyPreviewText("");
         void refreshCallSessionSnapshot().catch(() => undefined);
         void queueNorthStarPeerReplyPlayback(async () => {
           await queueNorthStarReplyTransport(() => sendOrQueueNorthStarChannelJson({
@@ -1083,7 +1196,7 @@ const northStarAwaitingConversationStart =
           northStarActiveSpeechRequestIdRef.current = null;
           void refreshSpeechStreamSnapshot().catch(() => undefined);
         }
-        setNorthStarLiveReplyPreviewText("");
+        flushNorthStarLiveReplyPreviewText("");
         window.setTimeout(() => {
           void queueNorthStarReplyTransport(() => sendOrQueueNorthStarChannelJson({
             type: "live_reply_stream_error",
@@ -1851,11 +1964,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
             if (!openerId || !text) {
               return;
             }
+            void ensureNorthStarAcceptedSessionFor(callId, { silent: true });
             updateNorthStarLiveDiagnostics({
               phase: "desktop_opening_requested",
               issue: "",
             });
-            void synthesizeNorthStarPhrase(text)
+            void synthesizeNorthStarOpening(text)
               .then((result) => {
                 if (event.channel.readyState !== "open") {
                   return;
@@ -2133,6 +2247,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     processedNorthStarSignalIdsRef.current.add(signal.signalId);
 
     if (signal.signalKind === "offer") {
+      void ensureNorthStarAcceptedSessionFor(callId, { silent: true });
       teardownNorthStarWebRtc({
         resetProcessedSignals: false,
         clearPendingOutboundMessages: false,
@@ -2217,9 +2332,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function refreshSnapshot() { setSnapshot(await getPhaseOneSnapshot()); }
   async function refreshPassiveSnapshot() { setPassiveSnapshot(await getPassiveContextSnapshot()); }
   async function refreshPhaseThreeSnapshot() { setPhaseThreeSnapshot(await getPhaseThreeSnapshot()); }
-  async function refreshTelegramSnapshot() { setTelegramSnapshot(await getTelegramConnectionSnapshot()); }
-  async function refreshTelegramUserSnapshot() { setTelegramUserSnapshot(await getTelegramUserSnapshot()); }
-  async function refreshTelegramCallTransportSnapshot() { setTelegramCallTransportSnapshot(await getTelegramCallTransportSnapshot()); }
   async function refreshCallSessionSnapshot() { setCallSessionSnapshot(await getCallSessionSnapshot()); }
   async function refreshDecisionSnapshot() { setDecisionSnapshot(await getDecisionSnapshot()); }
   async function refreshRealityCheckSnapshot() { setRealityCheckSnapshot(await getMvpRealityCheckSnapshot()); }
@@ -2229,7 +2341,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     let active = true;
     async function bootstrap() {
       try {
-        const [loadedSettings, loadedDiagnostics, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedTelegramSnapshot, loadedTelegramUserSnapshot, loadedTelegramCallTransportSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot] = await Promise.all([
+        const [loadedSettings, loadedDiagnostics, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot] = await Promise.all([
           loadSettings(),
           getDiagnostics(),
           getNorthStarSnapshot(),
@@ -2239,16 +2351,13 @@ async function playNorthStarReplyOverPeer(base64: string) {
           getPassiveContextSnapshot(),
           getPhaseThreeSnapshot(),
           getDecisionSnapshot(),
-          getTelegramConnectionSnapshot(),
-          getTelegramUserSnapshot(),
-          getTelegramCallTransportSnapshot(),
           getCallSessionSnapshot(),
           getMvpRealityCheckSnapshot(),
           listSimulationScenarios(),
           getMemoryGrowthSnapshot(),
         ]);
         if (!active) return;
-        setSettings(loadedSettings);
+        setSettings(withPromptDefaults(loadedSettings));
         setDiagnostics(loadedDiagnostics);
         commitNorthStarSnapshot(loadedNorthStarSnapshot);
         setVoiceSnapshot(loadedVoiceSnapshot);
@@ -2257,9 +2366,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
         setPassiveSnapshot(loadedPassiveSnapshot);
         setPhaseThreeSnapshot(loadedPhaseThreeSnapshot);
         setDecisionSnapshot(loadedDecisionSnapshot);
-        setTelegramSnapshot(loadedTelegramSnapshot);
-        setTelegramUserSnapshot(loadedTelegramUserSnapshot);
-        setTelegramCallTransportSnapshot(loadedTelegramCallTransportSnapshot);
         setCallSessionSnapshot(loadedCallSessionSnapshot);
         setRealityCheckSnapshot(loadedRealityCheckSnapshot);
         setSimulationScenarios(loadedSimulationScenarios);
@@ -2275,13 +2381,17 @@ async function playNorthStarReplyOverPeer(base64: string) {
     return () => { active = false; };
   }, []);
 
+  const speechStreamNeedsHotPolling =
+    Boolean(speechStream?.active)
+    && (speechStream?.status === "starting" || speechStream?.status === "listening");
+
   useEffect(() => {
-    if (!speechStream?.active) return;
+    if (!speechStreamNeedsHotPolling) return;
     const timer = window.setInterval(() => {
       void refreshSpeechStreamSnapshot();
     }, 250);
     return () => window.clearInterval(timer);
-  }, [speechStream?.active]);
+  }, [speechStreamNeedsHotPolling]);
 
   useEffect(() => {
     if (!northStarRuntimeSnapshot?.configured) return;
@@ -2321,12 +2431,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
     if (activeNorthStarSession && activeNorthStarRemoteCallId !== latestAcceptedNorthStarCall.callId) {
       void (async () => {
         await handleEndCallSession("interrupted");
-        await handleStartNorthStarAcceptedCall();
+        await ensureNorthStarAcceptedSessionFor(latestAcceptedNorthStarCall.callId);
       })();
       return;
     }
     if (!callSessionSnapshot?.activeSession) {
-      void handleStartNorthStarAcceptedCall();
+      void ensureNorthStarAcceptedSessionFor(latestAcceptedNorthStarCall.callId, { silent: true });
     }
   }, [latestAcceptedNorthStarCall?.callId, activeNorthStarRemoteCallId, activeNorthStarSession?.id, callSessionSnapshot?.activeSession?.id, busyPanel]);
 
@@ -2363,26 +2473,28 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }, [activeNorthStarSession?.id, activeNorthStarRemoteCall?.callId, activeNorthStarRemoteCall?.status, northStarRuntimeSnapshot?.configured, busyPanel]);
 
   useEffect(() => {
-    if (!activeNorthStarSession || !activeNorthStarRemoteCallId) {
+    const targetCallId = activeNorthStarRemoteCallId ?? pendingAcceptedNorthStarCallId;
+    if (!targetCallId) {
       teardownNorthStarWebRtc();
       return;
     }
+    const stableCallId = targetCallId;
 
     let cancelled = false;
-    const targetCallId = activeNorthStarRemoteCallId;
-    if (northStarWebRtcCallIdRef.current !== targetCallId) {
+    void ensureNorthStarAcceptedSessionFor(stableCallId, { silent: true });
+    if (northStarWebRtcCallIdRef.current !== stableCallId) {
       teardownNorthStarWebRtc();
-      northStarWebRtcCallIdRef.current = targetCallId;
+      northStarWebRtcCallIdRef.current = stableCallId;
     }
 
     async function pollSignals() {
       try {
-        const signals = await pullNorthStarWebRtcSignals(targetCallId);
-        if (cancelled || northStarWebRtcCallIdRef.current !== targetCallId) {
+        const signals = await pullNorthStarWebRtcSignals(stableCallId);
+        if (cancelled || northStarWebRtcCallIdRef.current !== stableCallId) {
           return;
         }
         for (const signal of signals) {
-          await handleNorthStarDesktopSignal(targetCallId, signal);
+          await handleNorthStarDesktopSignal(stableCallId, signal);
         }
       } catch {
         // Keep the existing turn-upload call path alive while live signaling is still being added.
@@ -2398,7 +2510,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [activeNorthStarSession?.id, activeNorthStarRemoteCallId]);
+  }, [activeNorthStarSession?.id, activeNorthStarRemoteCallId, pendingAcceptedNorthStarCallId]);
 
   useEffect(() => {
     if (
@@ -2517,12 +2629,16 @@ async function playNorthStarReplyOverPeer(base64: string) {
       const rows = await saveSettings(settings);
       setSavedRows(rows);
       setMessage("Settings saved locally.");
-      await Promise.all([refreshDiagnostics(), refreshNorthStarSnapshot(), refreshVoiceSnapshot(), refreshTelegramSnapshot(), refreshTelegramUserSnapshot(), refreshTelegramCallTransportSnapshot(), refreshDecisionSnapshot(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshDiagnostics(), refreshNorthStarSnapshot(), refreshVoiceSnapshot(), refreshDecisionSnapshot(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setSaving(false);
     }
+  }
+
+  function handleResetPromptField(key: PromptSettingKey) {
+    setSettings((current) => ({ ...current, [key]: defaultSettings[key] }));
   }
 
   async function handleCreateNorthStarSession() {
@@ -2533,7 +2649,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       const snapshot = await createNorthStarSession();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
-      setSettings(loaded);
+      setSettings(withPromptDefaults(loaded));
       setMessage(snapshot.detail);
       await refreshDiagnostics();
     } catch (caught) {
@@ -2551,7 +2667,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       const snapshot = await bindNorthStarDesktop();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
-      setSettings(loaded);
+      setSettings(withPromptDefaults(loaded));
       setMessage(snapshot.detail);
       await refreshDiagnostics();
     } catch (caught) {
@@ -2578,7 +2694,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       snapshot = await sendNorthStarHeartbeat();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
-      setSettings(loaded);
+      setSettings(withPromptDefaults(loaded));
       setMessage("North Star is linked and ready for calls.");
       await refreshDiagnostics();
     } catch (caught) {
@@ -2662,7 +2778,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       if (!northStarReadyForCalls) {
         await handleNorthStarQuickLink();
       }
-      const note = northStarCallNote.trim() || "NeuralTrainer is calling you now.";
+      const note = northStarCallNote.trim() || defaultNorthStarOutreachNote();
       const snapshot = await sendNorthStarCallRequest(note);
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarCallNote("");
@@ -2752,21 +2868,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
       setLocationForm((current) => ({ ...current, occurredAt: new Date().toISOString() }));
       setMessage("Location event ingested.");
       await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleTelegramSend() {
-    setBusyPanel("telegramSend");
-    setError("");
-    setMessage("");
-    try {
-      const result = await sendTestTelegramMessage();
-      setMessage(`Telegram test message sent to chat ${result.telegramChatId}.`);
-      await Promise.all([refreshTelegramSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -2914,178 +3015,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshDecisionSnapshot(),
-        refreshTelegramSnapshot(),
-        refreshTelegramUserSnapshot(),
-        refreshTelegramCallTransportSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
         refreshMemoryGrowthSnapshot(),
       ]);
       setMessage("All local app data and voice assets were cleared.");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleStartSpeechStream(payload: StartSpeechStreamInput) {
-    setBusyPanel("speechStreamStart");
-    setError("");
-    setMessage("");
-    try {
-      setCallTurnResult(null);
-      setCallReplyAudioSrc(null);
-      const snapshot = await startSpeechStream(payload);
-      setSpeechStream(snapshot);
-      setMessage("Listening live. Speak naturally, then stop the stream when you're done.");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleStopSpeechStream(payload: StopSpeechStreamInput) {
-    setBusyPanel("speechStreamStop");
-    setError("");
-    setMessage("");
-    try {
-      const result = await stopSpeechStreamAndReply(payload);
-      setCallTurnResult(result);
-      setCallReplyAudioSrc(`data:audio/wav;base64,${result.replyAudioBase64}`);
-      setCallTranscriptSummary(result.transcriptText);
-      setSpeechStream(await getSpeechStreamSnapshot());
-      setMessage("Stopped listening and generated a spoken reply.");
-      await Promise.all([refreshDiagnostics(), refreshCallSessionSnapshot()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-      try {
-        await refreshSpeechStreamSnapshot();
-      } catch {
-        // Keep original error.
-      }
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleTelegramPoll() {
-    setBusyPanel("telegramPoll");
-    setError("");
-    setMessage("");
-    try {
-      setTelegramSnapshot(await pollTelegramUpdates());
-      setMessage("Telegram updates polled and local reply history refreshed.");
-      await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handlePrepareTelegramUserRuntime() {
-    setBusyPanel("telegramUserRuntime");
-    setError("");
-    setMessage("");
-    try {
-      const snapshot = await prepareTelegramUserRuntime();
-      setTelegramUserSnapshot(snapshot);
-      setMessage("Telegram user runtime prepared.");
-      await Promise.all([refreshDiagnostics(), refreshTelegramCallTransportSnapshot()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handlePrepareTelegramCallTransport() {
-    setBusyPanel("telegramCallRuntime");
-    setError("");
-    setMessage("");
-    try {
-      const snapshot = await prepareTelegramCallTransport();
-      setTelegramCallTransportSnapshot(snapshot);
-      setMessage("Telegram private-call transport runtime prepared.");
-      await refreshDiagnostics();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleStartTelegramTestCall() {
-    setBusyPanel("telegramCallRuntime");
-    setError("");
-    setMessage("");
-    try {
-      const result = await startTelegramTestCall();
-      setTelegramCallTransportSnapshot(result.snapshot);
-      setMessage(result.detail);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleSendTelegramUserCode() {
-    setBusyPanel("telegramUserCode");
-    setError("");
-    setMessage("");
-    try {
-      const result = await sendTelegramUserLoginCode();
-      setTelegramUserSnapshot(result.snapshot);
-      setMessage(result.detail);
-      setTelegramLoginCode("");
-      await refreshTelegramCallTransportSnapshot();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleCompleteTelegramUserLogin() {
-    if (!telegramLoginCode.trim()) {
-      setMessage("Enter the Telegram login code first.");
-      return;
-    }
-    setBusyPanel("telegramUserLogin");
-    setError("");
-    setMessage("");
-    try {
-      const payload: CompleteTelegramUserLoginInput = {
-        code: telegramLoginCode.trim(),
-        password: telegramLoginPassword.trim() || null,
-      };
-      const result = await completeTelegramUserLogin(payload);
-      setTelegramUserSnapshot(result.snapshot);
-      setTelegramLoginCode("");
-      setTelegramLoginPassword("");
-      setMessage(result.detail);
-      await refreshTelegramCallTransportSnapshot();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleLogoutTelegramUser() {
-    setBusyPanel("telegramUserLogout");
-    setError("");
-    setMessage("");
-    try {
-      const result = await logoutTelegramUser();
-      setTelegramUserSnapshot(result.snapshot);
-      setTelegramLoginCode("");
-      setTelegramLoginPassword("");
-      setMessage(result.detail);
-      await refreshTelegramCallTransportSnapshot();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3100,7 +3034,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     try {
       const result = await runMessageDecisions();
       setMessage(`Decision pass complete: ${result.promotedCount} promoted, ${result.suppressedCount} suppressed.`);
-      await Promise.all([refreshDecisionSnapshot(), refreshPhaseThreeSnapshot(), refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshDecisionSnapshot(), refreshPhaseThreeSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3128,7 +3062,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       } else {
         setMessage(`Call-request pass complete: ${result.promotedCount} promoted, ${result.suppressedCount} suppressed.`);
       }
-      await Promise.all([refreshDecisionSnapshot(), refreshPhaseThreeSnapshot(), refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshDecisionSnapshot(), refreshPhaseThreeSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3147,7 +3081,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       const summary = summarizeMemoryGrowth(previousSnapshot, nextSnapshot);
       setMemoryGrowthSummary(summary);
       setMessage(`Memory growth pass complete. ${summary[0]}`);
-      await Promise.all([refreshSnapshot(), refreshTelegramSnapshot(), refreshDiagnostics()]);
+      await Promise.all([refreshSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3174,42 +3108,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       } else {
         setMessage("Memory item moved back into active memory.");
       }
-      await Promise.all([refreshSnapshot(), refreshTelegramSnapshot(), refreshDiagnostics()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleDispatchDrafts() {
-    setBusyPanel("dispatch");
-    setError("");
-    setMessage("");
-    try {
-      const result = await dispatchDraftedOutreach();
-      setMessage(`Draft dispatch complete: ${result.sentCount} sent, ${result.failedCount} failed.`);
-      await Promise.all([refreshDecisionSnapshot(), refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleStartCallSession(payload: StartCallSessionInput) {
-    setBusyPanel("callStart");
-    setError("");
-    setMessage("");
-    try {
-      const snapshot = await startCallSession(payload);
-      setCallSessionSnapshot(snapshot);
-      setCallSessionNotes(payload.notes);
-      setCallTurnResult(null);
-      setCallReplyAudioSrc(null);
-      setSpeechStream(null);
-      setMessage("Call session started.");
-      await Promise.all([refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDecisionSnapshot(), refreshDiagnostics()]);
+      await Promise.all([refreshSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3218,9 +3117,34 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   async function handleStartNorthStarAcceptedCall() {
-    setBusyPanel("northStarAcceptedCall");
-    setError("");
-    setMessage("");
+    if (!pendingAcceptedNorthStarCallId) {
+      setError("No accepted North Star call is waiting yet.");
+      return;
+    }
+    await ensureNorthStarAcceptedSessionFor(pendingAcceptedNorthStarCallId);
+  }
+
+  async function ensureNorthStarAcceptedSessionFor(callId: string, options?: { silent?: boolean }) {
+    if (!callId || pendingAcceptedNorthStarCallId !== callId) {
+      return;
+    }
+    if (activeNorthStarSession && activeNorthStarRemoteCallId === callId) {
+      return;
+    }
+    if (callSessionSnapshot?.activeSession && !activeNorthStarSession) {
+      return;
+    }
+    if (northStarAcceptedSessionStartCallIdRef.current === callId) {
+      return;
+    }
+
+    const silent = options?.silent ?? false;
+    northStarAcceptedSessionStartCallIdRef.current = callId;
+    if (!silent) {
+      setBusyPanel("northStarAcceptedCall");
+      setError("");
+      setMessage("");
+    }
     setNorthStarTurnStatus(null);
     setCallTurnResult(null);
     setCallReplyAudioSrc(null);
@@ -3230,12 +3154,15 @@ async function playNorthStarReplyOverPeer(base64: string) {
     try {
       const snapshot = await startNorthStarAcceptedCall();
       setCallSessionSnapshot(snapshot);
-      setMessage("Started a local call session from the accepted North Star request.");
+      setMessage("Started the accepted North Star companion call.");
       await Promise.all([refreshNorthStarSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
-      setBusyPanel(null);
+      northStarAcceptedSessionStartCallIdRef.current = null;
+      if (!silent) {
+        setBusyPanel(null);
+      }
     }
   }
 
@@ -3286,22 +3213,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       setCallReplyAudioSrc(null);
       setSpeechStream(null);
       setMessage(`Call session ended as ${outcome}.`);
-      await Promise.all([refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDecisionSnapshot(), refreshDiagnostics()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleFeedback(feedbackKind: "helpful" | "mistimed" | "intrusive" | "welcome", outreachEventId: number) {
-    setBusyPanel("feedback");
-    setError("");
-    setMessage("");
-    try {
-      setTelegramSnapshot(await submitOutreachFeedback({ outreachEventId, feedbackKind, notes: "" }));
-      setMessage(`Recorded feedback: ${feedbackKind}.`);
-      await Promise.all([refreshDecisionSnapshot(), refreshTelegramSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshCallSessionSnapshot(), refreshDecisionSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -3355,7 +3267,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshDecisionSnapshot(),
-        refreshTelegramSnapshot(),
         refreshCallSessionSnapshot(),
         refreshDiagnostics(),
       ]);
@@ -3382,7 +3293,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshDecisionSnapshot(),
-        refreshTelegramSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
         refreshDiagnostics(),
@@ -3407,7 +3317,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshDecisionSnapshot(),
-        refreshTelegramSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
         refreshDiagnostics(),
@@ -3542,7 +3451,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                               <div><strong>Session token</strong><br />{northStarConnectionsSnapshot.sessionTokenMasked || "Not created yet"}</div>
                               <div><strong>Device token</strong><br />{northStarConnectionsSnapshot.deviceTokenMasked || "Not bound yet"}</div>
                             </div>
-                            <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional note for the phone call request..." /></label>
+                <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional outreach reason. Leave empty to use a seeded companion check-in." /></label>
                             <label><span>Desktop companion message</span><textarea rows={3} value={northStarMessageText} onChange={(event) => setNorthStarMessageText(event.target.value)} placeholder="Send a message into the North Star companion thread..." /></label>
                             <div className="button-row">
                               <button type="button" onClick={handleCreateNorthStarSession} disabled={busyPanel === "northStarSession"}>{busyPanel === "northStarSession" ? "Creating session..." : "Create session"}</button>
@@ -3556,17 +3465,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
                         <p>North Star desktop status has not been loaded yet.</p>
                       )}
                     </div>
-                    <label><span>Telegram bot token</span><input type="password" value={settings.telegramBotToken} onChange={(event) => setSettings((current) => ({ ...current, telegramBotToken: event.target.value }))} /></label>
-                    <div className="split">
-                      <label><span>Telegram default chat ID</span><input value={settings.telegramDefaultChatId} onChange={(event) => setSettings((current) => ({ ...current, telegramDefaultChatId: event.target.value }))} /></label>
-                    <label><span>Telegram last update ID</span><input value={settings.telegramLastUpdateId} disabled /></label>
-                  </div>
-                  <div className="split">
-                    <label><span>Telegram user API ID</span><input value={settings.telegramUserApiId} onChange={(event) => setSettings((current) => ({ ...current, telegramUserApiId: event.target.value }))} /></label>
-                    <label><span>Telegram user phone</span><input value={settings.telegramUserPhone} onChange={(event) => setSettings((current) => ({ ...current, telegramUserPhone: event.target.value }))} placeholder="+31..." /></label>
-                  </div>
-                  <label><span>Telegram user API hash</span><input type="password" value={settings.telegramUserApiHash} onChange={(event) => setSettings((current) => ({ ...current, telegramUserApiHash: event.target.value }))} /></label>
-                  <label><span>Telegram call target</span><input value={settings.telegramUserCallTarget} onChange={(event) => setSettings((current) => ({ ...current, telegramUserCallTarget: event.target.value }))} placeholder="@username or phone" /></label>
                   <div className="split">
                     <label><span>LM Studio endpoint</span><input value={settings.lmStudioEndpoint} onChange={(event) => setSettings((current) => ({ ...current, lmStudioEndpoint: event.target.value }))} /></label>
                     <label><span>LM Studio model</span><input value={settings.lmStudioModel} onChange={(event) => setSettings((current) => ({ ...current, lmStudioModel: event.target.value }))} /></label>
@@ -3591,6 +3489,33 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   </div>
                   <label><span>Model file path</span><input value={settings.ttsModelPath} onChange={(event) => setSettings((current) => ({ ...current, ttsModelPath: event.target.value }))} placeholder="Leave empty to use the app's Kokoro model path" /></label>
                   <label><span>Voices file path</span><input value={settings.ttsVoicesPath} onChange={(event) => setSettings((current) => ({ ...current, ttsVoicesPath: event.target.value }))} placeholder="Leave empty to use the app's Kokoro voices path" /></label>
+
+                  <div className="voice-card">
+                    <h3>Prompt menu</h3>
+                    <p>These live-call prompts are multiline and fully editable here. Supported placeholders include <code>{"{session_context}"}</code>, <code>{"{transcript_text}"}</code>, and for the opener <code>{"{default_fallback}"}</code>.</p>
+                    <p><strong>Direction guide</strong><br />This menu only exposes the North Star live-call path. `Shared` means both call directions use it. `NeuralTrainer -&gt; North Star` means it is only used when NeuralTrainer is the one placing the call.</p>
+                    {promptFieldMeta.map((entry) => (
+                      <div key={entry.key} className="saved-state">
+                        <div className="panel-header">
+                          <h4>{entry.label}</h4>
+                          <p>{entry.description}</p>
+                        </div>
+                        <label>
+                          <span>{entry.label}</span>
+                          <textarea
+                            rows={entry.rows}
+                            value={settings[entry.key]}
+                            onChange={(event) => setSettings((current) => ({ ...current, [entry.key]: event.target.value }))}
+                          />
+                        </label>
+                        <div className="actions">
+                          <button type="button" className="ghost" onClick={() => handleResetPromptField(entry.key)}>
+                            Reset to default
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
 
                   <div className="voice-card">
                     <h3>Kokoro readiness</h3>
@@ -3925,13 +3850,13 @@ async function playNorthStarReplyOverPeer(base64: string) {
                 <label><span>Speed m/s</span><input type="number" min={0} step={0.1} value={locationForm.speedMps ?? ""} onChange={(event) => setLocationForm((current) => ({ ...current, speedMps: event.target.value ? Number(event.target.value) : null }))} /></label>
               </div>
               <label><span>Source</span><input value={locationForm.source} onChange={(event) => setLocationForm((current) => ({ ...current, source: event.target.value }))} /></label>
-              <div className="saved-state inline-note"><h3>Telegram live location shape</h3><code>{`{
+                          <div className="saved-state inline-note"><h3>Legacy location event shape</h3><code>{`{
   "occurredAt": "2026-03-23T10:38:00Z",
   "latitude": 52.3712,
   "longitude": 4.9004,
   "accuracyMeters": 12,
   "speedMps": 0,
-  "source": "telegram_location"
+  "source": "north_star_location"
 }`}</code></div>
               <button type="submit" disabled={busyPanel === "location"}>{busyPanel === "location" ? "Ingesting..." : "Ingest location event"}</button>
             </form>
@@ -3957,7 +3882,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         {contextSection === "timeline" ? (
           <div className="grid two-up">
           <section className="panel">
-            <div className="panel-header"><h2>Recent raw events</h2><p>Manual and Telegram-derived location records.</p></div>
+            <div className="panel-header"><h2>Recent raw events</h2><p>Manual and North Star-derived location records.</p></div>
             <div className="saved-state"><ul>{passiveSnapshot?.rawEvents.length ? passiveSnapshot.rawEvents.slice(0, 12).map((item) => <li key={item.id}><strong>{item.movementState}</strong><code>{formatDateTime(item.occurredAt)} / {item.latitude.toFixed(4)}, {item.longitude.toFixed(4)} / {item.source}</code></li>) : <li>No raw events yet.</li>}</ul></div>
           </section>
 
@@ -4108,48 +4033,29 @@ async function playNorthStarReplyOverPeer(base64: string) {
           <div className="actions">
             <button type="button" onClick={() => void handleRunDecisions()} disabled={busyPanel === "decisions" || loading}>{busyPanel === "decisions" ? "Evaluating..." : "Run decision pass"}</button>
             <button type="button" className="ghost" onClick={() => void handleRunCallRequestDecisions()} disabled={busyPanel === "callDecisions" || loading}>{busyPanel === "callDecisions" ? "Evaluating calls..." : "Run call request pass"}</button>
-            <button type="button" className="ghost" onClick={() => void handleDispatchDrafts()} disabled={busyPanel === "dispatch" || loading}>{busyPanel === "dispatch" ? "Sending..." : "Send drafted outreach"}</button>
           </div>
         </section>
 
         <div className="grid two-up">
           <section className="panel">
-            <div className="panel-header"><h2>Call surface</h2><p>Move from an accepted call request into a real tracked session.</p></div>
+            <div className="panel-header"><h2>North Star call surface</h2><p>Move from an accepted North Star call into a real tracked companion session.</p></div>
             <dl className="facts">
-              <div><dt>Accepted call requests</dt><dd>{callSessionSnapshot?.acceptedCallRequestCount ?? 0}</dd></div>
+              <div><dt>Accepted North Star calls</dt><dd>{latestAcceptedNorthStarCall ? 1 : 0}</dd></div>
               <div><dt>Active sessions</dt><dd>{callSessionSnapshot?.activeSessionCount ?? 0}</dd></div>
             </dl>
               <div className="actions">
                 <button
                   type="button"
-                  onClick={() => void handleStartCallSession({ outreachEventId: latestAcceptedCallRequest?.id ?? null, handoffKind: "accepted_handoff", notes: "Started from accepted Telegram call request." })}
-                  disabled={busyPanel === "callStart" || !latestAcceptedCallRequest || !!callSessionSnapshot?.activeSession}
-                >
-                  {busyPanel === "callStart" ? "Starting..." : "Start accepted call"}
-                </button>
-                <button
-                  type="button"
-                  className="ghost"
                   onClick={() => void handleStartNorthStarAcceptedCall()}
                   disabled={busyPanel === "northStarAcceptedCall" || !latestAcceptedNorthStarCall || !!callSessionSnapshot?.activeSession}
                 >
                   {busyPanel === "northStarAcceptedCall" ? "Starting..." : "Start North Star call"}
                 </button>
-                <button
-                  type="button"
-                  className="ghost"
-                  onClick={() => void handleStartCallSession({ outreachEventId: null, handoffKind: "local_test_surface", notes: "Started from the local desktop call surface." })}
-                  disabled={busyPanel === "callStart" || !!callSessionSnapshot?.activeSession}
-              >
-                Start local test call
-              </button>
             </div>
-              {latestAcceptedCallRequest ? (
-                <p className="memory-explanation"><strong>Ready handoff:</strong> {latestAcceptedCallRequest.messageText}</p>
-              ) : latestAcceptedNorthStarCall ? (
+              {latestAcceptedNorthStarCall ? (
                 <p className="memory-explanation"><strong>Ready North Star handoff:</strong> {latestAcceptedNorthStarCall.note || "Accepted companion call waiting."}</p>
               ) : (
-                <p className="memory-explanation">No accepted Telegram or North Star call request is ready yet. You can still start a local test call.</p>
+                <p className="memory-explanation">No accepted North Star call is ready yet.</p>
               )}
             {callSessionSnapshot?.activeSession ? (
               <div className="saved-state">
@@ -4203,31 +4109,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   </div>
                 ) : null}
                 <div className="actions mini-actions">
-                  {speechStream?.active ? (
-                    <button
-                      type="button"
-                      className="ghost"
-                      title="Stop the live microphone stream and generate a spoken reply."
-                      onClick={() => void handleStopSpeechStream({ sessionId: callSessionSnapshot.activeSession!.id })}
-                      disabled={busyPanel === "speechStreamStop"}
-                    >
-                      {busyPanel === "speechStreamStop" ? "Replying..." : "Stop and reply"}
-                    </button>
-                  ) : (
-                    <button
-                      type="button"
-                      className="ghost"
-                      title={!voiceSnapshot?.speechReady || !voiceSnapshot?.speechRuntimeReady ? "Set up voice in Settings > Voice first." : "Start listening live through this PC microphone."}
-                      onClick={() => void handleStartSpeechStream({ sessionId: callSessionSnapshot.activeSession!.id })}
-                      disabled={busyPanel === "speechStreamStart" || !voiceSnapshot?.speechReady || !voiceSnapshot?.speechRuntimeReady || !voiceSnapshot?.runtimeReady}
-                    >
-                      {busyPanel === "speechStreamStart"
-                        ? "Starting..."
-                        : (!voiceSnapshot?.speechReady || !voiceSnapshot?.speechRuntimeReady)
-                          ? "Set up speech input first"
-                          : "Start listening"}
-                    </button>
-                  )}
                   <button type="button" onClick={() => void handleEndCallSession("completed")} disabled={busyPanel === "callEnd"}>{busyPanel === "callEnd" ? "Ending..." : "End as completed"}</button>
                   <button type="button" className="ghost" onClick={() => void handleEndCallSession("interrupted")} disabled={busyPanel === "callEnd"}>Interrupted</button>
                   <button type="button" className="ghost" onClick={() => void handleEndCallSession("missed")} disabled={busyPanel === "callEnd"}>Missed</button>
@@ -4254,9 +4135,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
                 ) : null}
                 {(speechStream?.lastError || error) ? (
                   <p className="memory-explanation"><strong>Call issue</strong><br />{speechStream?.lastError || error}</p>
-                ) : null}
-                {!voiceSnapshot?.speechReady || !voiceSnapshot?.speechRuntimeReady ? (
-                  <p className="memory-explanation">If the microphone path is not ready yet, use Settings &gt; Voice and run Set up voice once. Repair speech input is only for fixing the local STT setup.</p>
                 ) : null}
                 {callTurnResult && callTurnResult.sessionId === callSessionSnapshot.activeSession.id ? (
                   <div className="saved-state">
@@ -4324,135 +4202,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
     );
   }
 
-  function renderTelegramTab() {
-    return (
-      <div className="content-stack">
-        {renderSectionTabs([
-          { id: "controls", label: "Controls" },
-          { id: "outbound", label: "Outbound" },
-          { id: "inbound", label: "Inbound" },
-          { id: "feedback", label: "Feedback" },
-        ], telegramSection, setTelegramSection)}
-
-        {telegramSection === "controls" ? (
-        <div className="grid two-up">
-          <section className="panel">
-            <div className="panel-header"><h2>Telegram bot controls</h2><p>Bot testing, reply polling, and live location ingestion.</p></div>
-            <div className="actions">
-              <button type="button" onClick={() => void handleTelegramSend()} disabled={busyPanel === "telegramSend" || saving || loading}>{busyPanel === "telegramSend" ? "Sending..." : "Send Telegram test"}</button>
-              <button type="button" className="ghost" onClick={() => void handleTelegramPoll()} disabled={busyPanel === "telegramPoll" || saving || loading}>{busyPanel === "telegramPoll" ? "Polling..." : "Poll replies"}</button>
-            </div>
-          </section>
-          <section className="panel">
-            <div className="panel-header"><h2>Telegram user account</h2><p>The MTProto user-account foundation needed before real Telegram call transport can exist.</p></div>
-            <div className="saved-state">
-              <ul>
-                <li><strong>Configured</strong><code>{telegramUserSnapshot?.configured ? "Yes" : "No"}</code></li>
-                <li><strong>Runtime ready</strong><code>{telegramUserSnapshot?.runtimeReady ? "Yes" : "No"}</code></li>
-                <li><strong>Authorized</strong><code>{telegramUserSnapshot?.authorized ? "Yes" : "No"}</code></li>
-                <li><strong>Phone</strong><code>{telegramUserSnapshot?.phone || settings.telegramUserPhone || "Not set"}</code></li>
-                <li><strong>Session</strong><code>{telegramUserSnapshot?.sessionPath || "Not created yet"}</code></li>
-                {telegramUserSnapshot?.meDisplay ? <li><strong>Connected as</strong><code>{telegramUserSnapshot.meDisplay}</code></li> : null}
-              </ul>
-              <p className="memory-explanation">{telegramUserSnapshot?.runtimeDetail || "Save your Telegram user account settings first, then prepare the MTProto runtime."}</p>
-            </div>
-            <div className="actions">
-              <button type="button" onClick={() => void handlePrepareTelegramUserRuntime()} disabled={busyPanel === "telegramUserRuntime"}>{busyPanel === "telegramUserRuntime" ? "Preparing..." : "Prepare user runtime"}</button>
-              <button type="button" className="ghost" onClick={() => void handleSendTelegramUserCode()} disabled={busyPanel === "telegramUserCode" || !telegramUserSnapshot?.configured || !telegramUserSnapshot?.runtimeReady}>{busyPanel === "telegramUserCode" ? "Sending code..." : "Send login code"}</button>
-              <button type="button" className="ghost" onClick={() => void handleLogoutTelegramUser()} disabled={busyPanel === "telegramUserLogout" || !telegramUserSnapshot?.authorized}>{busyPanel === "telegramUserLogout" ? "Logging out..." : "Log out user"}</button>
-            </div>
-            <div className="split">
-              <label><span>Login code</span><input value={telegramLoginCode} onChange={(event) => setTelegramLoginCode(event.target.value)} placeholder="Telegram code" /></label>
-              <label><span>Password, if asked</span><input type="password" value={telegramLoginPassword} onChange={(event) => setTelegramLoginPassword(event.target.value)} placeholder="2FA password" /></label>
-            </div>
-            <div className="actions">
-              <button type="button" onClick={() => void handleCompleteTelegramUserLogin()} disabled={busyPanel === "telegramUserLogin" || !telegramUserSnapshot?.pendingCode}>{busyPanel === "telegramUserLogin" ? "Connecting..." : "Complete login"}</button>
-            </div>
-          </section>
-          <section className="panel">
-            <div className="panel-header"><h2>Telegram call transport</h2><p>The private-call runtime foundation that has to exist before a real Telegram call can be attempted.</p></div>
-            <div className="saved-state">
-              <ul>
-                <li><strong>Configured</strong><code>{telegramCallTransportSnapshot?.configured ? "Yes" : "No"}</code></li>
-                <li><strong>User authorized</strong><code>{telegramCallTransportSnapshot?.userAuthorized ? "Yes" : "No"}</code></li>
-                <li><strong>Runtime ready</strong><code>{telegramCallTransportSnapshot?.runtimeReady ? "Yes" : "No"}</code></li>
-                <li><strong>Provider</strong><code>{telegramCallTransportSnapshot?.provider || "telegram_mtproto"}</code></li>
-                <li><strong>Package</strong><code>{telegramCallTransportSnapshot?.packageName || "pytgvoip"}</code></li>
-                <li><strong>Private calls supported</strong><code>{telegramCallTransportSnapshot?.privateCallsSupported ? "Yes" : "Not yet"}</code></li>
-                <li><strong>Target</strong><code>{telegramCallTransportSnapshot?.target || settings.telegramUserCallTarget || "Not set"}</code></li>
-                <li><strong>Pending call</strong><code>{telegramCallTransportSnapshot?.pendingCall ? "Yes" : "No"}</code></li>
-                {telegramCallTransportSnapshot?.pendingCallTarget ? <li><strong>Pending target</strong><code>{telegramCallTransportSnapshot.pendingCallTarget}</code></li> : null}
-                {telegramCallTransportSnapshot?.pendingCallState ? <li><strong>Pending state</strong><code>{telegramCallTransportSnapshot.pendingCallState}</code></li> : null}
-              </ul>
-              <p className="memory-explanation">{telegramCallTransportSnapshot?.runtimeDetail || "Prepare the Telegram user account first, then prepare the private-call transport runtime."}</p>
-            </div>
-            <div className="actions">
-              <button
-                type="button"
-                onClick={() => void handlePrepareTelegramCallTransport()}
-                disabled={busyPanel === "telegramCallRuntime" || !telegramUserSnapshot?.configured}
-              >
-                {busyPanel === "telegramCallRuntime" ? "Preparing..." : "Prepare call transport"}
-              </button>
-              <button
-                type="button"
-                className="ghost"
-                onClick={() => void handleStartTelegramTestCall()}
-                disabled={
-                  busyPanel === "telegramCallRuntime"
-                  || !telegramCallTransportSnapshot?.privateCallsSupported
-                  || !(telegramCallTransportSnapshot?.target || settings.telegramUserCallTarget)
-                }
-              >
-                {busyPanel === "telegramCallRuntime" ? "Working..." : "Start test call request"}
-              </button>
-            </div>
-            <p className="memory-explanation">Prepare call transport installs the private-call runtime. Start test call request places the outgoing MTProto call request to the saved target.</p>
-          </section>
-        </div>
-        ) : null}
-
-        {telegramSection === "outbound" ? (
-          <section className="panel">
-            <div className="panel-header"><h2>Outbound history</h2><p>Sent, failed, and drafted outreach items plus feedback controls.</p></div>
-            <div className="saved-state">
-              <ul>
-                {telegramSnapshot?.outreachEvents.length ? telegramSnapshot.outreachEvents.map((event) => (
-                  <li key={event.id}>
-                    <strong>{event.outreachKind} / {event.responseState}</strong>
-                    <code>{event.messageText}</code>
-                    {event.responseState === "sent" ? (
-                      <div className="actions mini-actions">
-                        <button type="button" className="ghost" onClick={() => void handleFeedback("helpful", event.id)} disabled={busyPanel === "feedback"}>Helpful</button>
-                        <button type="button" className="ghost" onClick={() => void handleFeedback("mistimed", event.id)} disabled={busyPanel === "feedback"}>Mistimed</button>
-                        <button type="button" className="ghost" onClick={() => void handleFeedback("intrusive", event.id)} disabled={busyPanel === "feedback"}>Intrusive</button>
-                        <button type="button" className="ghost" onClick={() => void handleFeedback("welcome", event.id)} disabled={busyPanel === "feedback"}>Welcome</button>
-                      </div>
-                    ) : null}
-                  </li>
-                )) : <li>No Telegram outreach logged yet.</li>}
-              </ul>
-            </div>
-          </section>
-        ) : null}
-
-        {telegramSection === "inbound" ? (
-          <section className="panel">
-            <div className="panel-header"><h2>Inbound messages</h2><p>Replies and location updates stored from polling.</p></div>
-            <div className="saved-state"><ul>{telegramSnapshot?.inboundMessages.length ? telegramSnapshot.inboundMessages.map((messageItem) => <li key={messageItem.id}><strong>chat {messageItem.chatId}</strong><code>{messageItem.text}</code><code>{formatDateTime(messageItem.receivedAt)}</code></li>) : <li>No inbound Telegram messages stored yet.</li>}</ul></div>
-          </section>
-        ) : null}
-
-        {telegramSection === "feedback" ? (
-        <section className="panel">
-          <div className="panel-header"><h2>Feedback history</h2><p>How conversations are teaching the decision layer over time.</p></div>
-          <div className="saved-state"><ul>{telegramSnapshot?.feedbackEntries.length ? telegramSnapshot.feedbackEntries.map((entry) => <li key={entry.id}><strong>{entry.feedbackKind}</strong><code>event {entry.outreachEventId} / score {entry.score.toFixed(2)}</code><code>{formatDateTime(entry.createdAt)}</code></li>) : <li>No outreach feedback yet.</li>}</ul></div>
-        </section>
-        ) : null}
-      </div>
-    );
-  }
-
   function renderReviewTab() {
     return (
       <div className="content-stack">
@@ -4460,7 +4209,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "places", label: "Places" },
           { id: "rules", label: "Rules" },
           { id: "moments", label: "Saved moments" },
-          { id: "outreach", label: "Outreach detail" },
           { id: "calls", label: "Calls" },
         ], reviewSection, setReviewSection)}
 
@@ -4500,13 +4248,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
           <section className="panel">
             <div className="panel-header"><h2>Saved moments detail</h2><p>Full context payloads for why each moment mattered.</p></div>
             <div className="saved-state"><ul>{phaseThreeSnapshot?.savedMoments.length ? phaseThreeSnapshot.savedMoments.map((moment) => <li key={moment.id}><strong>{moment.momentKind}</strong><code>{moment.inferredSignificance}</code><code>{moment.observedContextJson}</code></li>) : <li>No saved moments yet.</li>}</ul></div>
-          </section>
-        ) : null}
-
-        {reviewSection === "outreach" ? (
-          <section className="panel">
-            <div className="panel-header"><h2>Outreach history detail</h2><p>Inspect reason summaries, delivery metadata, and final text.</p></div>
-            <div className="saved-state"><ul>{telegramSnapshot?.outreachEvents.length ? telegramSnapshot.outreachEvents.map((event) => <li key={event.id}><strong>{event.responseState}</strong><code>{event.reasonSummary}</code><code>{event.deliveryMetadataJson}</code><code>{event.messageText}</code></li>) : <li>No outreach history yet.</li>}</ul></div>
           </section>
         ) : null}
 
@@ -4586,7 +4327,6 @@ async function playNorthStarReplyOverPeer(base64: string) {
       case "memory": return renderMemoryTab();
       case "context": return renderContextTab();
       case "judgment": return renderJudgmentTab();
-      case "telegram": return renderTelegramTab();
       case "review": return renderReviewTab();
       default: return null;
     }
@@ -4624,7 +4364,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
               <li><strong>Places</strong><code>{snapshot?.places.length ?? 0}</code></li>
               <li><strong>Visits</strong><code>{passiveSnapshot?.visits.length ?? 0}</code></li>
               <li><strong>Saved moments</strong><code>{phaseThreeSnapshot?.savedMoments.length ?? 0}</code></li>
-              <li><strong>Outreach events</strong><code>{telegramSnapshot?.outreachEvents.length ?? 0}</code></li>
+              <li><strong>Calls</strong><code>{callSessionSnapshot?.recentSessions.length ?? 0}</code></li>
             </ul>
           </div>
         </aside>

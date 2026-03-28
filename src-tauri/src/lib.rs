@@ -4,8 +4,6 @@ mod error;
 mod models;
 mod north_star;
 mod state;
-mod telegram_call;
-mod telegram_user;
 mod voice;
 
 use std::sync::{Arc, Mutex};
@@ -63,6 +61,7 @@ pub fn run() {
       commands::setup_local_speech,
       commands::synthesize_voice_preview,
       commands::synthesize_north_star_phrase,
+      commands::synthesize_north_star_opening,
       commands::get_speech_stream_snapshot,
       commands::start_speech_stream,
       commands::push_speech_stream_audio,
@@ -82,22 +81,9 @@ pub fn run() {
       commands::ingest_location_event,
       commands::get_passive_context_snapshot,
       commands::get_phase_three_snapshot,
-      commands::send_test_telegram_message,
-      commands::poll_telegram_updates,
-      commands::get_telegram_connection_snapshot,
-      commands::get_telegram_user_snapshot,
-      commands::get_telegram_call_transport_snapshot,
-      commands::prepare_telegram_user_runtime,
-      commands::prepare_telegram_call_transport,
-      commands::start_telegram_test_call,
-      commands::send_telegram_user_login_code,
-      commands::complete_telegram_user_login,
-      commands::logout_telegram_user,
-      commands::dispatch_drafted_outreach,
       commands::start_call_session,
       commands::start_north_star_accepted_call,
       commands::end_call_session,
-      commands::submit_outreach_feedback,
       commands::run_message_decisions,
       commands::run_call_request_decisions,
       commands::get_decision_snapshot,

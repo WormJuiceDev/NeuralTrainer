@@ -15,7 +15,7 @@ use crate::{
     PlaceVisit, ProtectedRule, RawLocationEvent, ReflectionKindCount,
     RepeatedPlaceSummary, RealityCheckItem, RhythmBaselineEntry, SavedMoment, SettingsEntry,
     SimulationRunInput, SimulationRunResult, SimulationScenario, SimulationSuiteCheck,
-    SimulationSuiteResult, StartCallSessionInput, SubmitFeedbackInput, TelegramConnectionSnapshot, UpdateMemoryItemInput,
+    SimulationSuiteResult, StartCallSessionInput, SubmitFeedbackInput, UpdateMemoryItemInput,
     UpdatePlaceInput, UpdateRuleInput, MvpRealityCheckSnapshot,
   },
 };
@@ -83,25 +83,6 @@ pub fn load_settings(db_path: &PathBuf) -> Result<AppSettings, AppError> {
       "call_confidence_threshold" => {
         settings.call_confidence_threshold = serde_json::from_str(&value_json)?
       }
-      "telegram_bot_token" => settings.telegram_bot_token = serde_json::from_str(&value_json)?,
-      "telegram_default_chat_id" => {
-        settings.telegram_default_chat_id = serde_json::from_str(&value_json)?
-      }
-      "telegram_last_update_id" => {
-        settings.telegram_last_update_id = serde_json::from_str(&value_json)?
-      }
-      "telegram_user_api_id" => {
-        settings.telegram_user_api_id = serde_json::from_str(&value_json)?
-      }
-      "telegram_user_api_hash" => {
-        settings.telegram_user_api_hash = serde_json::from_str(&value_json)?
-      }
-      "telegram_user_phone" => {
-        settings.telegram_user_phone = serde_json::from_str(&value_json)?
-      }
-      "telegram_user_call_target" => {
-        settings.telegram_user_call_target = serde_json::from_str(&value_json)?
-      }
       "lm_studio_endpoint" => settings.lm_studio_endpoint = serde_json::from_str(&value_json)?,
       "lm_studio_api_key" => settings.lm_studio_api_key = serde_json::from_str(&value_json)?,
       "lm_studio_model" => settings.lm_studio_model = serde_json::from_str(&value_json)?,
@@ -113,6 +94,33 @@ pub fn load_settings(db_path: &PathBuf) -> Result<AppSettings, AppError> {
       "tts_default_voice" => settings.tts_default_voice = serde_json::from_str(&value_json)?,
       "tts_model_path" => settings.tts_model_path = serde_json::from_str(&value_json)?,
       "tts_voices_path" => settings.tts_voices_path = serde_json::from_str(&value_json)?,
+      "call_transcript_cleanup_prompt" => {
+        settings.call_transcript_cleanup_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_outbound_outreach_prompt" => {
+        settings.call_outbound_outreach_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_inbound_main_reply_prompt" => {
+        settings.call_inbound_main_reply_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_outbound_main_reply_prompt" => {
+        settings.call_outbound_main_reply_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_inbound_streamed_reply_prompt" => {
+        settings.call_inbound_streamed_reply_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_outbound_streamed_reply_prompt" => {
+        settings.call_outbound_streamed_reply_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_inbound_explanation_prompt" => {
+        settings.call_inbound_explanation_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_outbound_explanation_prompt" => {
+        settings.call_outbound_explanation_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_opener_prompt" => {
+        settings.call_opener_prompt = serde_json::from_str(&value_json)?
+      }
       "north_star_endpoint" => settings.north_star_endpoint = serde_json::from_str(&value_json)?,
       "north_star_user_handle" => settings.north_star_user_handle = serde_json::from_str(&value_json)?,
       "north_star_display_name" => settings.north_star_display_name = serde_json::from_str(&value_json)?,
@@ -170,34 +178,6 @@ pub fn save_settings(
       serde_json::to_string(&payload.call_confidence_threshold)?,
     ),
     (
-      "telegram_bot_token",
-      serde_json::to_string(&payload.telegram_bot_token)?,
-    ),
-    (
-      "telegram_default_chat_id",
-      serde_json::to_string(&payload.telegram_default_chat_id)?,
-    ),
-    (
-      "telegram_last_update_id",
-      serde_json::to_string(&payload.telegram_last_update_id)?,
-    ),
-    (
-      "telegram_user_api_id",
-      serde_json::to_string(&payload.telegram_user_api_id)?,
-    ),
-    (
-      "telegram_user_api_hash",
-      serde_json::to_string(&payload.telegram_user_api_hash)?,
-    ),
-    (
-      "telegram_user_phone",
-      serde_json::to_string(&payload.telegram_user_phone)?,
-    ),
-    (
-      "telegram_user_call_target",
-      serde_json::to_string(&payload.telegram_user_call_target)?,
-    ),
-    (
       "lm_studio_endpoint",
       serde_json::to_string(&payload.lm_studio_endpoint)?,
     ),
@@ -240,6 +220,42 @@ pub fn save_settings(
     (
       "tts_voices_path",
       serde_json::to_string(&payload.tts_voices_path)?,
+    ),
+    (
+      "call_transcript_cleanup_prompt",
+      serde_json::to_string(&payload.call_transcript_cleanup_prompt)?,
+    ),
+    (
+      "call_outbound_outreach_prompt",
+      serde_json::to_string(&payload.call_outbound_outreach_prompt)?,
+    ),
+    (
+      "call_inbound_main_reply_prompt",
+      serde_json::to_string(&payload.call_inbound_main_reply_prompt)?,
+    ),
+    (
+      "call_outbound_main_reply_prompt",
+      serde_json::to_string(&payload.call_outbound_main_reply_prompt)?,
+    ),
+    (
+      "call_inbound_streamed_reply_prompt",
+      serde_json::to_string(&payload.call_inbound_streamed_reply_prompt)?,
+    ),
+    (
+      "call_outbound_streamed_reply_prompt",
+      serde_json::to_string(&payload.call_outbound_streamed_reply_prompt)?,
+    ),
+    (
+      "call_inbound_explanation_prompt",
+      serde_json::to_string(&payload.call_inbound_explanation_prompt)?,
+    ),
+    (
+      "call_outbound_explanation_prompt",
+      serde_json::to_string(&payload.call_outbound_explanation_prompt)?,
+    ),
+    (
+      "call_opener_prompt",
+      serde_json::to_string(&payload.call_opener_prompt)?,
     ),
     (
       "north_star_endpoint",
@@ -544,17 +560,6 @@ pub fn phase_three_snapshot(db_path: &PathBuf) -> Result<PhaseThreeSnapshot, App
   Ok(PhaseThreeSnapshot {
     saved_moments: list_saved_moments(&connection)?,
     rhythm_baseline: build_rhythm_baseline(&visits),
-  })
-}
-
-pub fn telegram_connection_snapshot(
-  db_path: &PathBuf,
-) -> Result<TelegramConnectionSnapshot, AppError> {
-  let connection = Connection::open(db_path)?;
-  Ok(TelegramConnectionSnapshot {
-    outreach_events: list_outreach_events(&connection)?,
-    inbound_messages: list_inbound_messages(&connection)?,
-    feedback_entries: list_feedback_entries(&connection)?,
   })
 }
 
@@ -1088,38 +1093,6 @@ pub fn drafted_outreach_events(db_path: &PathBuf) -> Result<Vec<OutreachEvent>, 
   list_drafted_outreach_events(&connection)
 }
 
-pub fn create_outreach_event(
-  db_path: &PathBuf,
-  saved_moment_id: Option<i64>,
-  reason_summary: &str,
-  message_text: &str,
-  confidence: f64,
-  was_delivered: bool,
-  delivery_metadata_json: &str,
-) -> Result<OutreachEvent, AppError> {
-  let connection = Connection::open(db_path)?;
-  connection.execute(
-    r#"
-      INSERT INTO outreach_events (
-        created_at, saved_moment_id, outreach_kind, channel, reason_summary,
-        message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, ?2, 'message', 'telegram', ?3, ?4, ?5, ?6, ?7, ?8)
-    "#,
-    params![
-      Utc::now().to_rfc3339(),
-      saved_moment_id,
-      reason_summary,
-      message_text,
-      confidence,
-      was_delivered,
-      delivery_metadata_json,
-      if was_delivered { "sent" } else { "failed" }
-    ],
-  )?;
-
-  get_outreach_event_by_id(&connection, connection.last_insert_rowid())
-}
-
 pub fn save_inbound_message(
   db_path: &PathBuf,
   telegram_update_id: i64,
@@ -1177,16 +1150,6 @@ pub fn save_inbound_message(
   )?))
 }
 
-pub fn update_telegram_last_update_id(db_path: &PathBuf, update_id: i64) -> Result<(), AppError> {
-  let connection = Connection::open(db_path)?;
-  upsert_setting(
-    &connection,
-    "telegram_last_update_id",
-    &serde_json::to_string(&update_id)?,
-  )?;
-  Ok(())
-}
-
 pub fn submit_outreach_feedback(
   db_path: &PathBuf,
   payload: &SubmitFeedbackInput,
@@ -1227,32 +1190,6 @@ pub fn update_memory_item(
   let connection = Connection::open(db_path)?;
   update_memory_item_with_connection(&connection, payload)?;
   build_memory_growth_snapshot(&connection)
-}
-
-pub fn mark_outreach_event_delivery(
-  db_path: &PathBuf,
-  outreach_event_id: i64,
-  was_delivered: bool,
-  response_state: &str,
-  delivery_metadata_json: &str,
-) -> Result<OutreachEvent, AppError> {
-  let connection = Connection::open(db_path)?;
-  connection.execute(
-    r#"
-      UPDATE outreach_events
-      SET was_delivered = ?2,
-          response_state = ?3,
-          delivery_metadata_json = ?4
-      WHERE id = ?1
-    "#,
-    params![
-      outreach_event_id,
-      was_delivered,
-      response_state,
-      delivery_metadata_json
-    ],
-  )?;
-  get_outreach_event_by_id(&connection, outreach_event_id)
 }
 
 fn apply_schema(connection: &Connection) -> Result<(), AppError> {
@@ -3029,7 +2966,7 @@ fn build_mvp_reality_check_snapshot(
 
   let mut next_actions = Vec::new();
   if raw_events.is_empty() {
-    next_actions.push("Seed the controlled scenario or ingest real Telegram/location events.".into());
+    next_actions.push("Seed the controlled scenario or ingest real North Star/location events.".into());
   }
   if saved_moments.is_empty() {
     next_actions.push("Generate at least one saved moment before judging outreach quality.".into());
@@ -3081,35 +3018,6 @@ fn list_moment_decisions(connection: &Connection) -> Result<Vec<MomentDecision>,
       reason_summary: row.get(4)?,
       decision_metadata_json: row.get(5)?,
       created_outreach_event_id: row.get(6)?,
-    })
-  })?;
-
-  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
-}
-
-fn list_inbound_messages(connection: &Connection) -> Result<Vec<InboundMessage>, AppError> {
-  let mut statement = connection.prepare(
-    r#"
-      SELECT
-        id, created_at, outreach_event_id, telegram_update_id, telegram_message_id,
-        chat_id, sender_id, text, received_at
-      FROM inbound_messages
-      ORDER BY received_at DESC, id DESC
-      LIMIT 40
-    "#,
-  )?;
-
-  let rows = statement.query_map([], |row| {
-    Ok(InboundMessage {
-      id: row.get(0)?,
-      created_at: row.get(1)?,
-      outreach_event_id: row.get(2)?,
-      telegram_update_id: row.get(3)?,
-      telegram_message_id: row.get(4)?,
-      chat_id: row.get(5)?,
-      sender_id: row.get(6)?,
-      text: row.get(7)?,
-      received_at: row.get(8)?,
     })
   })?;
 
@@ -3516,7 +3424,7 @@ fn run_accepted_call_request_starts_session_simulation(
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, NULL, 'call_request', 'telegram', 'accepted call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'accepted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'accepted call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'accepted')
     "#,
     params![
       "2026-03-23T18:00:00Z",
@@ -3555,7 +3463,7 @@ fn run_completed_call_session_is_logged_simulation(
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, NULL, 'call_request', 'telegram', 'completed call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'accepted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'completed call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'accepted')
     "#,
     params![
       "2026-03-23T18:10:00Z",
@@ -3624,7 +3532,7 @@ fn run_feedback_learning_simulation(db_path: &PathBuf) -> Result<SimulationRunRe
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, ?2, 'message', 'telegram', 'seed', 'seed', 0.82, 1, '{}', 'sent')
+) VALUES (?1, ?2, 'message', 'north_star', 'seed', 'seed', 0.82, 1, '{}', 'sent')
     "#,
     params!["2026-03-20T10:06:00Z", past_moment_id],
   )?;
@@ -3671,7 +3579,7 @@ fn run_cooldown_simulation(db_path: &PathBuf) -> Result<SimulationRunResult, App
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, NULL, 'message', 'telegram', 'recent send', 'recent send', 0.9, 1, '{}', 'sent')
+) VALUES (?1, NULL, 'message', 'north_star', 'recent send', 'recent send', 0.9, 1, '{}', 'sent')
     "#,
     params!["2026-03-23T13:40:00Z"],
   )?;
@@ -3745,7 +3653,7 @@ fn run_welcome_feedback_simulation(db_path: &PathBuf) -> Result<SimulationRunRes
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, ?2, 'message', 'telegram', 'welcome seed', 'welcome seed', 0.62, 1, '{}', 'sent')
+) VALUES (?1, ?2, 'message', 'north_star', 'welcome seed', 'welcome seed', 0.62, 1, '{}', 'sent')
     "#,
     params!["2026-03-18T10:06:00Z", past_moment_id],
   )?;
@@ -3923,7 +3831,7 @@ fn run_accepted_call_request_strengthens_memory_simulation(
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, NULL, 'call_request', 'telegram', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
     "#,
     params![
       "2026-03-23T10:00:00Z",
@@ -3969,7 +3877,7 @@ fn run_declined_call_request_softens_memory_simulation(
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, NULL, 'call_request', 'telegram', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
     "#,
     params![
       "2026-03-23T10:00:00Z",
@@ -4858,7 +4766,7 @@ fn create_draft_outreach_with_kind(
       INSERT INTO outreach_events (
         created_at, saved_moment_id, outreach_kind, channel, reason_summary,
         message_text, confidence, was_delivered, delivery_metadata_json, response_state
-      ) VALUES (?1, ?2, ?3, 'telegram', ?4, ?5, ?6, 0, ?7, 'drafted')
+      ) VALUES (?1, ?2, ?3, 'north_star', ?4, ?5, ?6, 0, ?7, 'drafted')
     "#,
     params![
       Utc::now().to_rfc3339(),
@@ -5076,7 +4984,7 @@ fn rewrite_with_lm_studio(
   let preferred_closing = safe_message_closing(variation_seed);
   let alternate_closing = safe_message_closing(variation_seed + 1);
   let prompt = format!(
-    "Lightly rewrite the following Telegram draft. Keep the same meaning, keep the same facts, and stay close to the original, but allow one small natural variation in wording. Your job is to make it sound a little more human, not to explain more. Stay under 70 words. Do not add analysis, interpretation, reassurance, therapy language, or system-like wording. Do not mention system terms, model terms, memory-engine language, confidence scores, or internal/test place labels. If a place name sounds internal or synthetic, rewrite it into natural human wording instead of repeating it.\n\n{mode_guidance}\n\nPreferred style:\n- short\n- simple\n- human\n- calm\n- direct\n- presence over explanation\n\nGood examples:\n- Hey, I see you go to this place more lately. Just letting you know I'm here with you.\n- Hey, I notice this place keeps coming up for you. I'm here with you.\n- Hey, seems like this place has been showing up more lately. Just wanted you to know I'm here with you.\n- Hey, I keep seeing you come back here a bit more lately. I'm right here with you.\n- Hey, this feels like it might matter. Would it help if I call you for a moment?\n- Hey, this one feels worth pausing for. Would it help if I call you for a moment?\n\nAvoid examples like:\n- It felt more intentional than usual.\n- It seemed worth gently acknowledging.\n- No pressure to reply.\n- No need to reply.\n- I'm thinking of you.\n- I wanted to check in.\n- I didn't want to miss it either.\n- this feels heavier than usual.\n\nEnd simply. Do not keep using the exact same closing every time. For this pass, prefer a closing in the style of:\n- {preferred_closing}\nYou may also use a nearby allowed closing like:\n- {alternate_closing}\n\nAllowed closing family for regular messages:\n- I'm here with you.\n- Just letting you know I'm here with you.\n- Just wanted you to know I'm here with you.\n- I'm right here with you.\n\nReturn only one final message.\n\nMoment kind: {}\nDraft:\n{}",
+    "Lightly rewrite the following companion outreach draft. Keep the same meaning, keep the same facts, and stay close to the original, but allow one small natural variation in wording. Your job is to make it sound a little more human, not to explain more. Stay under 70 words. Do not add analysis, interpretation, reassurance, therapy language, or system-like wording. Do not mention system terms, model terms, memory-engine language, confidence scores, or internal/test place labels. If a place name sounds internal or synthetic, rewrite it into natural human wording instead of repeating it.\n\n{mode_guidance}\n\nPreferred style:\n- short\n- simple\n- human\n- calm\n- direct\n- presence over explanation\n\nGood examples:\n- Hey, I see you go to this place more lately. Just letting you know I'm here with you.\n- Hey, I notice this place keeps coming up for you. I'm here with you.\n- Hey, seems like this place has been showing up more lately. Just wanted you to know I'm here with you.\n- Hey, I keep seeing you come back here a bit more lately. I'm right here with you.\n- Hey, this feels like it might matter. Would it help if I call you for a moment?\n- Hey, this one feels worth pausing for. Would it help if I call you for a moment?\n\nAvoid examples like:\n- It felt more intentional than usual.\n- It seemed worth gently acknowledging.\n- No pressure to reply.\n- No need to reply.\n- I'm thinking of you.\n- I wanted to check in.\n- I didn't want to miss it either.\n- this feels heavier than usual.\n\nEnd simply. Do not keep using the exact same closing every time. For this pass, prefer a closing in the style of:\n- {preferred_closing}\nYou may also use a nearby allowed closing like:\n- {alternate_closing}\n\nAllowed closing family for regular messages:\n- I'm here with you.\n- Just letting you know I'm here with you.\n- Just wanted you to know I'm here with you.\n- I'm right here with you.\n\nReturn only one final message.\n\nMoment kind: {}\nDraft:\n{}",
     moment.moment_kind, structured_message
   );
 
@@ -6190,7 +6098,7 @@ mod tests {
           INSERT INTO outreach_events (
             created_at, saved_moment_id, outreach_kind, channel, reason_summary,
             message_text, confidence, was_delivered, delivery_metadata_json, response_state
-          ) VALUES (?1, NULL, 'call_request', 'telegram', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
         "#,
         params![
           "2026-03-23T10:00:00Z",
@@ -6228,7 +6136,7 @@ mod tests {
           INSERT INTO outreach_events (
             created_at, saved_moment_id, outreach_kind, channel, reason_summary,
             message_text, confidence, was_delivered, delivery_metadata_json, response_state
-          ) VALUES (?1, NULL, 'call_request', 'telegram', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
+) VALUES (?1, NULL, 'call_request', 'north_star', 'call seed', 'Would it help if I call you for a moment?', 0.91, 1, ?2, 'drafted')
         "#,
         params![
           "2026-03-23T10:00:00Z",
@@ -6460,7 +6368,7 @@ mod tests {
           INSERT INTO outreach_events (
             created_at, saved_moment_id, outreach_kind, channel, reason_summary,
             message_text, confidence, was_delivered, delivery_metadata_json, response_state
-          ) VALUES (?1, 1, 'message', 'telegram', 'seed', 'seed', 0.82, 1, '{}', 'sent')
+) VALUES (?1, 1, 'message', 'north_star', 'seed', 'seed', 0.82, 1, '{}', 'sent')
         "#,
         params!["2026-03-20T10:06:00Z"],
       )

@@ -13,13 +13,6 @@ pub struct AppSettings {
   pub call_requests_enabled: bool,
   pub call_cooldown_minutes: i64,
   pub call_confidence_threshold: f64,
-  pub telegram_bot_token: String,
-  pub telegram_default_chat_id: String,
-  pub telegram_last_update_id: i64,
-  pub telegram_user_api_id: String,
-  pub telegram_user_api_hash: String,
-  pub telegram_user_phone: String,
-  pub telegram_user_call_target: String,
   pub lm_studio_endpoint: String,
   pub lm_studio_api_key: String,
   pub lm_studio_model: String,
@@ -31,6 +24,15 @@ pub struct AppSettings {
   pub tts_default_voice: String,
   pub tts_model_path: String,
   pub tts_voices_path: String,
+  pub call_transcript_cleanup_prompt: String,
+  pub call_outbound_outreach_prompt: String,
+  pub call_inbound_main_reply_prompt: String,
+  pub call_outbound_main_reply_prompt: String,
+  pub call_inbound_streamed_reply_prompt: String,
+  pub call_outbound_streamed_reply_prompt: String,
+  pub call_inbound_explanation_prompt: String,
+  pub call_outbound_explanation_prompt: String,
+  pub call_opener_prompt: String,
   pub north_star_endpoint: String,
   pub north_star_user_handle: String,
   pub north_star_display_name: String,
@@ -52,13 +54,6 @@ impl Default for AppSettings {
       call_requests_enabled: false,
       call_cooldown_minutes: 720,
       call_confidence_threshold: 0.85,
-      telegram_bot_token: String::new(),
-      telegram_default_chat_id: String::new(),
-      telegram_last_update_id: 0,
-      telegram_user_api_id: String::new(),
-      telegram_user_api_hash: String::new(),
-      telegram_user_phone: String::new(),
-      telegram_user_call_target: String::new(),
       lm_studio_endpoint: "http://127.0.0.1:1234".into(),
       lm_studio_api_key: String::new(),
       lm_studio_model: "qwen/qwen3.5-9b".into(),
@@ -70,6 +65,15 @@ impl Default for AppSettings {
       tts_default_voice: "af_heart".into(),
       tts_model_path: String::new(),
       tts_voices_path: String::new(),
+      call_transcript_cleanup_prompt: String::new(),
+      call_outbound_outreach_prompt: String::new(),
+      call_inbound_main_reply_prompt: String::new(),
+      call_outbound_main_reply_prompt: String::new(),
+      call_inbound_streamed_reply_prompt: String::new(),
+      call_outbound_streamed_reply_prompt: String::new(),
+      call_inbound_explanation_prompt: String::new(),
+      call_outbound_explanation_prompt: String::new(),
+      call_opener_prompt: String::new(),
       north_star_endpoint: "http://127.0.0.1:3100".into(),
       north_star_user_handle: String::new(),
       north_star_display_name: String::new(),
@@ -529,64 +533,6 @@ pub struct InboundMessage {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TelegramConnectionSnapshot {
-  pub outreach_events: Vec<OutreachEvent>,
-  pub inbound_messages: Vec<InboundMessage>,
-  pub feedback_entries: Vec<OutreachFeedback>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelegramUserSnapshot {
-  pub configured: bool,
-  pub runtime_ready: bool,
-  pub runtime_detail: String,
-  pub session_path: String,
-  pub authorized: bool,
-  pub me_display: Option<String>,
-  pub phone: String,
-  pub pending_code: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelegramCallTransportSnapshot {
-  pub configured: bool,
-  pub user_authorized: bool,
-  pub runtime_ready: bool,
-  pub runtime_detail: String,
-  pub provider: String,
-  pub package_name: String,
-  pub private_calls_supported: bool,
-  pub target: String,
-  pub pending_call: bool,
-  pub pending_call_target: Option<String>,
-  pub pending_call_state: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelegramCallActionResult {
-  pub snapshot: TelegramCallTransportSnapshot,
-  pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelegramUserActionResult {
-  pub snapshot: TelegramUserSnapshot,
-  pub detail: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CompleteTelegramUserLoginInput {
-  pub code: String,
-  pub password: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
 pub struct CallSession {
   pub id: i64,
   pub created_at: String,
@@ -638,14 +584,6 @@ pub struct EndCallSessionInput {
   pub outcome: String,
   pub transcript_summary: String,
   pub notes: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct TelegramSendResult {
-  pub outreach_event: OutreachEvent,
-  pub telegram_chat_id: String,
-  pub telegram_message_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -743,14 +681,6 @@ pub struct SimulationSuiteResult {
   pub passed_count: usize,
   pub total_count: usize,
   pub summary: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct OutreachDispatchResult {
-  pub sent_count: usize,
-  pub failed_count: usize,
-  pub outreach_events: Vec<OutreachEvent>,
 }
 
 #[derive(Debug, Clone, Serialize)]

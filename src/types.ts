@@ -9,13 +9,6 @@ export type AppSettings = {
   callRequestsEnabled: boolean;
   callCooldownMinutes: number;
   callConfidenceThreshold: number;
-  telegramBotToken: string;
-  telegramDefaultChatId: string;
-  telegramLastUpdateId: number;
-  telegramUserApiId: string;
-  telegramUserApiHash: string;
-  telegramUserPhone: string;
-  telegramUserCallTarget: string;
   lmStudioEndpoint: string;
   lmStudioApiKey: string;
   lmStudioModel: string;
@@ -27,6 +20,15 @@ export type AppSettings = {
   ttsDefaultVoice: string;
   ttsModelPath: string;
   ttsVoicesPath: string;
+  callTranscriptCleanupPrompt: string;
+  callOutboundOutreachPrompt: string;
+  callInboundMainReplyPrompt: string;
+  callOutboundMainReplyPrompt: string;
+  callInboundStreamedReplyPrompt: string;
+  callOutboundStreamedReplyPrompt: string;
+  callInboundExplanationPrompt: string;
+  callOutboundExplanationPrompt: string;
+  callOpenerPrompt: string;
   northStarEndpoint: string;
   northStarUserHandle: string;
   northStarDisplayName: string;
@@ -394,64 +396,6 @@ export type OutreachEvent = {
   responseState: string;
 };
 
-export type InboundMessage = {
-  id: number;
-  createdAt: string;
-  outreachEventId: number | null;
-  telegramUpdateId: number;
-  telegramMessageId: number | null;
-  chatId: string;
-  senderId: string | null;
-  text: string;
-  receivedAt: string;
-};
-
-export type TelegramConnectionSnapshot = {
-  outreachEvents: OutreachEvent[];
-  inboundMessages: InboundMessage[];
-  feedbackEntries: OutreachFeedback[];
-};
-
-export type TelegramUserSnapshot = {
-  configured: boolean;
-  runtimeReady: boolean;
-  runtimeDetail: string;
-  sessionPath: string;
-  authorized: boolean;
-  meDisplay: string | null;
-  phone: string;
-  pendingCode: boolean;
-};
-
-export type TelegramCallTransportSnapshot = {
-  configured: boolean;
-  userAuthorized: boolean;
-  runtimeReady: boolean;
-  runtimeDetail: string;
-  provider: string;
-  packageName: string;
-  privateCallsSupported: boolean;
-  target: string;
-  pendingCall: boolean;
-  pendingCallTarget: string | null;
-  pendingCallState: string | null;
-};
-
-export type TelegramCallActionResult = {
-  snapshot: TelegramCallTransportSnapshot;
-  detail: string;
-};
-
-export type TelegramUserActionResult = {
-  snapshot: TelegramUserSnapshot;
-  detail: string;
-};
-
-export type CompleteTelegramUserLoginInput = {
-  code: string;
-  password?: string | null;
-};
-
 export type CallSession = {
   id: number;
   createdAt: string;
@@ -495,12 +439,6 @@ export type EndCallSessionInput = {
   outcome: "completed" | "interrupted" | "missed" | "declined";
   transcriptSummary: string;
   notes: string;
-};
-
-export type TelegramSendResult = {
-  outreachEvent: OutreachEvent;
-  telegramChatId: string;
-  telegramMessageId: number | null;
 };
 
 export type MomentDecision = {
@@ -578,12 +516,6 @@ export type SimulationSuiteResult = {
   passedCount: number;
   totalCount: number;
   summary: string;
-};
-
-export type OutreachDispatchResult = {
-  sentCount: number;
-  failedCount: number;
-  outreachEvents: OutreachEvent[];
 };
 
 export type OutreachFeedback = {

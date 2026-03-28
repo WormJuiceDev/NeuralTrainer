@@ -47,6 +47,15 @@ const DEFAULT_CALL_REPLY: &str = "I had a little trouble with that reply just th
 const DEFAULT_CALL_REPLY_PLAYFUL: &str = "Maybe just a croak or two.";
 const DEFAULT_CALL_REPLY_POSITIVE: &str = "That sounds really nice.";
 const DEFAULT_CALL_REPLY_MODEL_ISSUE: &str = "I had a little trouble responding just then. Can you say that again?";
+const DEFAULT_CALL_TRANSCRIPT_CLEANUP_PROMPT: &str = "You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.\n\nRecent call context:\n{session_context}\n\nRaw transcript:\n{transcript_text}\n\nReturn only the cleaned transcript.";
+const DEFAULT_CALL_OUTBOUND_OUTREACH_PROMPT: &str = "This is an outbound companion outreach call that you initiated. The user is asking why you called or what you wanted to talk about. Answer directly from the outreach purpose in the call context. Do not act like the user initiated the call. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Do not keep asking if now is a good time once the user has already engaged. Continue naturally from the moment in a warm, grounded, human way in 2 to 4 short spoken sentences.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_INBOUND_MAIN_REPLY_PROMPT: &str = "You are on a phone call that the user placed to you. The person on the other side usually does not need reflection, emotional labeling, reassurance, or guidance unless they clearly ask for it. Let the conversation flow naturally from what you already know, what has already been said, and what the other person is giving you now. Conversations like this work best when interest comes from just having the chat, not from trying to help, coach, or sound like a careful listener. Talk like a real person who is already in the conversation. Keep it natural, grounded, understated, and plainspoken. Stay close to the concrete moment and the specific thing being talked about right now. Do not drift into broad life lessons, generalized observations, tidy wisdom, philosophical commentary, or summarizing what this means in general. Do not sound like a mental encyclopedia, reflective guide, or narrator of human experience. Do not default to praise, validation, poetic phrasing, metaphors, or therapeutic language. Avoid filler like 'That's nice', 'Cool', 'Awesome', or 'Interesting' unless it truly adds value. Prefer statements over questions. The default is zero questions. Treat questions as rare and only use one when the conversation genuinely cannot move forward without asking. If a question can be replaced by a reasonable continuation, assumption, suggestion, or plain statement, do that instead. Continue from the specific thing the user just said rather than zooming out to a bigger pattern. Add something concrete, grounded, and directly related to the topic at hand. Do not turn ordinary moments into commentary about life, mood, weather, healing, growth, or patterns unless the user clearly asks for that kind of interpretation. Avoid lines like 'sometimes...', 'ever notice...', 'isn't it?', or other generalized wisdom-style phrasing. Do not keep steering with curiosity-only follow-up questions. Do not ask multiple questions, stacked questions, choice-list questions, or topic-probing questions just to keep the conversation going. Do not wrap up the moment with a takeaway, moral, neat conclusion, or summary of what it means. If the moment already landed, let it land. End simply instead of turning it into a lesson or emotional conclusion. When in doubt, make a simple statement instead of asking. Most replies should be 1 to 3 short spoken sentences, usually under 55 words. If the user asks a practical or factual question, answer it directly. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_OUTBOUND_MAIN_REPLY_PROMPT: &str = "You are on a phone call that you initiated as an outbound outreach call. Stay aware that you called for a reason, and keep that context quietly alive in the conversation. The person on the other side usually does not need reflection, emotional labeling, reassurance, or guidance unless they clearly ask for it. Let the conversation flow naturally from what you already know, what has already been said, and what the other person is giving you now. Conversations like this work best when interest comes from just having the chat, not from trying to help, coach, or sound like a careful listener. Talk like a real person who is already in the conversation. Keep it natural, grounded, understated, and plainspoken. Stay close to the concrete moment and the specific thing being talked about right now. Do not drift into broad life lessons, generalized observations, tidy wisdom, philosophical commentary, or summarizing what this means in general. Do not sound like a mental encyclopedia, reflective guide, or narrator of human experience. Do not default to praise, validation, poetic phrasing, metaphors, or therapeutic language. Avoid filler like 'That's nice', 'Cool', 'Awesome', or 'Interesting' unless it truly adds value. Prefer statements over questions. The default is zero questions. Treat questions as rare and only use one when the conversation genuinely cannot move forward without asking. If a question can be replaced by a reasonable continuation, assumption, suggestion, or plain statement, do that instead. Continue from the specific thing the user just said rather than zooming out to a bigger pattern. Add something concrete, grounded, and directly related to the topic at hand. Do not turn ordinary moments into commentary about life, mood, weather, healing, growth, or patterns unless the user clearly asks for that kind of interpretation. Avoid lines like 'sometimes...', 'ever notice...', 'isn't it?', or other generalized wisdom-style phrasing. Do not keep steering with curiosity-only follow-up questions. Do not ask multiple questions, stacked questions, choice-list questions, or topic-probing questions just to keep the conversation going. Do not wrap up the moment with a takeaway, moral, neat conclusion, or summary of what it means. If the moment already landed, let it land. End simply instead of turning it into a lesson or emotional conclusion. When in doubt, make a simple statement instead of asking. Most replies should be 1 to 3 short spoken sentences, usually under 55 words. If the user asks a practical or factual question, answer it directly. If the user asks why you are calling or what is going on, answer from that outreach purpose directly. Never pretend the user called you first. Do not keep re-asking whether it is a good time after the user has already engaged. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_INBOUND_STREAMED_REPLY_PROMPT: &str = DEFAULT_CALL_INBOUND_MAIN_REPLY_PROMPT;
+const DEFAULT_CALL_OUTBOUND_STREAMED_REPLY_PROMPT: &str = DEFAULT_CALL_OUTBOUND_MAIN_REPLY_PROMPT;
+const DEFAULT_CALL_INBOUND_EXPLANATION_PROMPT: &str = "The user is clearly asking for an explanation during a call they placed to you. Answer the question itself right away. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_OUTBOUND_EXPLANATION_PROMPT: &str = "The user is clearly asking for an explanation during a call you initiated as outbound outreach. Answer the question itself right away, while staying aware of why you called. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences. If the user asks why you called or what is going on, answer directly from the outreach purpose.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_OPENER_PROMPT: &str = "You are a warm life companion beginning a live phone call. Write only the first spoken opener. If the call context says this is outbound outreach, briefly and naturally say why you called so the user can feel your real reason for reaching out. Do not be generic. Do not say 'what's up' or act like the user called you first when this is outbound outreach. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Keep it warm, grounded, and concise, usually 1 to 3 sentences.\n\nCall context:\n{session_context}\n\nFallback purpose if needed:\n{default_fallback}\n\nReturn only the spoken opener.";
 
 pub struct VoiceWorker {
   child: Child,
@@ -684,6 +693,24 @@ pub fn synthesize_phrase(
     output_path: output_path.display().to_string(),
     audio_base64: STANDARD.encode(audio_bytes),
   })
+}
+
+pub fn synthesize_north_star_opening(
+  app_data_dir: &Path,
+  settings: &AppSettings,
+  worker_slot: &Mutex<Option<VoiceWorker>>,
+  kokoro_runtime_slot: &Mutex<Option<ManagedKokoroFastApiRuntime>>,
+  session_context: &str,
+  fallback_text: &str,
+) -> Result<VoiceSynthesisResult, AppError> {
+  let opener_text = generate_north_star_opening_text(settings, session_context, fallback_text);
+  synthesize_phrase(
+    app_data_dir,
+    settings,
+    worker_slot,
+    kokoro_runtime_slot,
+    &opener_text,
+  )
 }
 
 pub fn clear_voice_assets(
@@ -1374,8 +1401,12 @@ fn repair_call_transcript(
   }
 
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
-  let repair_prompt = format!(
-    "You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.\n\nRecent call context:\n{session_context}\n\nRaw transcript:\n{transcript_text}\n\nReturn only the cleaned transcript."
+  let repair_prompt = render_call_prompt_template(
+    &settings.call_transcript_cleanup_prompt,
+    DEFAULT_CALL_TRANSCRIPT_CLEANUP_PROMPT,
+    session_context,
+    transcript_text,
+    None,
   );
 
   request_call_reply(
@@ -1400,9 +1431,43 @@ fn generate_call_reply(
     return Ok(None);
   }
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
-  let primary_prompt = format!(
-    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. If the user asks how, why, or what something is, actually explain it instead of merely acknowledging the question. Do not stall with phrases like 'That's a great question', 'I'd love to help', or 'Sure' unless they are immediately followed by the real answer in the same reply. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
-  );
+  if is_outbound_outreach_call(session_context) && is_outreach_origin_question(transcript_text) {
+    let outreach_prompt = render_call_prompt_template(
+      &settings.call_outbound_outreach_prompt,
+      DEFAULT_CALL_OUTBOUND_OUTREACH_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    );
+    if let Some(reply) = request_call_reply(
+      settings,
+      &endpoint,
+      "You are beginning an outbound companion outreach call. State why you called in natural spoken language. No reasoning trace. No <think> tags.",
+      &outreach_prompt,
+      0.4,
+      180,
+    )? {
+      return Ok(Some(reply));
+    }
+  }
+  let outbound_call = is_outbound_outreach_call(session_context);
+  let primary_prompt = if outbound_call {
+    render_call_prompt_template(
+      &settings.call_outbound_main_reply_prompt,
+      DEFAULT_CALL_OUTBOUND_MAIN_REPLY_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    )
+  } else {
+    render_call_prompt_template(
+      &settings.call_inbound_main_reply_prompt,
+      DEFAULT_CALL_INBOUND_MAIN_REPLY_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    )
+  };
   let fallback_prompt = format!(
     "Answer this live phone-call question directly in 2 or 3 natural spoken sentences. No analysis. No tags. No hidden reasoning. Do not mention being an AI.\n\nUser asked: {transcript_text}"
   );
@@ -1413,9 +1478,23 @@ fn generate_call_reply(
     }
   }
   if wants_explanation {
-    let stricter_prompt = format!(
-      "The user is clearly asking for an explanation. Answer the question itself right away. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
-    );
+    let stricter_prompt = if outbound_call {
+      render_call_prompt_template(
+        &settings.call_outbound_explanation_prompt,
+        DEFAULT_CALL_OUTBOUND_EXPLANATION_PROMPT,
+        session_context,
+        transcript_text,
+        None,
+      )
+    } else {
+      render_call_prompt_template(
+        &settings.call_inbound_explanation_prompt,
+        DEFAULT_CALL_INBOUND_EXPLANATION_PROMPT,
+        session_context,
+        transcript_text,
+        None,
+      )
+    };
     if let Some(reply) = request_call_reply(settings, &endpoint, "You are on a live phone call. Provide the actual answer immediately. No <think> tags. No reasoning trace. No acknowledgment-only replies.", &stricter_prompt, 0.35, 220)? {
       return Ok(Some(reply));
     }
@@ -1555,10 +1634,53 @@ where
   }
 
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
-  let system_prompt = "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning. If the user asks for an explanation, give the explanation itself instead of only acknowledging the question.";
-  let user_prompt = format!(
-    "You are North Star, speaking inside a live companion phone call. Give a real spoken answer to what the user actually asked. Most replies should be 2 to 4 short spoken sentences, usually under 70 words. If the user asks a practical or factual question, answer it directly and helpfully. If the user asks how, why, or what something is, actually explain it instead of merely acknowledging the question. Do not stall with phrases like 'That's a great question', 'I'd love to help', or 'Sure' unless they are immediately followed by the real answer in the same reply. Never say you are an AI language model, text model, or that you cannot talk about normal everyday topics like cooking, music, travel, work, or hobbies. Stay warm, grounded, and useful.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply."
-  );
+  let system_prompt = "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning. Sound like a normal person, not a therapist or support script. If the user asks for an explanation, give the explanation itself instead of only acknowledging the question.";
+  if is_outbound_outreach_call(session_context) && is_outreach_origin_question(transcript_text) {
+    let opener_followup_prompt = render_call_prompt_template(
+      &settings.call_outbound_outreach_prompt,
+      DEFAULT_CALL_OUTBOUND_OUTREACH_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    );
+    if let Some(reply) = request_call_reply(
+      settings,
+      &endpoint,
+      "You are beginning an outbound companion outreach call. State why you called in natural spoken language. No reasoning trace. No <think> tags.",
+      &opener_followup_prompt,
+      0.4,
+      180,
+    )? {
+      let audio_bytes = synthesize_text_once(app_data_dir, settings, worker_slot, kokoro_runtime_slot, &reply, reply_voice)?;
+      emit_streamed_reply_audio(
+        request_id,
+        "outreach_context",
+        &reply,
+        audio_bytes,
+        settings.tts_sample_rate,
+        0,
+        emit_event,
+      )?;
+      return Ok((reply.clone(), "outreach_context".into(), vec![reply]));
+    }
+  }
+  let user_prompt = if is_outbound_outreach_call(session_context) {
+    render_call_prompt_template(
+      &settings.call_outbound_streamed_reply_prompt,
+      DEFAULT_CALL_OUTBOUND_STREAMED_REPLY_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    )
+  } else {
+    render_call_prompt_template(
+      &settings.call_inbound_streamed_reply_prompt,
+      DEFAULT_CALL_INBOUND_STREAMED_REPLY_PROMPT,
+      session_context,
+      transcript_text,
+      None,
+    )
+  };
 
   let client = Client::new();
   let response = client
@@ -1932,6 +2054,65 @@ fn strip_think_text(content: &str) -> String {
   normalized
 }
 
+fn is_outbound_outreach_call(session_context: &str) -> bool {
+  session_context
+    .to_ascii_lowercase()
+    .contains("call mode: desktop_outreach")
+}
+
+fn is_outreach_origin_question(transcript_text: &str) -> bool {
+  let lowered = transcript_text.to_ascii_lowercase();
+  (lowered.contains("why are you calling")
+    || lowered.contains("why'd you call")
+    || lowered.contains("why did you call")
+    || lowered.contains("you called me")
+    || lowered.contains("you're calling me")
+    || lowered.contains("you are calling me"))
+    || lowered.contains("what do you want to talk about")
+    || lowered.contains("what did you want to talk about")
+    || (lowered.contains("what's up") || lowered.contains("whats up") || lowered.contains("what is up"))
+}
+
+fn generate_north_star_opening_text(
+  settings: &AppSettings,
+  session_context: &str,
+  fallback_text: &str,
+) -> String {
+  let cleaned_fallback = sanitize_text(fallback_text);
+  let default_fallback = if cleaned_fallback.is_empty() {
+    "Hey, I wanted to check in with you for a minute.".to_string()
+  } else {
+    cleaned_fallback
+  };
+  if settings.lm_studio_endpoint.trim().is_empty()
+    || settings.lm_studio_model.trim().is_empty()
+    || settings.lm_studio_api_key.trim().is_empty()
+  {
+    return default_fallback;
+  }
+
+  let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
+  let opener_prompt = render_call_prompt_template(
+    &settings.call_opener_prompt,
+    DEFAULT_CALL_OPENER_PROMPT,
+    session_context,
+    "",
+    Some(default_fallback.as_str()),
+  );
+  request_call_reply(
+    settings,
+    &endpoint,
+    "You are writing the opening spoken line for a live companion phone call. Return only the opener text. No <think> tags or reasoning trace.",
+    &opener_prompt,
+    0.45,
+    120,
+  )
+  .ok()
+  .flatten()
+  .filter(|candidate| !candidate.is_empty())
+  .unwrap_or(default_fallback)
+}
+
 fn sanitize_text(text: &str) -> String {
   text
     .replace(['\r', '\n', '\t'], " ")
@@ -1940,6 +2121,27 @@ fn sanitize_text(text: &str) -> String {
     .join(" ")
     .trim()
     .to_string()
+}
+
+fn prompt_template_value<'a>(saved: &'a str, default_template: &'static str) -> &'a str {
+  if saved.trim().is_empty() {
+    default_template
+  } else {
+    saved
+  }
+}
+
+fn render_call_prompt_template(
+  saved_template: &str,
+  default_template: &'static str,
+  session_context: &str,
+  transcript_text: &str,
+  default_fallback: Option<&str>,
+) -> String {
+  prompt_template_value(saved_template, default_template)
+    .replace("{session_context}", session_context)
+    .replace("{transcript_text}", transcript_text)
+    .replace("{default_fallback}", default_fallback.unwrap_or(""))
 }
 
 fn is_usable_call_reply(text: &str) -> bool {

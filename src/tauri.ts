@@ -5,7 +5,6 @@ import type {
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
-  CompleteTelegramUserLoginInput,
   CreatePlaceInput,
   CreateReflectionInput,
   CreateRuleInput,
@@ -22,18 +21,10 @@ import type {
   NorthStarRtcIceServer,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
-  OutreachDispatchResult,
-  SubmitFeedbackInput,
   SimulationRunInput,
   SimulationRunResult,
   SimulationScenario,
   SimulationSuiteResult,
-  TelegramConnectionSnapshot,
-  TelegramCallTransportSnapshot,
-  TelegramCallActionResult,
-  TelegramSendResult,
-  TelegramUserActionResult,
-  TelegramUserSnapshot,
   SpeechStreamSnapshot,
   StartSpeechStreamInput,
   StopSpeechStreamInput,
@@ -160,6 +151,9 @@ export const synthesizeVoicePreview = () =>
 export const synthesizeNorthStarPhrase = (text: string) =>
   invoke<VoiceSynthesisResult>("synthesize_north_star_phrase", { text });
 
+export const synthesizeNorthStarOpening = (fallbackText: string) =>
+  invoke<VoiceSynthesisResult>("synthesize_north_star_opening", { fallbackText });
+
 export const getSpeechStreamSnapshot = () =>
   invoke<SpeechStreamSnapshot>("get_speech_stream_snapshot");
 
@@ -217,39 +211,6 @@ export const getPassiveContextSnapshot = () =>
 export const getPhaseThreeSnapshot = () =>
   invoke<PhaseThreeSnapshot>("get_phase_three_snapshot");
 
-export const sendTestTelegramMessage = () =>
-  invoke<TelegramSendResult>("send_test_telegram_message");
-
-export const pollTelegramUpdates = () =>
-  invoke<TelegramConnectionSnapshot>("poll_telegram_updates");
-
-export const getTelegramConnectionSnapshot = () =>
-  invoke<TelegramConnectionSnapshot>("get_telegram_connection_snapshot");
-
-export const getTelegramUserSnapshot = () =>
-  invoke<TelegramUserSnapshot>("get_telegram_user_snapshot");
-
-export const getTelegramCallTransportSnapshot = () =>
-  invoke<TelegramCallTransportSnapshot>("get_telegram_call_transport_snapshot");
-
-export const prepareTelegramUserRuntime = () =>
-  invoke<TelegramUserSnapshot>("prepare_telegram_user_runtime");
-
-export const prepareTelegramCallTransport = () =>
-  invoke<TelegramCallTransportSnapshot>("prepare_telegram_call_transport");
-
-export const startTelegramTestCall = () =>
-  invoke<TelegramCallActionResult>("start_telegram_test_call");
-
-export const sendTelegramUserLoginCode = () =>
-  invoke<TelegramUserActionResult>("send_telegram_user_login_code");
-
-export const completeTelegramUserLogin = (payload: CompleteTelegramUserLoginInput) =>
-  invoke<TelegramUserActionResult>("complete_telegram_user_login", { payload });
-
-export const logoutTelegramUser = () =>
-  invoke<TelegramUserActionResult>("logout_telegram_user");
-
 export const runMessageDecisions = () =>
   invoke<DecisionRunResult>("run_message_decisions");
 
@@ -276,9 +237,6 @@ export const runSimulationScenario = (payload: SimulationRunInput) =>
 export const runAutomatedSimulationSuite = () =>
   invoke<SimulationSuiteResult>("run_automated_simulation_suite");
 
-export const dispatchDraftedOutreach = () =>
-  invoke<OutreachDispatchResult>("dispatch_drafted_outreach");
-
 export const startCallSession = (payload: StartCallSessionInput) =>
   invoke<CallSessionSnapshot>("start_call_session", { payload });
 
@@ -287,6 +245,3 @@ export const startNorthStarAcceptedCall = () =>
 
 export const endCallSession = (payload: EndCallSessionInput) =>
   invoke<CallSessionSnapshot>("end_call_session", { payload });
-
-export const submitOutreachFeedback = (payload: SubmitFeedbackInput) =>
-  invoke<TelegramConnectionSnapshot>("submit_outreach_feedback", { payload });

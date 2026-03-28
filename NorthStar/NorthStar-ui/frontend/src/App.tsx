@@ -189,7 +189,7 @@ type StoredSession = {
 };
 
 type AppView = "chats" | "settings";
-type SettingsSection = "menu" | "account" | "desktop" | "notifications" | "location" | "diagnostics";
+type SettingsSection = "menu" | "account" | "desktop" | "audio" | "notifications" | "location" | "debug";
 
 const DEFAULT_API =
   import.meta.env.VITE_API_BASE ||
@@ -198,14 +198,36 @@ const SESSION_STORAGE_KEY = "northstar.session";
 const DEVICE_STORAGE_KEY = "northstar.deviceToken";
 const LOCATION_QUEUE_KEY = "northstar.locationQueue";
 const CALL_REVIEW_QUEUE_KEY = "northstar.pendingCallReviews";
+const AUDIO_SETTINGS_KEY = "northstar.audioSettings";
+const DEBUG_SETTINGS_KEY = "northstar.debugSettings";
 const LIVE_CHANNEL_CHUNK_SIZE = 6_000;
 const LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
 const LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
 const MOBILE_OUTBOUND_CALL_NOTE = "North Star is calling from your phone.";
 const LIVE_CALL_OPENING_TEXT = "Hi, you wanted to talk?";
-const NORTHSTAR_MOBILE_VERSION = "v50";
+const NORTHSTAR_MOBILE_VERSION = "v61";
 const MIN_SETUP_TONE_MS = 1500;
 const LIVE_TURN_DATA_CHANNEL_MAX_BASE64 = 180_000;
+
+type AudioSettings = {
+  openingGain: number;
+  replyGain: number;
+  turnEndDelaySeconds: number;
+};
+
+type DebugSettings = {
+  debugCall: boolean;
+};
+
+const defaultAudioSettings: AudioSettings = {
+  openingGain: 1,
+  replyGain: 2.3,
+  turnEndDelaySeconds: 2,
+};
+
+const defaultDebugSettings: DebugSettings = {
+  debugCall: false,
+};
 
 const CALL_STATUS_LABELS: Record<CallStatus, string> = {
   pending: "Ringing",
@@ -479,6 +501,17 @@ function callWasStartedFromPhone(call: CompanionCallSession | null) {
   return call.note.trim() === MOBILE_OUTBOUND_CALL_NOTE;
 }
 
+function getLiveOpeningText(call: CompanionCallSession | null) {
+  if (!call) {
+    return LIVE_CALL_OPENING_TEXT;
+  }
+  if (callWasStartedFromPhone(call)) {
+    return LIVE_CALL_OPENING_TEXT;
+  }
+  const trimmedNote = call.note.trim();
+  return trimmedNote.length > 0 ? trimmedNote : "Hey, I wanted to check in with you for a minute.";
+}
+
 function getLiveCallStatusCopy(
   liveConversationPhase: LiveConversationPhase,
   callLoopMuted: boolean,
@@ -720,6 +753,7 @@ function App() {
   const [pendingCallReviews, setPendingCallReviews] = useState<PendingCallReviewRecord[]>([]);
   const [callTurns, setCallTurns] = useState<CompanionCallTurn[]>([]);
   const [selectedCallId, setSelectedCallId] = useState("");
+  const [postCallReviewCallId, setPostCallReviewCallId] = useState("");
   const [pushCapability, setPushCapability] = useState<PushCapability>({
     notificationSupported: false,
     serviceWorkerSupported: false,
@@ -741,6 +775,8 @@ function App() {
   const [callLoopMuted, setCallLoopMuted] = useState(false);
   const [liveConversationPhase, setLiveConversationPhase] = useState<LiveConversationPhase>("idle");
   const [liveReplyAudioSrc, setLiveReplyAudioSrc] = useState<string | null>(null);
+  const [audioSettings, setAudioSettings] = useState<AudioSettings>(defaultAudioSettings);
+  const [debugSettings, setDebugSettings] = useState<DebugSettings>(defaultDebugSettings);
   const [message, setMessage] = useState("North Star is ready to keep you and NeuralTrainer in sync.");
 
   const watchIdRef = useRef<number | null>(null);
@@ -752,12 +788,17 @@ function App() {
   const callTurnSinkRef = useRef<GainNode | null>(null);
   const threadViewportRef = useRef<HTMLDivElement | null>(null);
   const liveReplyAudioRef = useRef<HTMLAudioElement | null>(null);
+  const liveReplyAudioContextRef = useRef<AudioContext | null>(null);
+  const liveReplyAudioSourceRef = useRef<MediaElementAudioSourceNode | null>(null);
+  const liveReplyAudioGainRef = useRef<GainNode | null>(null);
   const lastPlayedReplyTurnIdRef = useRef<string | null>(null);
+  const previousAcceptedCallIdRef = useRef<string | null>(null);
   const handsFreeCallIdRef = useRef<string | null>(null);
   const pendingRecordingStartCallIdRef = useRef<string | null>(null);
   const recordingTurnActiveRef = useRef(false);
   const speechDetectedRef = useRef(false);
   const silenceFrameCountRef = useRef(0);
+  const silenceDurationMsRef = useRef(0);
   const speechFrameCountRef = useRef(0);
   const sendingTurnRef = useRef(false);
   const liveStreamingTurnRequestIdRef = useRef<string | null>(null);
@@ -817,12 +858,78 @@ function App() {
   }
 
   function teardownLiveRemoteAudioBoost() {
-    liveRemoteAudioSourceRef.current?.disconnect();
-    liveRemoteAudioGainRef.current?.disconnect();
-    liveRemoteAudioContextRef.current?.close().catch(() => undefined);
-    liveRemoteAudioSourceRef.current = null;
-    liveRemoteAudioGainRef.current = null;
-    liveRemoteAudioContextRef.current = null;
+    const audio = liveRemoteAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.srcObject = null;
+    }
+    const context = liveRemoteAudioContextRef.current;
+    if (context && context.state === "running") {
+      void context.suspend().catch(() => undefined);
+    }
+  }
+
+  function currentReplyPlaybackGain() {
+    return liveConversationPhase === "waiting_for_opening_audio"
+      ? audioSettings.openingGain
+      : audioSettings.replyGain;
+  }
+
+  function teardownLiveReplyAudioBoost() {
+    const audio = liveReplyAudioRef.current;
+    if (audio) {
+      audio.pause();
+      audio.currentTime = 0;
+      audio.removeAttribute("src");
+      audio.load();
+    }
+    const context = liveReplyAudioContextRef.current;
+    if (context && context.state === "running") {
+      void context.suspend().catch(() => undefined);
+    }
+  }
+
+  function failOpenIntoListening(message: string) {
+    if (!activeAcceptedCall) {
+      return;
+    }
+    completeLiveOpening(activeAcceptedCall.call_id, { message });
+    if (callLoopMuted) {
+      setCallLoopState("idle");
+      setLiveConversationPhase("idle");
+      return;
+    }
+    setCallLoopState("listening");
+    setLiveConversationPhase("ready_for_user");
+    if (!recordingTurn) {
+      void resumeLiveHandsFreeListening(activeAcceptedCall);
+    }
+  }
+
+  async function ensureLiveReplyAudioBoost() {
+    const audio = liveReplyAudioRef.current;
+    if (!audio) {
+      return;
+    }
+    audio.volume = 1;
+    let context = liveReplyAudioContextRef.current;
+    if (!context) {
+      context = new AudioContext();
+      const source = context.createMediaElementSource(audio);
+      const gain = context.createGain();
+      gain.gain.value = currentReplyPlaybackGain();
+      source.connect(gain);
+      gain.connect(context.destination);
+      liveReplyAudioContextRef.current = context;
+      liveReplyAudioSourceRef.current = source;
+      liveReplyAudioGainRef.current = gain;
+    } else if (liveReplyAudioGainRef.current) {
+      liveReplyAudioGainRef.current.gain.value = currentReplyPlaybackGain();
+    }
+    if (context.state === "suspended") {
+      await context.resume().catch(() => undefined);
+    }
   }
 
   async function ensureLiveRemoteAudioBoost() {
@@ -836,14 +943,14 @@ function App() {
       context = new AudioContext();
       const source = context.createMediaElementSource(audio);
       const gain = context.createGain();
-      gain.gain.value = 2.3;
+      gain.gain.value = audioSettings.replyGain;
       source.connect(gain);
       gain.connect(context.destination);
       liveRemoteAudioContextRef.current = context;
       liveRemoteAudioSourceRef.current = source;
       liveRemoteAudioGainRef.current = gain;
     } else if (liveRemoteAudioGainRef.current) {
-      liveRemoteAudioGainRef.current.gain.value = 2.3;
+      liveRemoteAudioGainRef.current.gain.value = audioSettings.replyGain;
     }
     if (context.state === "suspended") {
       await context.resume().catch(() => undefined);
@@ -1095,11 +1202,61 @@ function App() {
         localStorage.removeItem(LOCATION_QUEUE_KEY);
       }
     }
+
+    const storedAudioSettings = localStorage.getItem(AUDIO_SETTINGS_KEY);
+    if (storedAudioSettings) {
+      try {
+        const parsed = JSON.parse(storedAudioSettings) as Partial<AudioSettings>;
+        setAudioSettings({
+          openingGain:
+            typeof parsed.openingGain === "number" && Number.isFinite(parsed.openingGain)
+              ? parsed.openingGain
+              : defaultAudioSettings.openingGain,
+          replyGain:
+            typeof parsed.replyGain === "number" && Number.isFinite(parsed.replyGain)
+              ? parsed.replyGain
+              : defaultAudioSettings.replyGain,
+          turnEndDelaySeconds:
+            typeof parsed.turnEndDelaySeconds === "number" && Number.isFinite(parsed.turnEndDelaySeconds)
+              ? parsed.turnEndDelaySeconds
+              : defaultAudioSettings.turnEndDelaySeconds,
+        });
+      } catch {
+        localStorage.removeItem(AUDIO_SETTINGS_KEY);
+      }
+    }
+
+    const storedDebugSettings = localStorage.getItem(DEBUG_SETTINGS_KEY);
+    if (storedDebugSettings) {
+      try {
+        const parsed = JSON.parse(storedDebugSettings) as Partial<DebugSettings>;
+        setDebugSettings({
+          debugCall: typeof parsed.debugCall === "boolean" ? parsed.debugCall : defaultDebugSettings.debugCall,
+        });
+      } catch {
+        localStorage.removeItem(DEBUG_SETTINGS_KEY);
+      }
+    }
   }, []);
 
   useEffect(() => {
     localStorage.setItem(LOCATION_QUEUE_KEY, JSON.stringify(locationQueue));
   }, [locationQueue]);
+
+  useEffect(() => {
+    localStorage.setItem(AUDIO_SETTINGS_KEY, JSON.stringify(audioSettings));
+  }, [audioSettings]);
+
+  useEffect(() => {
+    localStorage.setItem(DEBUG_SETTINGS_KEY, JSON.stringify(debugSettings));
+  }, [debugSettings]);
+
+  useEffect(() => {
+    void ensureLiveReplyAudioBoost().catch(() => undefined);
+    if (liveRemoteAudioGainRef.current) {
+      liveRemoteAudioGainRef.current.gain.value = audioSettings.replyGain;
+    }
+  }, [audioSettings, liveConversationPhase, liveReplyAudioSrc]);
 
   useEffect(() => {
     if (!sessionToken) return;
@@ -1301,6 +1458,7 @@ function App() {
     if (liveRemoteAudioRef.current) {
       liveRemoteAudioRef.current.srcObject = null;
     }
+    teardownLiveReplyAudioBoost();
     teardownLiveRemoteAudioBoost();
     livePeerInputStreamRef.current?.getTracks().forEach((track) => track.stop());
     teardownLiveInputMeter();
@@ -2338,6 +2496,7 @@ function App() {
       draft,
       ...current.filter((review) => review.call_id !== callId),
     ]);
+    setPostCallReviewCallId("");
     if (options?.collapse !== false) {
       setSelectedCallId("");
     }
@@ -2365,7 +2524,14 @@ function App() {
       setMessage("Call is connecting.");
       setLiveConversationPhase("connecting_transport");
     } else if (action === "end") {
-      setSelectedCallId("");
+      const endingCall = callSessions.find((call) => call.call_id === callId) ?? null;
+      if (endingCall && !callWasStartedFromPhone(endingCall)) {
+        setPostCallReviewCallId(callId);
+        setSelectedCallId(callId);
+      } else {
+        setPostCallReviewCallId("");
+        setSelectedCallId("");
+      }
       setMessage("Call ended.");
       setLiveConversationPhase("idle");
     } else {
@@ -2590,6 +2756,7 @@ function App() {
   function resetHandsFreeDetection() {
     speechDetectedRef.current = false;
     silenceFrameCountRef.current = 0;
+    silenceDurationMsRef.current = 0;
     speechFrameCountRef.current = 0;
     callTurnAudioChunksRef.current = [];
   }
@@ -2639,10 +2806,13 @@ function App() {
         }
         const rms = Math.sqrt(sum / chunk.length);
         const speaking = rms > 0.01;
+        const chunkDurationMs = (chunk.length / sampleRate) * 1000;
+        const requiredSilenceMs = Math.max(250, audioSettings.turnEndDelaySeconds * 1000);
 
         if (speaking) {
           speechDetectedRef.current = true;
           silenceFrameCountRef.current = 0;
+          silenceDurationMsRef.current = 0;
           speechFrameCountRef.current += 1;
           if (liveChannel) {
             void sendLiveSpeechFrame(liveChannel, targetCall.call_id, chunk, sampleRate).catch(() => undefined);
@@ -2652,7 +2822,8 @@ function App() {
             void sendLiveSpeechFrame(liveChannel, targetCall.call_id, chunk, sampleRate).catch(() => undefined);
           }
           silenceFrameCountRef.current += 1;
-          if (speechFrameCountRef.current >= 3 && silenceFrameCountRef.current >= 10) {
+          silenceDurationMsRef.current += chunkDurationMs;
+          if (speechFrameCountRef.current >= 3 && silenceDurationMsRef.current >= requiredSilenceMs) {
             void stopAndSendRemoteTurn(targetCall, { handsFree: true });
           }
         }
@@ -2817,7 +2988,7 @@ function App() {
           createdAt: entry.created_at,
           message: entry,
         })),
-        ...callSessions.map((call) => ({
+        ...callSessions.filter((call) => call.status === "pending").map((call) => ({
           kind: "call" as const,
           id: call.call_id,
           createdAt: call.requested_at,
@@ -2839,7 +3010,11 @@ function App() {
   const incomingCall =
     callSessions.find((call) => call.status === "pending") ??
     null;
-  const callOverlayCall = activeAcceptedCall ?? incomingCall;
+  const postCallReviewCall =
+    (postCallReviewCallId
+      ? callSessions.find((call) => call.call_id === postCallReviewCallId && call.status === "ended") ?? null
+      : null);
+  const callOverlayCall = activeAcceptedCall ?? incomingCall ?? postCallReviewCall;
   const latestReplyTurn =
     [...selectedCallTurns]
       .reverse()
@@ -2868,8 +3043,7 @@ function App() {
       && !livePathReady
       && !liveFallbackAllowed,
     );
-  const shouldAutoOpenLiveCall =
-    Boolean(activeAcceptedCall && (outboundCallIdsRef.current.has(activeAcceptedCall.call_id) || callWasStartedFromPhone(activeAcceptedCall)));
+  const shouldAutoOpenLiveCall = Boolean(activeAcceptedCall);
   const liveOpeningStarted =
     Boolean(activeAcceptedCall && liveOpeningStartedCallIdRef.current === activeAcceptedCall.call_id);
   const liveConversationReadyTarget =
@@ -2939,9 +3113,10 @@ function App() {
   const settingsMenuItems: Array<{ section: SettingsSection; label: string; helper: string }> = [
     { section: "account", label: "Account", helper: "Identity and API" },
     { section: "desktop", label: "Desktop", helper: "Linked machine" },
+    { section: "audio", label: "Audio", helper: "Opening and reply loudness" },
     { section: "notifications", label: "Notifications", helper: "Push wake-ups" },
     { section: "location", label: "Location", helper: "Shared context" },
-    { section: "diagnostics", label: "Diagnostics", helper: "Hidden details" },
+    { section: "debug", label: "Debug", helper: "Call diagnostics and hidden details" },
   ];
   const currentSettingsMeta = settingsMenuItems.find((item) => item.section === settingsSection) ?? null;
   const topBarTitle =
@@ -2952,7 +3127,7 @@ function App() {
         : currentSettingsMeta?.label ?? "Settings";
   const topBarSubtitle =
     view === "chats"
-      ? (activeCallCount > 0 ? `${activeCallCount} call active` : (pushReady ? "Secure companion chat" : "Chat ready, push still syncing"))
+      ? (activeCallCount > 0 ? `${activeCallCount} call active` : (pushReady ? "Companion chat" : "Chat ready, push still syncing"))
       : settingsSection === "menu"
         ? "Companion preferences"
         : currentSettingsMeta?.helper ?? "Companion preferences";
@@ -3062,6 +3237,35 @@ function App() {
     if (!callOverlayCall || selectedCallId === callOverlayCall.call_id) return;
     setSelectedCallId(callOverlayCall.call_id);
   }, [callOverlayCall?.call_id, selectedCallId]);
+
+  useEffect(() => {
+    if (activeAcceptedCall?.call_id) {
+      previousAcceptedCallIdRef.current = activeAcceptedCall.call_id;
+      return;
+    }
+    const previousAcceptedCallId = previousAcceptedCallIdRef.current;
+    if (!previousAcceptedCallId) {
+      return;
+    }
+    const endedCall = callSessions.find((call) => call.call_id === previousAcceptedCallId) ?? null;
+    const alreadyReviewed = effectiveCallReviews.some((review) => review.call_id === previousAcceptedCallId);
+    if (endedCall?.status === "ended" && !alreadyReviewed && !callWasStartedFromPhone(endedCall)) {
+      setPostCallReviewCallId(previousAcceptedCallId);
+      setSelectedCallId(previousAcceptedCallId);
+    }
+    previousAcceptedCallIdRef.current = null;
+  }, [activeAcceptedCall?.call_id, callSessions, effectiveCallReviews]);
+
+  useEffect(() => {
+    if (!postCallReviewCallId) {
+      return;
+    }
+    const trackedCall = callSessions.find((call) => call.call_id === postCallReviewCallId) ?? null;
+    const alreadyReviewed = effectiveCallReviews.some((review) => review.call_id === postCallReviewCallId);
+    if (!trackedCall || trackedCall.status !== "ended" || alreadyReviewed || callWasStartedFromPhone(trackedCall)) {
+      setPostCallReviewCallId("");
+    }
+  }, [postCallReviewCallId, callSessions, effectiveCallReviews]);
 
   useEffect(() => {
     if (shouldPlaySetupTone) {
@@ -3218,7 +3422,7 @@ function App() {
     void sendLiveChannelJson(liveDataChannelRef.current, {
       type: "live_opening_request",
       openerId: activeAcceptedCall.call_id,
-      text: LIVE_CALL_OPENING_TEXT,
+      text: getLiveOpeningText(activeAcceptedCall),
     }).catch(() => {
       if (liveOpeningRequestedCallIdRef.current === activeAcceptedCall.call_id) {
         liveOpeningRequestedCallIdRef.current = null;
@@ -3292,7 +3496,13 @@ function App() {
   useEffect(() => {
     if (!liveReplyAudioSrc || !liveReplyAudioRef.current) return;
     liveReplyAudioRef.current.currentTime = 0;
-    void liveReplyAudioRef.current.play().catch(() => undefined);
+    void ensureLiveReplyAudioBoost()
+      .then(() => liveReplyAudioRef.current?.play())
+      .catch(() => {
+        if (activeAcceptedCall && liveOpeningStartedCallIdRef.current === activeAcceptedCall.call_id) {
+          failOpenIntoListening("NeuralTrainer joined the line. Speak naturally while the opener catches up.");
+        }
+      });
   }, [liveReplyAudioSrc]);
 
   useEffect(() => {
@@ -3353,11 +3563,6 @@ function App() {
 
               const call = entry.call;
               const review = effectiveCallReviews.find((item) => item.call_id === call.call_id) ?? null;
-              const callTurnsForEntry = selectedCallId === call.call_id ? selectedCallTurns : [];
-              const canOpenCallCard =
-                call.status === "pending" ||
-                call.status === "accepted" ||
-                ((call.status === "ended" || call.status === "missed") && !review);
               return (
                 <article key={entry.id} className={`chat-call-card chat-call-card--${call.status}`}>
                   <div className="chat-call-card-header">
@@ -3365,13 +3570,8 @@ function App() {
                       <strong>{call.desktop_name}</strong>
                       <span>{CALL_STATUS_LABELS[call.status]} · {formatTime(call.requested_at)}</span>
                     </div>
-                    {canOpenCallCard ? (
-                      <button className="ghost-button" onClick={() => setSelectedCallId(call.call_id)}>
-                        Open
-                      </button>
-                    ) : null}
                   </div>
-                  {call.status === "pending" || call.status === "accepted" ? (
+                  {call.status === "pending" ? (
                     <p>{call.note || "NeuralTrainer is reaching out through North Star."}</p>
                   ) : null}
 
@@ -3383,55 +3583,9 @@ function App() {
                     </div>
                   ) : null}
 
-                  {call.status === "accepted" && selectedCallId === call.call_id ? (
-                    <div className="inline-call-live">
-                      <p className="helper-copy">
-                        Stay in chat while talking. Record a turn and North Star will bring the reply back here.
-                      </p>
-                      <div className="call-actions">
-                        {recordingTurn ? (
-                          <button onClick={() => void stopAndSendRemoteTurn(call)}>Send spoken turn</button>
-                        ) : (
-                          <button onClick={() => void startRemoteTurnRecording(call)}>Record spoken turn</button>
-                        )}
-                        <button className="secondary" onClick={() => void respondToCall(call.call_id, "end")}>End call</button>
-                      </div>
-                      {callTurnsForEntry.length > 0 ? (
-                        <div className="inline-turn-stack">
-                          {callTurnsForEntry.slice(-2).map((turn) => {
-                            const audioSrc = replyAudioUrl(turn.reply_audio_base64);
-                            return (
-                              <div key={turn.turn_id} className="inline-turn-card">
-                                <strong>{turn.source === "mobile" ? "You" : "NeuralTrainer"}</strong>
-                                <p>{turn.reply_text || turn.transcript_text || "Waiting for the next part of the call."}</p>
-                                {audioSrc ? <audio controls src={audioSrc} /> : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      ) : null}
-                    </div>
-                  ) : null}
-
-                  {(call.status === "ended" || call.status === "declined" || call.status === "missed") ? (
+                  {review && (call.status === "declined" || call.status === "missed") ? (
                     <div className="chat-call-footer">
-                      <span>
-                        {call.status === "declined"
-                          ? "Declined"
-                          : call.status === "missed"
-                            ? "Call missed"
-                          : review
-                            ? "Call ended"
-                            : "How did that call feel?"}
-                      </span>
-                      {selectedCallId === call.call_id && !review && call.status !== "declined" ? (
-                        <div className="review-choices review-choices--inline">
-                          <button onClick={() => submitCallReview(call.call_id, "helpful")}>Helpful</button>
-                          <button onClick={() => submitCallReview(call.call_id, "welcome")}>Welcome</button>
-                          <button onClick={() => submitCallReview(call.call_id, "mistimed")}>Mistimed</button>
-                          <button onClick={() => submitCallReview(call.call_id, "intrusive")}>Intrusive</button>
-                        </div>
-                      ) : null}
+                      <span>{call.status === "declined" ? "Declined" : "Call missed"}</span>
                     </div>
                   ) : null}
                 </article>
@@ -3531,6 +3685,68 @@ function App() {
         </div>
       </section>
     );
+  } else if (settingsSection === "audio") {
+    settingsContent = (
+      <section className="settings-page">
+        <p className="helper-copy">Adjust the phone-side playback and turn timing. Opening speech and reply speech can be tuned separately, and the live turn end delay controls how long North Star waits after you stop speaking.</p>
+        <label className="field">
+          <span>Opening speech gain</span>
+          <input
+            type="number"
+            min={0}
+            max={4}
+            step={0.05}
+            value={audioSettings.openingGain}
+            onChange={(event) => setAudioSettings((current) => ({
+              ...current,
+              openingGain: Number(event.target.value) || 0,
+            }))}
+          />
+        </label>
+        <label className="field">
+          <span>Reply speech gain</span>
+          <input
+            type="number"
+            min={0}
+            max={4}
+            step={0.05}
+            value={audioSettings.replyGain}
+            onChange={(event) => setAudioSettings((current) => ({
+              ...current,
+              replyGain: Number(event.target.value) || 0,
+            }))}
+          />
+        </label>
+        <label className="field">
+          <span>Turn end delay</span>
+          <input
+            type="number"
+            min={0.25}
+            max={6}
+            step={0.25}
+            value={audioSettings.turnEndDelaySeconds}
+            onChange={(event) => setAudioSettings((current) => ({
+              ...current,
+              turnEndDelaySeconds: Number(event.target.value) || 0,
+            }))}
+          />
+        </label>
+        <div className="settings-facts settings-facts--single">
+          <div>
+            <dt>Opening gain</dt>
+            <dd>{audioSettings.openingGain.toFixed(2)}x</dd>
+          </div>
+          <div>
+            <dt>Reply gain</dt>
+            <dd>{audioSettings.replyGain.toFixed(2)}x</dd>
+          </div>
+          <div>
+            <dt>Turn end delay</dt>
+            <dd>{audioSettings.turnEndDelaySeconds.toFixed(2)}s</dd>
+          </div>
+        </div>
+      </section>
+    );
   } else if (settingsSection === "notifications") {
     settingsContent = (
       <section className="settings-page">
@@ -3586,6 +3802,20 @@ function App() {
   } else {
     settingsContent = (
       <section className="settings-page settings-page--diagnostics">
+        <label className="toggle-field">
+          <div>
+            <strong>Debug call</strong>
+            <p className="helper-copy">Show the live call diagnostics overlay during active calls.</p>
+          </div>
+          <input
+            type="checkbox"
+            checked={debugSettings.debugCall}
+            onChange={(event) => setDebugSettings((current) => ({
+              ...current,
+              debugCall: event.target.checked,
+            }))}
+          />
+        </label>
         <div className="diagnostic-block">
           <h4>Recent activity</h4>
           <ul className="mini-list">
@@ -3636,10 +3866,16 @@ function App() {
               ? "Incoming call"
               : callOverlayCall.status === "accepted"
                 ? liveCallStatus.headline
+                : callOverlayCall.status === "ended"
+                  ? "How did that call feel?"
                 : CALL_STATUS_LABELS[callOverlayCall.status]}
           </p>
           <p className="call-overlay-note">
-            {callOverlayCall.status === "accepted" ? liveCallStatus.detail : callOverlayCall.note || "NeuralTrainer is calling you now."}
+            {callOverlayCall.status === "accepted"
+              ? liveCallStatus.detail
+              : callOverlayCall.status === "ended"
+                ? "Give North Star a quick sense of how that call landed, then you will return to chat."
+                  : callOverlayCall.note || "NeuralTrainer is calling you now."}
           </p>
         </div>
 
@@ -3661,81 +3897,83 @@ function App() {
                 <strong>North Star</strong>
                 <p>{liveCallStatus.headline}</p>
               </article>
-              <div className="call-live-diagnostics-grid">
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Call path</strong>
-                  <p>{livePathLabel}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Phase</strong>
-                  <p>{formatStatus(liveCallDiagnostics.phase)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Peer</strong>
-                  <p>{formatStatus(liveCallDiagnostics.connectionState)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>ICE</strong>
-                  <p>{formatStatus(liveCallDiagnostics.iceConnectionState)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Signal</strong>
-                  <p>{formatStatus(liveCallDiagnostics.lastSignal)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Channel</strong>
-                  <p>{formatStatus(liveCallDiagnostics.dataChannelState)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Remote audio</strong>
-                  <p>{formatStatus(liveCallDiagnostics.remoteTrackState)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>ICE candidates</strong>
-                  <p>{liveCallDiagnostics.localIceCandidates} out / {liveCallDiagnostics.remoteIceCandidates} in</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>ICE policy</strong>
-                  <p>{formatStatus(liveCallDiagnostics.icePolicy)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>ICE servers</strong>
-                  <p>{liveCallDiagnostics.iceServerKinds}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Candidate kinds</strong>
-                  <p>{liveCallDiagnostics.localCandidateKinds} / {liveCallDiagnostics.remoteCandidateKinds}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Phone mic</strong>
-                  <p>{liveInputMeter.speaking ? "Speech detected" : "Waiting for voice"}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Mic track</strong>
-                  <p>{liveInputMeter.trackEnabled ? "enabled" : "disabled"} / {liveInputMeter.trackMuted ? "muted" : "live"} / {liveInputMeter.trackReadyState}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Mic level</strong>
-                  <p>rms {liveInputMeter.rms.toFixed(4)} / peak {liveInputMeter.peak.toFixed(4)}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Live turns sent</strong>
-                  <p>{liveTurnTransportStats.liveTurnsSent} turns / {liveTurnTransportStats.liveTurnChunksSent} chunks</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Last turn id</strong>
-                  <p>{liveTurnTransportStats.lastLiveTurnRequestId}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Conversation ready</strong>
-                  <p>{liveConversationReadyFlag ? "yes" : "no"}</p>
-                </article>
-                <article className="call-live-chip call-live-chip--trainer">
-                  <strong>Opening audio</strong>
-                  <p>{openingAudioStatus}</p>
-                </article>
-              </div>
-              {liveCallDiagnostics.issue ? (
+              {debugSettings.debugCall ? (
+                <div className="call-live-diagnostics-grid">
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Call path</strong>
+                    <p>{livePathLabel}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Phase</strong>
+                    <p>{formatStatus(liveCallDiagnostics.phase)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Peer</strong>
+                    <p>{formatStatus(liveCallDiagnostics.connectionState)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>ICE</strong>
+                    <p>{formatStatus(liveCallDiagnostics.iceConnectionState)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Signal</strong>
+                    <p>{formatStatus(liveCallDiagnostics.lastSignal)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Channel</strong>
+                    <p>{formatStatus(liveCallDiagnostics.dataChannelState)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Remote audio</strong>
+                    <p>{formatStatus(liveCallDiagnostics.remoteTrackState)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>ICE candidates</strong>
+                    <p>{liveCallDiagnostics.localIceCandidates} out / {liveCallDiagnostics.remoteIceCandidates} in</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>ICE policy</strong>
+                    <p>{formatStatus(liveCallDiagnostics.icePolicy)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>ICE servers</strong>
+                    <p>{liveCallDiagnostics.iceServerKinds}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Candidate kinds</strong>
+                    <p>{liveCallDiagnostics.localCandidateKinds} / {liveCallDiagnostics.remoteCandidateKinds}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Phone mic</strong>
+                    <p>{liveInputMeter.speaking ? "Speech detected" : "Waiting for voice"}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Mic track</strong>
+                    <p>{liveInputMeter.trackEnabled ? "enabled" : "disabled"} / {liveInputMeter.trackMuted ? "muted" : "live"} / {liveInputMeter.trackReadyState}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Mic level</strong>
+                    <p>rms {liveInputMeter.rms.toFixed(4)} / peak {liveInputMeter.peak.toFixed(4)}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Live turns sent</strong>
+                    <p>{liveTurnTransportStats.liveTurnsSent} turns / {liveTurnTransportStats.liveTurnChunksSent} chunks</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Last turn id</strong>
+                    <p>{liveTurnTransportStats.lastLiveTurnRequestId}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Conversation ready</strong>
+                    <p>{liveConversationReadyFlag ? "yes" : "no"}</p>
+                  </article>
+                  <article className="call-live-chip call-live-chip--trainer">
+                    <strong>Opening audio</strong>
+                    <p>{openingAudioStatus}</p>
+                  </article>
+                </div>
+              ) : null}
+              {debugSettings.debugCall && liveCallDiagnostics.issue ? (
                 <div className="empty-state compact">
                   <h3>Live call issue</h3>
                   <p>{liveCallDiagnostics.issue}</p>
@@ -3757,6 +3995,20 @@ function App() {
             </div>
           </>
         ) : null}
+        {callOverlayCall.status === "ended" ? (
+          <div className="call-live-feed call-live-feed--review">
+            <div className="empty-state compact">
+              <h3>Quick check-in</h3>
+              <p>How did that finished call feel?</p>
+            </div>
+            <div className="review-choices review-choices--overlay">
+              <button onClick={() => submitCallReview(callOverlayCall.call_id, "helpful")}>Helpful</button>
+              <button onClick={() => submitCallReview(callOverlayCall.call_id, "welcome")}>Welcome</button>
+              <button onClick={() => submitCallReview(callOverlayCall.call_id, "mistimed")}>Mistimed</button>
+              <button onClick={() => submitCallReview(callOverlayCall.call_id, "intrusive")}>Intrusive</button>
+            </div>
+          </div>
+        ) : null}
       </div>
     </section>
   ) : null;
@@ -3765,43 +4017,47 @@ function App() {
     <main className="northstar-app">
       <div className="app-frame">
         <header className="topbar">
-          <div className="topbar-leading">
-            {view === "settings" && settingsSection !== "menu" ? (
-              <button className="icon-button" onClick={() => setSettingsSection("menu")} aria-label="Back to settings menu">
-                Back
-              </button>
-            ) : (
-              <div className="avatar-badge topbar-avatar">{(displayName || "N").slice(0, 1).toUpperCase()}</div>
-            )}
-            <div className="topbar-copy">
-              <strong>{topBarTitle}</strong>
-              <span>{topBarSubtitle}</span>
-            </div>
+          <div className="topbar-title-row">
+            <strong className="topbar-title">{topBarTitle}</strong>
           </div>
+          <div className="topbar-main-row">
+            <div className="topbar-leading">
+              {view === "settings" && settingsSection !== "menu" ? (
+                <button className="icon-button" onClick={() => setSettingsSection("menu")} aria-label="Back to settings menu">
+                  Back
+                </button>
+              ) : (
+                <div className="avatar-badge topbar-avatar">{(displayName || "N").slice(0, 1).toUpperCase()}</div>
+              )}
+              <div className="topbar-copy">
+                <span>{topBarSubtitle}</span>
+              </div>
+            </div>
 
-          <div className="topbar-actions">
-            {view === "chats" ? (
+            <div className="topbar-actions">
+              {view === "chats" ? (
+                <button
+                  className="icon-button"
+                  onClick={() => void startCallFromPhone()}
+                  aria-label="Call NeuralTrainer"
+                  disabled={!desktopReady || activeCallCount > 0}
+                  title={!desktopReady ? "Link your desktop first" : activeCallCount > 0 ? "A call is already active" : "Call NeuralTrainer"}
+                >
+                  <PhoneIcon kind="accept" />
+                </button>
+              ) : null}
+              <button className="icon-button" onClick={() => void refreshAll()}>Refresh</button>
               <button
-                className="icon-button"
-                onClick={() => void startCallFromPhone()}
-                aria-label="Call NeuralTrainer"
-                disabled={!desktopReady || activeCallCount > 0}
-                title={!desktopReady ? "Link your desktop first" : activeCallCount > 0 ? "A call is already active" : "Call NeuralTrainer"}
+                className="icon-button menu-button"
+                onClick={() => setMenuOpen((current) => !current)}
+                aria-label="Open menu"
+                aria-expanded={menuOpen}
               >
-                <PhoneIcon kind="accept" />
+                <span />
+                <span />
+                <span />
               </button>
-            ) : null}
-            <button className="icon-button" onClick={() => void refreshAll()}>Refresh</button>
-            <button
-              className="icon-button menu-button"
-              onClick={() => setMenuOpen((current) => !current)}
-              aria-label="Open menu"
-              aria-expanded={menuOpen}
-            >
-              <span />
-              <span />
-              <span />
-            </button>
+            </div>
           </div>
 
           {menuOpen ? (
