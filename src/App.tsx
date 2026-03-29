@@ -1,4 +1,4 @@
-import { FormEvent, memo, startTransition, useEffect, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import { FormEvent, memo, startTransition, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import {
   BriefcaseBusiness,
   Compass,
@@ -34,6 +34,7 @@ import {
   getDiagnostics,
   getCallSessionSnapshot,
   getMemoryGrowthSnapshot,
+  getMemorySystemSnapshot,
   getMvpRealityCheckSnapshot,
   getNorthStarRuntimeSnapshot,
   getNorthStarSnapshot,
@@ -55,6 +56,8 @@ import {
   prepareKokoroRuntime,
   resetRuntimeData,
   runCallRequestDecisions,
+  runContextMemoryPass,
+  seedContextMemoryExample,
   runMemoryGrowthPass,
   runMessageDecisions,
   runAutomatedSimulationSuite,
@@ -103,6 +106,7 @@ import type {
   LocationEventInput,
   MemoryItem,
   MemoryGrowthSnapshot,
+  MemorySystemSnapshot,
   PassiveContextSnapshot,
   PhaseOneSnapshot,
   PhaseThreeSnapshot,
@@ -127,10 +131,11 @@ import type {
   VoiceSynthesisResult,
 } from "./types";
 
-type TabId = "home" | "context" | "settings";
+type TabId = "home" | "context" | "tectonics" | "settings";
 type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
-type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth";
+type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
 type ContextSectionId = string;
+type PassiveSectionId = "ingest" | "timeline" | "patterns";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
 type ReviewSectionId = "places" | "rules" | "moments" | "calls";
 const defaultCallTranscriptCleanupPrompt = `You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.
@@ -205,6 +210,11 @@ Fallback purpose if needed:
 {default_fallback}
 
 Return only the spoken opener.`;
+
+const MAX_INTERPRETED_MEMORIES_UI = 80;
+const MAX_DETECTOR_RECORDS_UI = 80;
+const MAX_TECTONIC_TIMELINE_UI = 48;
+const TECTONIC_PLAYBACK_INTERVAL_MS = 1800;
 
 type PromptSettingKey =
   | "callTranscriptCleanupPrompt"
@@ -499,6 +509,7 @@ function describeIceServerKinds(servers: RTCIceServer[]) {
 const tabs: TabDefinition[] = [
   { id: "home", label: "Home", eyebrow: "Companion", title: "Life context at a glance", description: "A person-centered map of what matters, what is active, and what still needs to be taught." },
   { id: "context", label: "Context", eyebrow: "Manual Context", title: "Teach the companion directly", description: "Enter the people, places, values, and living details the companion should actually know." },
+  { id: "tectonics", label: "Tectonics", eyebrow: "Movement", title: "Deep movement over time", description: "A dedicated visual surface for the global change the companion is noticing beneath the visible layer." },
   { id: "settings", label: "Settings", eyebrow: "System", title: "Runtime and legacy tools", description: "Keep the operational surfaces close at hand without making them the app's identity." },
 ];
 
@@ -875,6 +886,500 @@ function describeMemoryBehavior(item: MemoryItem) {
   return "It is part of the current memory model and may change as more evidence arrives.";
 }
 
+function clamp(value: number, min: number, max: number) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function parseTectonicSummary(summaryJson: string) {
+  try {
+    const parsed = JSON.parse(summaryJson) as {
+      detectorTypeBreakdown?: Array<{ key?: string; count?: number }>;
+      evolutionStatusBreakdown?: Array<{ key?: string; count?: number }>;
+  truthAlignmentBreakdown?: Array<{ key?: string; count?: number }>;
+  divergentMemoryCount?: number;
+  cumulativeDivergenceAverage?: number;
+  crossSourceMemoryCount?: number;
+  sourceCoherenceAverage?: number;
+  sustainedShiftMemoryCount?: number;
+  phaseShiftAverage?: number;
+  phaseShiftBreakdown?: Array<{ key?: string; count?: number }>;
+  targetKindBreakdown?: Array<{ key?: string; count?: number }>;
+      directionBreakdown?: Array<{ key?: string; count?: number }>;
+      regionContinuity?: Array<{
+        regionId?: string;
+        targetKind?: string;
+        dominantDirection?: string;
+        dominantDetectorType?: string;
+        activity?: number;
+        activityDelta?: number;
+        divergencePressure?: number;
+        detectorCount?: number;
+        persistenceFrames?: number;
+        centerLatitude?: number;
+        longitudeStart?: number;
+        longitudeEnd?: number;
+      }>;
+    };
+    return {
+      detectorTypeBreakdown: Array.isArray(parsed.detectorTypeBreakdown) ? parsed.detectorTypeBreakdown : [],
+      evolutionStatusBreakdown: Array.isArray(parsed.evolutionStatusBreakdown) ? parsed.evolutionStatusBreakdown : [],
+    truthAlignmentBreakdown: Array.isArray(parsed.truthAlignmentBreakdown) ? parsed.truthAlignmentBreakdown : [],
+    divergentMemoryCount: typeof parsed.divergentMemoryCount === "number" ? parsed.divergentMemoryCount : 0,
+    cumulativeDivergenceAverage: typeof parsed.cumulativeDivergenceAverage === "number" ? parsed.cumulativeDivergenceAverage : 0,
+    crossSourceMemoryCount: typeof parsed.crossSourceMemoryCount === "number" ? parsed.crossSourceMemoryCount : 0,
+    sourceCoherenceAverage: typeof parsed.sourceCoherenceAverage === "number" ? parsed.sourceCoherenceAverage : 0,
+    sustainedShiftMemoryCount: typeof parsed.sustainedShiftMemoryCount === "number" ? parsed.sustainedShiftMemoryCount : 0,
+    phaseShiftAverage: typeof parsed.phaseShiftAverage === "number" ? parsed.phaseShiftAverage : 0,
+    phaseShiftBreakdown: Array.isArray(parsed.phaseShiftBreakdown) ? parsed.phaseShiftBreakdown : [],
+    targetKindBreakdown: Array.isArray(parsed.targetKindBreakdown) ? parsed.targetKindBreakdown : [],
+      directionBreakdown: Array.isArray(parsed.directionBreakdown) ? parsed.directionBreakdown : [],
+      regionContinuity: Array.isArray(parsed.regionContinuity) ? parsed.regionContinuity : [],
+    };
+  } catch {
+    return {
+      detectorTypeBreakdown: [],
+      evolutionStatusBreakdown: [],
+    truthAlignmentBreakdown: [],
+    divergentMemoryCount: 0,
+    cumulativeDivergenceAverage: 0,
+    crossSourceMemoryCount: 0,
+    sourceCoherenceAverage: 0,
+    sustainedShiftMemoryCount: 0,
+    phaseShiftAverage: 0,
+    phaseShiftBreakdown: [],
+    targetKindBreakdown: [],
+      directionBreakdown: [],
+      regionContinuity: [],
+    };
+  }
+}
+
+type SphereProjectedPoint = {
+  x: number;
+  y: number;
+  z: number;
+};
+
+type SpherePulsePoint = SphereProjectedPoint & {
+  phaseWeight: number;
+};
+
+function projectSpherePoint(
+  latitude: number,
+  longitude: number,
+  rotationX: number,
+  rotationY: number,
+  radius: number,
+) {
+  const lat = latitude * (Math.PI / 180);
+  const lon = longitude * (Math.PI / 180);
+  let x = radius * Math.cos(lat) * Math.cos(lon);
+  let y = radius * Math.sin(lat);
+  let z = radius * Math.cos(lat) * Math.sin(lon);
+
+  const cosY = Math.cos(rotationY);
+  const sinY = Math.sin(rotationY);
+  const xAfterY = (x * cosY) + (z * sinY);
+  const zAfterY = (-x * sinY) + (z * cosY);
+
+  const cosX = Math.cos(rotationX);
+  const sinX = Math.sin(rotationX);
+  const yAfterX = (y * cosX) - (zAfterY * sinX);
+  const zAfterX = (y * sinX) + (zAfterY * cosX);
+
+  const perspective = 280 / (280 - zAfterX);
+  return {
+    x: xAfterY * perspective,
+    y: yAfterX * perspective,
+    z: zAfterX,
+  };
+}
+
+function buildSpherePolyline(
+  points: SphereProjectedPoint[],
+  width: number,
+  height: number,
+) {
+  return points
+    .map((point) => `${(width / 2) + point.x},${(height / 2) + point.y}`)
+    .join(" ");
+}
+
+function buildSphereBandPolygon(
+  topLatitude: number,
+  bottomLatitude: number,
+  longitudeStart: number,
+  longitudeEnd: number,
+  rotationX: number,
+  rotationY: number,
+  radius: number,
+) {
+  const topPoints = Array.from({ length: 28 }, (_, index) => {
+    const longitude = longitudeStart + (((longitudeEnd - longitudeStart) / 27) * index);
+    return projectSpherePoint(topLatitude, longitude, rotationX, rotationY, radius);
+  });
+  const bottomPoints = Array.from({ length: 28 }, (_, index) => {
+    const longitude = longitudeEnd - (((longitudeEnd - longitudeStart) / 27) * index);
+    return projectSpherePoint(bottomLatitude, longitude, rotationX, rotationY, radius);
+  });
+  return buildSpherePolyline([...topPoints, ...bottomPoints], 420, 420);
+}
+
+function territoryBandStyle(targetKind: string, index: number) {
+  const styles: Record<string, { fill: string; stroke: string }> = {
+    interaction_field: {
+      fill: "rgba(111, 230, 255, 0.15)",
+      stroke: "rgba(111, 230, 255, 0.34)",
+    },
+    interaction_boundary: {
+      fill: "rgba(255, 191, 111, 0.13)",
+      stroke: "rgba(255, 191, 111, 0.3)",
+    },
+    conversation_theme: {
+      fill: "rgba(255, 124, 148, 0.12)",
+      stroke: "rgba(255, 124, 148, 0.28)",
+    },
+    outreach_path: {
+      fill: "rgba(152, 133, 255, 0.13)",
+      stroke: "rgba(152, 133, 255, 0.28)",
+    },
+    memory_item: {
+      fill: "rgba(105, 195, 255, 0.1)",
+      stroke: "rgba(105, 195, 255, 0.24)",
+    },
+    category: {
+      fill: "rgba(114, 255, 173, 0.11)",
+      stroke: "rgba(114, 255, 173, 0.24)",
+    },
+  };
+
+  return styles[targetKind] ?? [
+    {
+      fill: "rgba(116, 221, 255, 0.12)",
+      stroke: "rgba(116, 221, 255, 0.24)",
+    },
+    {
+      fill: "rgba(255, 191, 111, 0.11)",
+      stroke: "rgba(255, 191, 111, 0.22)",
+    },
+    {
+      fill: "rgba(255, 124, 148, 0.1)",
+      stroke: "rgba(255, 124, 148, 0.2)",
+    },
+  ][index % 3];
+}
+
+function directionArcStyle(direction: string, index: number) {
+  const styles: Record<string, { stroke: string }> = {
+    warming: { stroke: "rgba(111, 230, 255, 0.8)" },
+    sheltering: { stroke: "rgba(255, 191, 111, 0.76)" },
+    guarding: { stroke: "rgba(255, 208, 122, 0.76)" },
+    resisting: { stroke: "rgba(255, 124, 148, 0.82)" },
+    pressing: { stroke: "rgba(255, 124, 148, 0.78)" },
+    unsettling: { stroke: "rgba(199, 148, 255, 0.78)" },
+    appearing: { stroke: "rgba(137, 226, 255, 0.82)" },
+    steadying: { stroke: "rgba(112, 198, 255, 0.8)" },
+    shifting: { stroke: "rgba(164, 214, 255, 0.72)" },
+    swinging: { stroke: "rgba(199, 148, 255, 0.8)" },
+    removing: { stroke: "rgba(255, 166, 122, 0.78)" },
+    receding: { stroke: "rgba(255, 166, 122, 0.74)" },
+  };
+
+  return styles[direction] ?? [
+    { stroke: "rgba(111, 230, 255, 0.8)" },
+    { stroke: "rgba(255, 191, 111, 0.76)" },
+    { stroke: "rgba(199, 148, 255, 0.78)" },
+  ][index % 3];
+}
+
+const TectonicsSpherePanel = memo(function TectonicsSpherePanel({
+  timeline,
+  sideContent,
+}: {
+  timeline: MemorySystemSnapshot["tectonicTimeline"];
+  sideContent?: React.ReactNode;
+}) {
+  const chronologicalTimeline = useMemo(() => [...timeline], [timeline]);
+  const [playbackIndex, setPlaybackIndex] = useState(0);
+  const [autoplay, setAutoplay] = useState(true);
+  const [rotation, setRotation] = useState({ x: -0.42, y: 0.58 });
+  const dragStateRef = useRef<{ pointerId: number; x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    if (!chronologicalTimeline.length) {
+      setPlaybackIndex(0);
+      return;
+    }
+    setPlaybackIndex((current) => clamp(current, 0, chronologicalTimeline.length - 1));
+  }, [chronologicalTimeline.length]);
+
+  useEffect(() => {
+    if (!autoplay || chronologicalTimeline.length <= 1) return;
+    const timer = window.setInterval(() => {
+      setPlaybackIndex((current) => (current + 1) % chronologicalTimeline.length);
+    }, TECTONIC_PLAYBACK_INTERVAL_MS);
+    return () => window.clearInterval(timer);
+  }, [autoplay, chronologicalTimeline.length]);
+
+  const activeSnapshot = chronologicalTimeline[playbackIndex] ?? null;
+  const parsedSummary = activeSnapshot ? parseTectonicSummary(activeSnapshot.summaryJson) : null;
+  const dominantDetector = parsedSummary?.detectorTypeBreakdown[0]?.key ?? "quiet";
+  const dominantEvolution = parsedSummary?.evolutionStatusBreakdown[0]?.key ?? "forming";
+  const dominantPhaseShift = parsedSummary?.phaseShiftBreakdown[0]?.key ?? "stable";
+  const detectorActivity = activeSnapshot?.totalDetectorActivity ?? 0;
+  const phaseShiftAverage = parsedSummary?.phaseShiftAverage ?? 0;
+  const glowStrength = clamp(0.22 + (detectorActivity / 28) + (phaseShiftAverage * 0.12), 0.24, 0.92);
+  const playbackPhase = chronologicalTimeline.length > 1 ? playbackIndex / (chronologicalTimeline.length - 1) : 0;
+
+  const meridians = useMemo(() => {
+    const longitudes = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150];
+    return longitudes.map((longitude) =>
+      Array.from({ length: 73 }, (_, index) => projectSpherePoint(-90 + (index * 2.5), longitude, rotation.x, rotation.y, 132)),
+    );
+  }, [rotation.x, rotation.y]);
+
+  const parallels = useMemo(() => {
+    const latitudes = [-75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75];
+    return latitudes.map((latitude) =>
+      Array.from({ length: 97 }, (_, index) => projectSpherePoint(latitude, -180 + (index * 3.75), rotation.x, rotation.y, 132)),
+    );
+  }, [rotation.x, rotation.y]);
+
+  const pulseNodes = useMemo(() => {
+    const detectorCount = parsedSummary?.detectorTypeBreakdown.length ?? 0;
+    const nodeCount = clamp(detectorCount * 2 + 4, 4, 14);
+    const phaseWeight = clamp((parsedSummary?.phaseShiftAverage ?? 0) * 0.4, 0, 0.4);
+    return Array.from({ length: nodeCount }, (_, index): SpherePulsePoint => {
+      const latitude = -55 + (((index * 29) + (playbackIndex * 7)) % 110);
+      const longitude = -180 + (((index * 47) + (playbackIndex * 19)) % 360);
+      const point = projectSpherePoint(latitude, longitude, rotation.x, rotation.y, 132);
+      return { ...point, phaseWeight };
+    }).sort((left, right) => left.z - right.z);
+  }, [parsedSummary, playbackIndex, rotation.x, rotation.y]);
+
+  const territoryBands = useMemo(() => {
+    const regions = (parsedSummary?.regionContinuity ?? []).slice(0, 4);
+    return regions.map((region, index) => {
+      const detectorCount = region.detectorCount ?? 0;
+      const density = clamp(detectorCount / 20, 0.15, 1);
+      const persistence = clamp((region.persistenceFrames ?? 1) / 7, 0.18, 1);
+      const divergencePressure = clamp((region.divergencePressure ?? 0) / 3.5, 0, 1);
+      const phaseShift = Math.sin((playbackPhase * Math.PI * 2) + index) * (5 + (persistence * 4));
+      const centerLatitude = (region.centerLatitude ?? (-32 + (index * 28))) + phaseShift;
+      const thickness = 9 + (density * 7);
+      const topLatitude = centerLatitude - thickness;
+      const bottomLatitude = centerLatitude + thickness;
+      const longitudeStart = (region.longitudeStart ?? (-132 + (index * 18))) - (density * 16) + (phaseShift * 0.8);
+      const longitudeEnd = (region.longitudeEnd ?? (72 + (index * 20))) + (density * 18) + (phaseShift * 0.8);
+      const intensity = clamp(0.32 + (density * 0.28) + (persistence * 0.34) + (divergencePressure * 0.16) + ((region.activityDelta ?? 0) * 0.05), 0.28, 0.98);
+      return {
+        key: region.regionId ?? `territory-${index}`,
+        count: detectorCount,
+        label: region.targetKind ?? `territory-${index}`,
+        path: buildSphereBandPolygon(topLatitude, bottomLatitude, longitudeStart, longitudeEnd, rotation.x, rotation.y, 118),
+        style: territoryBandStyle(region.targetKind ?? "", index),
+        intensity,
+        persistenceFrames: region.persistenceFrames ?? 1,
+      };
+    });
+  }, [parsedSummary, playbackPhase, rotation.x, rotation.y]);
+
+  const directionArcs = useMemo(() => {
+    const regions = (parsedSummary?.regionContinuity ?? []).slice(0, 4);
+    return regions.map((region, index) => {
+      const count = region.detectorCount ?? 0;
+      const sweep = clamp(count / 18, 0.15, 1);
+      const persistence = clamp((region.persistenceFrames ?? 1) / 7, 0.2, 1);
+      const divergencePressure = clamp((region.divergencePressure ?? 0) / 3.5, 0, 1);
+      const drift = Math.cos((playbackPhase * Math.PI * 2) + index) * (6 + (persistence * 4));
+      const latitude = ((region.centerLatitude ?? (-18 + (index * 24))) + 12) + drift;
+      const longitudeStart = (region.longitudeStart ?? (-160 + (index * 12))) - (sweep * 18);
+      const longitudeStep = 5.2 + (sweep * 2.1);
+      const line = Array.from({ length: 49 }, (_, pointIndex) =>
+        projectSpherePoint(latitude, longitudeStart + (pointIndex * longitudeStep), rotation.x, rotation.y, 144 + (sweep * 6)),
+      );
+      return {
+        key: region.regionId ?? `direction-${index}`,
+        count,
+        points: buildSpherePolyline(line, 420, 420),
+        label: region.dominantDirection ?? `direction-${index}`,
+        style: directionArcStyle(region.dominantDirection ?? "", index),
+        dashOffset: ((playbackIndex * 12) + (index * 18)) * (autoplay ? 1 : 0.35),
+        opacity: clamp(0.36 + (sweep * 0.26) + (persistence * 0.26) + (divergencePressure * 0.12) + ((region.activityDelta ?? 0) * 0.04), 0.36, 0.96),
+      };
+    });
+  }, [autoplay, parsedSummary, playbackIndex, playbackPhase, rotation.x, rotation.y]);
+
+  function handlePointerDown(event: React.PointerEvent<HTMLDivElement>) {
+    dragStateRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    event.currentTarget.setPointerCapture(event.pointerId);
+  }
+
+  function handlePointerMove(event: React.PointerEvent<HTMLDivElement>) {
+    if (!dragStateRef.current || dragStateRef.current.pointerId !== event.pointerId) return;
+    const deltaX = event.clientX - dragStateRef.current.x;
+    const deltaY = event.clientY - dragStateRef.current.y;
+    dragStateRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY };
+    setRotation((current) => ({
+      x: clamp(current.x - (deltaY * 0.008), -1.2, 1.2),
+      y: current.y + (deltaX * 0.008),
+    }));
+  }
+
+  function handlePointerUp(event: React.PointerEvent<HTMLDivElement>) {
+    if (dragStateRef.current?.pointerId === event.pointerId) {
+      dragStateRef.current = null;
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  }
+
+  const playbackReadout = (
+    <div className="saved-state tectonics-sphere-readout">
+      <h3>{activeSnapshot ? formatDateTime(activeSnapshot.recordedAt) : "No tectonic movement yet"}</h3>
+      {activeSnapshot ? (
+        <>
+          <p className="memory-detail-lead">Dominant detector: {dominantDetector}. Dominant evolution: {dominantEvolution}.</p>
+          <p className="memory-explanation">Temporal phase read: {dominantPhaseShift}. Sustained shifts {parsedSummary?.sustainedShiftMemoryCount ?? 0} / average phase shift {phaseShiftAverage.toFixed(2)}.</p>
+          <code>activity {activeSnapshot.totalDetectorActivity.toFixed(2)} / active memories {activeSnapshot.activeMemoryCount}</code>
+          <div className="tectonics-playback-row">
+            <button
+              type="button"
+              className="ghost"
+              onClick={() => setAutoplay((current) => !current)}
+              disabled={chronologicalTimeline.length <= 1}
+            >
+              {autoplay ? "Pause loop" : "Resume loop"}
+            </button>
+            <span className="status-pill muted">
+              frame {chronologicalTimeline.length ? playbackIndex + 1 : 0} / {chronologicalTimeline.length}
+            </span>
+          </div>
+          {chronologicalTimeline.length > 1 ? (
+            <input
+              type="range"
+              min={0}
+              max={chronologicalTimeline.length - 1}
+              value={playbackIndex}
+              onChange={(event) => {
+                setPlaybackIndex(Number(event.target.value));
+                setAutoplay(false);
+              }}
+            />
+          ) : null}
+          <div className="tectonics-chip-row">
+            {(parsedSummary?.detectorTypeBreakdown ?? []).slice(0, 4).map((entry) => (
+              <span key={`detector-${entry.key ?? "unknown"}`} className="status-pill">{entry.key ?? "unknown"} {entry.count ?? 0}</span>
+            ))}
+            {(parsedSummary?.phaseShiftBreakdown ?? []).slice(0, 3).map((entry) => (
+              <span key={`phase-${entry.key ?? "unknown"}`} className="status-pill muted">{entry.key ?? "unknown"} {entry.count ?? 0}</span>
+            ))}
+          </div>
+        </>
+      ) : (
+        <p>Run the context-memory pass to generate the first tectonic frame.</p>
+      )}
+    </div>
+  );
+
+  return (
+    <section className="panel tectonics-sphere-panel">
+      <div className="panel-header">
+        <h2>Tectonic sphere</h2>
+        <p>Deep movement under the visible surface. Drag to rotate, and let the last week loop through what the companion has been noticing.</p>
+      </div>
+      <div className="tectonics-sphere-layout">
+        <div className="tectonics-sphere-main">
+          <div
+            className="tectonics-sphere-stage"
+            onPointerDown={handlePointerDown}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp}
+          >
+            <div
+              className="tectonics-sphere-glow"
+              style={{ opacity: glowStrength, transform: `translate(-50%, -50%) scale(${1 + (glowStrength * 0.14)})` }}
+            />
+            <svg viewBox="0 0 420 420" className="tectonics-sphere-svg" aria-label="Tectonic sphere visualization">
+              <defs>
+                <linearGradient id="tectonics-pole-gradient" x1="0%" y1="0%" x2="0%" y2="100%">
+                  <stop offset="0%" stopColor="rgba(116, 221, 255, 0.42)" />
+                  <stop offset="28%" stopColor="rgba(88, 183, 236, 0.22)" />
+                  <stop offset="50%" stopColor="rgba(72, 154, 214, 0.14)" />
+                  <stop offset="72%" stopColor="rgba(58, 117, 186, 0.18)" />
+                  <stop offset="100%" stopColor="rgba(30, 63, 126, 0.34)" />
+                </linearGradient>
+                <radialGradient id="tectonics-core-glow" cx="50%" cy="46%" r="58%">
+                  <stop offset="0%" stopColor="rgba(116, 221, 255, 0.28)" />
+                  <stop offset="52%" stopColor="rgba(78, 167, 224, 0.14)" />
+                  <stop offset="100%" stopColor="rgba(16, 33, 68, 0)" />
+                </radialGradient>
+              </defs>
+              <circle cx="210" cy="210" r="118" className="tectonics-sphere-core" fill="url(#tectonics-pole-gradient)" />
+              <circle cx="210" cy="210" r="118" className="tectonics-sphere-core-glow" fill="url(#tectonics-core-glow)" />
+              {territoryBands.map((band) => (
+                <polygon
+                  key={`band-${band.key}`}
+                  points={band.path}
+                  className="tectonics-territory-band"
+                  style={{ fill: band.style.fill, stroke: band.style.stroke, opacity: band.intensity }}
+                />
+              ))}
+              {meridians.map((line, index) => (
+                <polyline
+                  key={`meridian-${index}`}
+                  points={buildSpherePolyline(line, 420, 420)}
+                  className="tectonics-wire tectonics-wire-meridian"
+                />
+              ))}
+              {parallels.map((line, index) => (
+                <polyline
+                  key={`parallel-${index}`}
+                  points={buildSpherePolyline(line, 420, 420)}
+                  className="tectonics-wire tectonics-wire-parallel"
+                />
+              ))}
+              {pulseNodes.map((node, index) => (
+                <circle
+                  key={`pulse-${index}`}
+                  cx={210 + node.x}
+                  cy={210 + node.y}
+                  r={(3.5 + ((index % 3) * 1.3)) + ((node.phaseWeight ?? 0) * 4)}
+                  className="tectonics-pulse"
+                  style={{ opacity: clamp(0.42 + ((node.z + 132) / 264) + ((node.phaseWeight ?? 0) * 0.18), 0.28, 0.98) }}
+                />
+              ))}
+              {directionArcs.map((arc) => (
+                <polyline
+                  key={`direction-${arc.key}`}
+                  points={arc.points}
+                  className="tectonics-direction-arc"
+                  style={{ stroke: arc.style.stroke, strokeDashoffset: arc.dashOffset, opacity: arc.opacity }}
+                />
+              ))}
+            </svg>
+            <div className="tectonics-overlay-note">
+              <span>Drag to rotate</span>
+              {territoryBands.length ? (
+                <div className="tectonics-overlay-legend">
+                  {territoryBands.map((band) => (
+                    <span key={`legend-territory-${band.key}`} className="tectonics-overlay-chip" title={`${band.label} / ${band.persistenceFrames} frames`}>
+                      <span className="tectonics-overlay-swatch" style={{ background: band.style.fill, borderColor: band.style.stroke }} />
+                      {band.label} {band.count}
+                    </span>
+                  ))}
+                </div>
+              ) : null}
+            </div>
+          </div>
+          {playbackReadout}
+        </div>
+        {sideContent ? <div className="tectonics-sphere-side">{sideContent}</div> : null}
+      </div>
+    </section>
+  );
+});
+
 const ConversationTurnsPanel = memo(function ConversationTurnsPanel({
   turns,
   liveReplyPreviewText,
@@ -1001,22 +1506,26 @@ function App() {
   const [realityCheckSnapshot, setRealityCheckSnapshot] = useState<MvpRealityCheckSnapshot | null>(null);
   const [simulationScenarios, setSimulationScenarios] = useState<SimulationScenario[]>([]);
   const [memoryGrowthSnapshot, setMemoryGrowthSnapshot] = useState<MemoryGrowthSnapshot | null>(null);
+  const [memorySystemSnapshot, setMemorySystemSnapshot] = useState<MemorySystemSnapshot | null>(null);
   const [selectedSimulationKey, setSelectedSimulationKey] = useState("single_message_path");
   const [simulationResult, setSimulationResult] = useState<SimulationRunResult | null>(null);
   const [simulationSuiteResult, setSimulationSuiteResult] = useState<SimulationSuiteResult | null>(null);
   const [memoryGrowthSummary, setMemoryGrowthSummary] = useState<string[]>([]);
+  const [contextMemorySummary, setContextMemorySummary] = useState<string[]>([]);
   const [companionCategoryForm, setCompanionCategoryForm] = useState<CreateCompanionContextCategoryInput>(defaultCompanionContextCategory);
   const [selectedCategoryIcon, setSelectedCategoryIcon] = useState("spark");
   const [companionContextForm, setCompanionContextForm] = useState<CreateCompanionContextEntryInput>(defaultCompanionContextEntry);
   const [companionContextTagsInput, setCompanionContextTagsInput] = useState("");
   const [editingCompanionContextEntryId, setEditingCompanionContextEntryId] = useState<number | null>(null);
   const [selectedMemoryItemId, setSelectedMemoryItemId] = useState<number | null>(null);
+  const [selectedInterpretedMemoryItemId, setSelectedInterpretedMemoryItemId] = useState<number | null>(null);
   const [selectedSavedMomentId, setSelectedSavedMomentId] = useState<number | null>(null);
   const [selectedDecisionId, setSelectedDecisionId] = useState<number | null>(null);
   const [selectedCallSessionId, setSelectedCallSessionId] = useState<number | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSectionId>("overview");
   const [memorySection, setMemorySection] = useState<MemorySectionId>("places");
   const [contextSection, setContextSection] = useState<ContextSectionId>("friends");
+  const [passiveSection, setPassiveSection] = useState<PassiveSectionId>("ingest");
   const [judgmentSection, setJudgmentSection] = useState<JudgmentSectionId>("reality");
   const [reviewSection, setReviewSection] = useState<ReviewSectionId>("places");
   const [diagnostics, setDiagnostics] = useState<DiagnosticStatus | null>(null);
@@ -1041,7 +1550,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [northStarLiveDiagnostics, setNorthStarLiveDiagnostics] = useState<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
@@ -1095,6 +1604,16 @@ function App() {
     memoryGrowthSnapshot?.memoryItems.find((item) => item.id === selectedMemoryItemId)
     ?? memoryGrowthSnapshot?.memoryItems[0]
     ?? null;
+  const selectedInterpretedMemoryItem =
+    memorySystemSnapshot?.memoryItems.find((item) => item.id === selectedInterpretedMemoryItemId)
+    ?? memorySystemSnapshot?.memoryItems[0]
+    ?? null;
+  const visibleInterpretedMemoryItems = memorySystemSnapshot?.memoryItems.slice(0, MAX_INTERPRETED_MEMORIES_UI) ?? [];
+  const visibleDetectorRecords = memorySystemSnapshot?.detectorRecords.slice(0, MAX_DETECTOR_RECORDS_UI) ?? [];
+  const visibleTectonicTimeline = memorySystemSnapshot?.tectonicTimeline.slice(-MAX_TECTONIC_TIMELINE_UI).reverse() ?? [];
+  const latestTectonicSummary = memorySystemSnapshot?.tectonicTimeline.length
+    ? parseTectonicSummary(memorySystemSnapshot.tectonicTimeline[memorySystemSnapshot.tectonicTimeline.length - 1].summaryJson)
+    : null;
   const selectedSavedMoment =
     phaseThreeSnapshot?.savedMoments.find((moment) => moment.id === selectedSavedMomentId)
     ?? phaseThreeSnapshot?.savedMoments[0]
@@ -2552,12 +3071,13 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function refreshDecisionSnapshot() { setDecisionSnapshot(await getDecisionSnapshot()); }
   async function refreshRealityCheckSnapshot() { setRealityCheckSnapshot(await getMvpRealityCheckSnapshot()); }
   async function refreshMemoryGrowthSnapshot() { setMemoryGrowthSnapshot(await getMemoryGrowthSnapshot()); }
+  async function refreshMemorySystemSnapshot() { setMemorySystemSnapshot(await getMemorySystemSnapshot()); }
 
   useEffect(() => {
     let active = true;
     async function bootstrap() {
       try {
-        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot] = await Promise.all([
+        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot, loadedMemorySystemSnapshot] = await Promise.all([
           loadSettings(),
           getDiagnostics(),
           getCompanionContextSnapshot(),
@@ -2573,6 +3093,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           getMvpRealityCheckSnapshot(),
           listSimulationScenarios(),
           getMemoryGrowthSnapshot(),
+          getMemorySystemSnapshot(),
         ]);
         if (!active) return;
         setSettings(withPromptDefaults(loadedSettings));
@@ -2590,6 +3111,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         setRealityCheckSnapshot(loadedRealityCheckSnapshot);
         setSimulationScenarios(loadedSimulationScenarios);
         setMemoryGrowthSnapshot(loadedMemoryGrowthSnapshot);
+        setMemorySystemSnapshot(loadedMemorySystemSnapshot);
       } catch (caught) {
         if (!active) return;
         setError(caught instanceof Error ? caught.message : String(caught));
@@ -3495,6 +4017,59 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
   }
 
+  async function handleRunContextMemory() {
+    setBusyPanel("contextMemory");
+    setError("");
+    setMessage("");
+    try {
+      const nextSnapshot = await runContextMemoryPass();
+      setMemorySystemSnapshot(nextSnapshot);
+      const summary = [
+        `${nextSnapshot.overview.totalMemoryCount} interpreted memories tracked.`,
+        `${nextSnapshot.overview.detectorCount} detector records are active.`,
+        `${nextSnapshot.overview.tectonicSnapshotCount} tectonic snapshots captured.`,
+      ];
+      setContextMemorySummary(summary);
+      setMessage(`Context-to-memory pass complete. ${summary[0]}`);
+      await Promise.all([refreshDiagnostics(), refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleSeedContextMemoryExample(scenarioKey: "support" | "contradiction") {
+    setBusyPanel("contextMemorySeed");
+    setError("");
+    setMessage("");
+    try {
+      const nextSnapshot = await seedContextMemoryExample(scenarioKey);
+      setMemorySystemSnapshot(nextSnapshot);
+      setSelectedInterpretedMemoryItemId(
+        nextSnapshot.memoryItems.find((item) => item.sourceEntryTitle === "[Seed] Akai MPC")?.id ?? nextSnapshot.memoryItems[0]?.id ?? null,
+      );
+      await Promise.all([
+        refreshCompanionContextSnapshot(),
+        refreshCompanionHomeSnapshot(),
+      ]);
+      setContextMemorySummary([
+        `${nextSnapshot.overview.totalMemoryCount} interpreted memories tracked.`,
+        `${nextSnapshot.overview.detectorCount} detector records are active.`,
+        `${nextSnapshot.overview.tectonicSnapshotCount} tectonic snapshots captured.`,
+      ]);
+      setMessage(
+        scenarioKey === "support"
+          ? "Seeded a support example for [Seed] Akai MPC and ran the context-memory pass."
+          : "Seeded a contradiction example for [Seed] Akai MPC and ran the context-memory pass.",
+      );
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
   async function handleUpdateMemoryItem(payload: UpdateMemoryItemInput) {
     setBusyPanel("memoryReview");
     setError("");
@@ -3712,22 +4287,36 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   async function handleResetRuntimeData() {
+    if (!window.confirm("Clear generated runtime and memory data while keeping settings and manual context?")) {
+      return;
+    }
     setBusyPanel("runtimeReset");
     setError("");
     setMessage("");
     try {
       await resetRuntimeData();
       setSimulationResult(null);
+      setSimulationSuiteResult(null);
+      setSelectedMemoryItemId(null);
+      setSelectedInterpretedMemoryItemId(null);
+      setSelectedSavedMomentId(null);
+      setSelectedDecisionId(null);
+      setSelectedCallSessionId(null);
       await Promise.all([
         refreshSnapshot(),
+        refreshMemoryGrowthSnapshot(),
+        refreshMemorySystemSnapshot(),
+        refreshCompanionContextSnapshot(),
+        refreshCompanionHomeSnapshot(),
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
+        refreshNorthStarSnapshot(),
         refreshDiagnostics(),
       ]);
-      setMessage("Runtime data cleared. Settings were kept.");
+      setMessage("Generated runtime and memory data were cleared. Settings and manual context were kept.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4048,6 +4637,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "reflections", label: "Reflections" },
           { id: "overview", label: "Overview" },
           { id: "growth", label: "Growth" },
+          { id: "tectonics", label: "Tectonics" },
         ], memorySection, setMemorySection)}
 
         {memorySection === "places" ? (
@@ -4228,6 +4818,139 @@ async function playNorthStarReplyOverPeer(base64: string) {
             </section>
           </div>
         ) : null}
+
+        {memorySection === "tectonics" ? (
+          <div className="grid two-up">
+            <section className="panel">
+              <div className="panel-header"><h2>Context to memory</h2><p>Interpret manual companion context into active memory, detector movement, and tectonic timeline snapshots.</p></div>
+              <div className="actions">
+                <button type="button" onClick={() => void handleRunContextMemory()} disabled={busyPanel === "contextMemory"}>
+                  {busyPanel === "contextMemory" ? "Interpreting..." : "Run context-memory pass"}
+                </button>
+                <button type="button" className="ghost" onClick={() => void handleSeedContextMemoryExample("support")} disabled={busyPanel === "contextMemorySeed"}>
+                  {busyPanel === "contextMemorySeed" ? "Seeding..." : "Seed support example"}
+                </button>
+                <button type="button" className="ghost" onClick={() => void handleSeedContextMemoryExample("contradiction")} disabled={busyPanel === "contextMemorySeed"}>
+                  {busyPanel === "contextMemorySeed" ? "Seeding..." : "Seed contradiction example"}
+                </button>
+                <button type="button" className="ghost danger" onClick={() => void handleResetRuntimeData()} disabled={busyPanel === "runtimeReset"}>
+                  {busyPanel === "runtimeReset" ? "Clearing..." : "Clear generated data"}
+                </button>
+              </div>
+              <p className="memory-explanation">Clears derived memory, tectonic snapshots, passive/runtime traces, and call or outreach history while keeping settings and manual context.</p>
+              <p className="memory-explanation">The seed buttons create or refresh a clearly named manual entry, `[Seed] Akai MPC`, add matching lived call and review evidence, and run the pass for you.</p>
+              {contextMemorySummary.length ? (
+                <div className="saved-state">
+                  <h3>Last pass</h3>
+                  <ul>{contextMemorySummary.map((line) => <li key={line}>{line}</li>)}</ul>
+                </div>
+              ) : null}
+              {memorySystemSnapshot ? (
+                <>
+                  <dl className="facts">
+                    <div><dt>Interpreted memories</dt><dd>{memorySystemSnapshot.overview.totalMemoryCount}</dd></div>
+                    <div><dt>Active</dt><dd>{memorySystemSnapshot.overview.activeMemoryCount}</dd></div>
+                    <div><dt>Historical</dt><dd>{memorySystemSnapshot.overview.historicalMemoryCount}</dd></div>
+                    <div><dt>Detectors</dt><dd>{memorySystemSnapshot.overview.detectorCount}</dd></div>
+                    <div><dt>Tectonic snapshots</dt><dd>{memorySystemSnapshot.overview.tectonicSnapshotCount}</dd></div>
+                    <div><dt>Last pass</dt><dd>{memorySystemSnapshot.overview.lastPassAt ? formatDateTime(memorySystemSnapshot.overview.lastPassAt) : "not run yet"}</dd></div>
+                  </dl>
+                  <div className="saved-state">
+                    <h3>Breakdown</h3>
+                    <ul>{memorySystemSnapshot.overview.memoryTypeBreakdown.length ? memorySystemSnapshot.overview.memoryTypeBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count}</code></li>) : <li>No interpreted memories yet.</li>}</ul>
+                  </div>
+                </>
+              ) : <p>Loading context-memory system...</p>}
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Interpreted memories</h2><p>Chosen self-description turned into active memory items with declared truth, salience, and lifecycle state.</p></div>
+              <div className="saved-state scroll-panel">
+                {memorySystemSnapshot && memorySystemSnapshot.memoryItems.length > visibleInterpretedMemoryItems.length ? (
+                  <p className="panel-limit-note">Showing the first {visibleInterpretedMemoryItems.length} of {memorySystemSnapshot.memoryItems.length} interpreted memories.</p>
+                ) : null}
+                <ul>{visibleInterpretedMemoryItems.length ? visibleInterpretedMemoryItems.map((item) => (
+                  <li key={item.id}>
+                    <button
+                      type="button"
+                      className={`memory-item-button ${selectedInterpretedMemoryItem?.id === item.id ? "active" : ""}`}
+                      onClick={() => setSelectedInterpretedMemoryItemId(item.id)}
+                    >
+                      <strong>{item.memoryType} / {item.status}</strong>
+                      <code>{item.sourceEntryTitle} / {item.sourceCategoryKey}</code>
+                      <code>confidence {item.confidence.toFixed(2)} / salience {item.salience.toFixed(2)} / sensitivity {item.sensitivity}</code>
+                    </button>
+                  </li>
+                )) : <li>No interpreted memories yet.</li>}</ul>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Selected interpreted memory</h2><p>What the companion is carrying from manual context, and how detector movement is changing that reading.</p></div>
+              {selectedInterpretedMemoryItem ? (
+                <div className="saved-state">
+                  <h3>{selectedInterpretedMemoryItem.sourceEntryTitle}</h3>
+                  <p className="memory-detail-lead">{selectedInterpretedMemoryItem.summary}</p>
+                  <code>{selectedInterpretedMemoryItem.memoryType} / {selectedInterpretedMemoryItem.status}</code>
+                  <code>declared by user {selectedInterpretedMemoryItem.declaredByUser ? "yes" : "no"} / confidence {selectedInterpretedMemoryItem.confidence.toFixed(2)} / salience {selectedInterpretedMemoryItem.salience.toFixed(2)}</code>
+                  <p className="memory-explanation"><strong>Detail:</strong> {selectedInterpretedMemoryItem.detail}</p>
+                  {selectedInterpretedMemoryItem.tags.length ? <p className="memory-explanation"><strong>Tags:</strong> {selectedInterpretedMemoryItem.tags.join(", ")}</p> : null}
+                  <p className="memory-explanation"><strong>Created:</strong> {formatDateTime(selectedInterpretedMemoryItem.createdAt)}</p>
+                  <p className="memory-explanation"><strong>Last observed:</strong> {formatDateTime(selectedInterpretedMemoryItem.lastObservedAt)}</p>
+                  {memorySystemSnapshot?.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id) ? (
+                    <>
+                      <p className="memory-explanation"><strong>Evolution state:</strong> {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.currentStatus}</p>
+                      <p className="memory-explanation"><strong>Truth alignment:</strong> {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.truthAlignment}</p>
+                      <p className="memory-explanation"><strong>Phase shift:</strong> {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.phaseShiftState}</p>
+                      <code>{memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.observedTruthSummary}</code>
+                      <code>{memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.observedEvidenceSummary}</code>
+                      <code>{memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.phaseShiftSummary}</code>
+                      <code>{memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.alignmentSummary}</code>
+                      <code>declared {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.declaredConfidence.toFixed(2)} / observed {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.observedConfidence.toFixed(2)} / divergence {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.divergenceScore.toFixed(2)}</code>
+                      <code>cumulative support {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.cumulativeSupportScore.toFixed(2)} / cumulative challenge {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.cumulativeChallengeScore.toFixed(2)} / cumulative divergence {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.cumulativeDivergenceScore.toFixed(2)}</code>
+                      <code>support sources {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.supportSourceCount ?? 0} / challenge sources {memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.challengeSourceCount ?? 0} / source coherence {(memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.sourceCoherenceScore ?? 0).toFixed(2)}</code>
+                      <code>sustained divergence {(memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.sustainedDivergenceScore ?? 0).toFixed(2)} / phase shift score {(memorySystemSnapshot.evolutionStates.find((state) => state.memoryItemId === selectedInterpretedMemoryItem.id)?.phaseShiftScore ?? 0).toFixed(2)}</code>
+                    </>
+                  ) : null}
+                </div>
+              ) : (
+                <p>No interpreted memory selected yet.</p>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Detector movement</h2><p>The kinds of movement the companion is noticing, not final truths.</p></div>
+              <div className="saved-state scroll-panel">
+                {memorySystemSnapshot && memorySystemSnapshot.detectorRecords.length > visibleDetectorRecords.length ? (
+                  <p className="panel-limit-note">Showing the first {visibleDetectorRecords.length} of {memorySystemSnapshot.detectorRecords.length} detector records.</p>
+                ) : null}
+                <ul>{visibleDetectorRecords.length ? visibleDetectorRecords.map((record) => (
+                  <li key={record.id}>
+                    <strong>{record.detectorType} / {record.direction}</strong>
+                    <code>{record.summary}</code>
+                    <code>strength {record.strength.toFixed(2)} / confidence {record.confidence.toFixed(2)} / seen {record.repeatCount} times</code>
+                  </li>
+                )) : <li>No detector movement yet.</li>}</ul>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Tectonic timeline</h2><p>Snapshots of the last movement window that the future sphere view will animate.</p></div>
+              <div className="saved-state scroll-panel">
+                {memorySystemSnapshot && memorySystemSnapshot.tectonicTimeline.length > visibleTectonicTimeline.length ? (
+                  <p className="panel-limit-note">Showing the most recent {visibleTectonicTimeline.length} of {memorySystemSnapshot.tectonicTimeline.length} tectonic snapshots.</p>
+                ) : null}
+                <ul>{visibleTectonicTimeline.length ? visibleTectonicTimeline.map((snapshot) => (
+                  <li key={snapshot.id}>
+                    <strong>{formatDateTime(snapshot.recordedAt)}</strong>
+                    <code>activity {snapshot.totalDetectorActivity.toFixed(2)} / active memories {snapshot.activeMemoryCount}</code>
+                    <code>{prettyJson(snapshot.summaryJson)}</code>
+                  </li>
+                )) : <li>No tectonic snapshots yet.</li>}</ul>
+              </div>
+            </section>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -4239,9 +4962,9 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "ingest", label: "Ingest" },
           { id: "timeline", label: "Timeline" },
           { id: "patterns", label: "Patterns" },
-        ], contextSection, setContextSection)}
+        ], passiveSection, (next) => setPassiveSection(next as PassiveSectionId))}
 
-        {contextSection === "ingest" ? (
+        {passiveSection === "ingest" ? (
           <div className="grid two-up">
           <section className="panel">
             <div className="panel-header"><h2>Manual location input</h2><p>Testing path for Phase 2 ingestion.</p></div>
@@ -4285,7 +5008,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           </div>
         ) : null}
 
-        {contextSection === "timeline" ? (
+        {passiveSection === "timeline" ? (
           <div className="grid two-up">
           <section className="panel">
             <div className="panel-header"><h2>Recent raw events</h2><p>Manual and North Star-derived location records.</p></div>
@@ -4300,7 +5023,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           </div>
         ) : null}
 
-        {contextSection === "patterns" ? (
+        {passiveSection === "patterns" ? (
           <section className="panel diagnostics">
             <div className="panel-header"><h2>Patterns</h2><p>Repeated places and likely sleep summarized without the raw feed.</p></div>
             {passiveSnapshot ? (
@@ -4393,7 +5116,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
               {busyPanel === "simulationSuite" ? "Running suite..." : "Run automated suite"}
             </button>
             <button type="button" className="ghost" onClick={() => void handleResetRuntimeData()} disabled={busyPanel === "runtimeReset"}>
-              {busyPanel === "runtimeReset" ? "Clearing..." : "Clear runtime data"}
+              {busyPanel === "runtimeReset" ? "Clearing..." : "Clear generated data"}
             </button>
           </div>
           {simulationResult ? (
@@ -4795,6 +5518,74 @@ async function playNorthStarReplyOverPeer(base64: string) {
     );
   }
 
+  function renderTectonicsTab() {
+    return (
+      <div className="screen-stack">
+        <section className="screen-panel screen-panel-hero screen-panel-hero-compact">
+          <div className="screen-panel-copy">
+            <p className="eyebrow">Tectonics</p>
+            <h2>Deep movement over time</h2>
+            <p>The visual layer for what the companion is noticing as slow global change, not just a list of records.</p>
+          </div>
+          <div className="screen-kpis">
+            <div className="screen-kpi"><span>Frames</span><strong>{memorySystemSnapshot?.overview.tectonicSnapshotCount ?? 0}</strong></div>
+            <div className="screen-kpi"><span>Detectors</span><strong>{memorySystemSnapshot?.overview.detectorCount ?? 0}</strong></div>
+            <div className="screen-kpi"><span>Memories</span><strong>{memorySystemSnapshot?.overview.totalMemoryCount ?? 0}</strong></div>
+          </div>
+        </section>
+
+        <TectonicsSpherePanel
+          timeline={memorySystemSnapshot?.tectonicTimeline ?? []}
+          sideContent={
+            <>
+              <section className="panel tectonics-side-panel">
+                <div className="panel-header"><h2>Current movement mix</h2><p>The most active detector and evolution currents shaping the present frame.</p></div>
+                {memorySystemSnapshot ? (
+                  <div className="saved-state scroll-panel tectonics-side-scroll">
+                    <h3>Detector currents</h3>
+                    <ul>{memorySystemSnapshot.overview.detectorTypeBreakdown.length ? memorySystemSnapshot.overview.detectorTypeBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count}</code></li>) : <li>No detector movement yet.</li>}</ul>
+                    <h3>Evolution currents</h3>
+                    <ul>{memorySystemSnapshot.overview.evolutionStatusBreakdown.length ? memorySystemSnapshot.overview.evolutionStatusBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count}</code></li>) : <li>No evolution movement yet.</li>}</ul>
+                    <h3>Truth alignment</h3>
+                    <ul>{latestTectonicSummary?.truthAlignmentBreakdown.length ? latestTectonicSummary.truthAlignmentBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count ?? 0}</code></li>) : <li>No alignment read yet.</li>}</ul>
+                    <h3>Divergence carry-over</h3>
+                    <ul>
+                      <li><strong>Diverging memories</strong><code>{latestTectonicSummary?.divergentMemoryCount ?? 0}</code></li>
+                      <li><strong>Average cumulative divergence</strong><code>{(latestTectonicSummary?.cumulativeDivergenceAverage ?? 0).toFixed(2)}</code></li>
+                      <li><strong>Cross-source memories</strong><code>{latestTectonicSummary?.crossSourceMemoryCount ?? 0}</code></li>
+                      <li><strong>Average source coherence</strong><code>{(latestTectonicSummary?.sourceCoherenceAverage ?? 0).toFixed(2)}</code></li>
+                      <li><strong>Sustained shifts</strong><code>{latestTectonicSummary?.sustainedShiftMemoryCount ?? 0}</code></li>
+                      <li><strong>Average phase shift</strong><code>{(latestTectonicSummary?.phaseShiftAverage ?? 0).toFixed(2)}</code></li>
+                    </ul>
+                    <h3>Phase shifts</h3>
+                    <ul>{latestTectonicSummary?.phaseShiftBreakdown.length ? latestTectonicSummary.phaseShiftBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count ?? 0}</code></li>) : <li>No temporal phase read yet.</li>}</ul>
+                    <h3>Movement territories</h3>
+                    <ul>{latestTectonicSummary?.targetKindBreakdown.length ? latestTectonicSummary.targetKindBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count ?? 0}</code></li>) : <li>No territorial split yet.</li>}</ul>
+                    <h3>Motion directions</h3>
+                    <ul>{latestTectonicSummary?.directionBreakdown.length ? latestTectonicSummary.directionBreakdown.map((item) => <li key={item.key}><strong>{item.key}</strong><code>{item.count ?? 0}</code></li>) : <li>No directional movement yet.</li>}</ul>
+                  </div>
+                ) : <p>Loading tectonic system...</p>}
+              </section>
+
+              <section className="panel tectonics-side-panel">
+                <div className="panel-header"><h2>Recent movement notes</h2><p>A lightweight textual anchor beside the visualizer so the motion still stays legible.</p></div>
+                <div className="saved-state scroll-panel tectonics-side-scroll">
+                  <ul>{visibleDetectorRecords.length ? visibleDetectorRecords.slice(0, 12).map((record) => (
+                    <li key={record.id}>
+                      <strong>{record.detectorType} / {record.direction}</strong>
+                      <code>{record.summary}</code>
+                      <code>strength {record.strength.toFixed(2)} / confidence {record.confidence.toFixed(2)}</code>
+                    </li>
+                  )) : <li>No detector movement yet.</li>}</ul>
+                </div>
+              </section>
+            </>
+          }
+        />
+      </div>
+    );
+  }
+
   function renderCompanionContextTab() {
     return (
       <div className="screen-stack">
@@ -5077,6 +5868,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     switch (activeTab) {
       case "home": return renderHomeTab();
       case "context": return renderCompanionContextTab();
+      case "tectonics": return renderTectonicsTab();
       case "settings": return renderSettingsExperience();
       default: return null;
     }
@@ -5102,7 +5894,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   className={tab.id === activeTab ? "literal-rail-item active" : "literal-rail-item"}
                   onClick={() => setActiveTab(tab.id)}
                 >
-                  <span className="literal-rail-icon">{tab.id === "home" ? "HM" : tab.id === "context" ? "CX" : "ST"}</span>
+                  <span className="literal-rail-icon">{tab.id === "home" ? "HM" : tab.id === "context" ? "CX" : tab.id === "tectonics" ? "TC" : "ST"}</span>
                   <span className="literal-rail-label">{tab.label}</span>
                 </button>
               ))}

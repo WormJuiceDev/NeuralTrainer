@@ -460,6 +460,196 @@ code {
   word-break: break-word;
 }
 
+.scroll-panel {
+  max-height: 620px;
+  overflow: auto;
+  scrollbar-gutter: stable;
+}
+
+.panel-limit-note {
+  margin: 0 0 0.8rem;
+  font-size: 0.82rem;
+  color: #86d5ff;
+}
+
+.tectonics-sphere-panel {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(92, 202, 255, 0.14), transparent 28%),
+    linear-gradient(180deg, rgba(18, 36, 62, 0.96), rgba(8, 18, 34, 0.98));
+}
+
+.tectonics-sphere-layout {
+  display: grid;
+  grid-template-columns: minmax(520px, 860px) minmax(360px, 520px);
+  gap: 1rem;
+  align-items: start;
+  justify-content: start;
+}
+
+.tectonics-sphere-main {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+  max-width: 860px;
+}
+
+.tectonics-sphere-side {
+  display: grid;
+  gap: 1rem;
+  align-content: start;
+  max-width: 520px;
+}
+
+.tectonics-sphere-stage {
+  position: relative;
+  height: clamp(340px, 42vh, 620px);
+  max-height: 620px;
+  border-radius: 20px;
+  border: 1px solid rgba(126, 208, 255, 0.18);
+  background:
+    radial-gradient(circle at 50% 48%, rgba(95, 207, 255, 0.12), transparent 26%),
+    radial-gradient(circle at 50% 50%, rgba(255, 255, 255, 0.02), transparent 52%),
+    linear-gradient(180deg, rgba(7, 16, 30, 0.98), rgba(6, 14, 25, 0.99));
+  overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+}
+
+.tectonics-sphere-stage:active {
+  cursor: grabbing;
+}
+
+.tectonics-sphere-glow {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 360px;
+  height: 360px;
+  border-radius: 999px;
+  background: radial-gradient(circle, rgba(96, 214, 255, 0.34), rgba(96, 214, 255, 0.08) 48%, transparent 72%);
+  pointer-events: none;
+}
+
+.tectonics-sphere-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+.tectonics-sphere-core {
+  stroke: rgba(132, 216, 255, 0.08);
+  stroke-width: 1;
+}
+
+.tectonics-sphere-core-glow {
+  opacity: 0.95;
+}
+
+.tectonics-wire {
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.tectonics-wire-meridian {
+  stroke: rgba(128, 219, 255, 0.46);
+  stroke-width: 1.2;
+}
+
+.tectonics-wire-parallel {
+  stroke: rgba(97, 182, 233, 0.34);
+  stroke-width: 1;
+}
+
+.tectonics-territory-band {
+  stroke-width: 1.2;
+}
+
+.tectonics-pulse {
+  fill: rgba(138, 231, 255, 0.92);
+  filter: drop-shadow(0 0 10px rgba(107, 212, 255, 0.55));
+}
+
+.tectonics-direction-arc {
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-dasharray: 8 10;
+  opacity: 0.85;
+}
+
+.tectonics-overlay-note {
+  position: absolute;
+  left: 1rem;
+  bottom: 1rem;
+  font-size: 0.76rem;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: #8fd8ff;
+}
+
+.tectonics-overlay-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.7rem;
+  max-width: min(86%, 440px);
+}
+
+.tectonics-overlay-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.38rem;
+  padding: 0.28rem 0.55rem;
+  border-radius: 999px;
+  background: rgba(9, 24, 42, 0.84);
+  border: 1px solid rgba(126, 208, 255, 0.16);
+  font-size: 0.66rem;
+  letter-spacing: 0.08em;
+}
+
+.tectonics-overlay-swatch {
+  width: 0.72rem;
+  height: 0.72rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  box-shadow: 0 0 10px rgba(111, 230, 255, 0.12);
+}
+
+.tectonics-sphere-readout {
+  min-height: 0;
+}
+
+.tectonics-playback-row,
+.tectonics-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+  margin-top: 0.85rem;
+}
+
+.tectonics-side-scroll {
+  max-height: 360px;
+}
+
+.tectonics-side-panel {
+  min-height: 0;
+}
+
+@media (max-width: 1100px) {
+  .tectonics-sphere-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .tectonics-sphere-main {
+    max-width: none;
+  }
+
+  .tectonics-sphere-stage {
+    height: clamp(320px, 46vh, 540px);
+  }
+}
+
 .saved-state ul,
 .diagnostics ul {
   margin: 0;

@@ -856,6 +856,132 @@ pub struct CompanionHomeSnapshot {
   pub categories: Vec<CompanionContextSection>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InterpretedMemoryItem {
+  pub id: i64,
+  pub memory_key: String,
+  pub source_kind: String,
+  pub source_ref_id: Option<i64>,
+  pub source_category_key: String,
+  pub source_entry_title: String,
+  pub memory_type: String,
+  pub summary: String,
+  pub detail: String,
+  pub tags: Vec<String>,
+  pub confidence: f64,
+  pub salience: f64,
+  pub sensitivity: String,
+  pub declared_by_user: bool,
+  pub status: String,
+  pub created_at: String,
+  pub updated_at: String,
+  pub interpreted_at: String,
+  pub last_observed_at: String,
+  pub archived_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetectorRecord {
+  pub id: i64,
+  pub detector_key: String,
+  pub detector_type: String,
+  pub target_kind: String,
+  pub target_ref_id: Option<i64>,
+  pub target_key: String,
+  pub direction: String,
+  pub strength: f64,
+  pub confidence: f64,
+  pub duration_seconds: i64,
+  pub repeat_count: i64,
+  pub summary: String,
+  pub evidence_json: String,
+  pub created_at: String,
+  pub last_seen_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEvolutionState {
+  pub id: i64,
+  pub memory_item_id: i64,
+  pub declared_confidence: f64,
+  pub observed_confidence: f64,
+  pub detector_balance: f64,
+  pub observed_support_score: f64,
+  pub observed_challenge_score: f64,
+  pub divergence_score: f64,
+  pub cumulative_support_score: f64,
+  pub cumulative_challenge_score: f64,
+  pub cumulative_divergence_score: f64,
+  pub support_source_count: i64,
+  pub challenge_source_count: i64,
+  pub source_coherence_score: f64,
+  pub sustained_divergence_score: f64,
+  pub phase_shift_score: f64,
+  pub phase_shift_state: String,
+  pub truth_alignment: String,
+  pub current_status: String,
+  pub reinforcement_score: f64,
+  pub drift_score: f64,
+  pub tension_score: f64,
+  pub volatility_score: f64,
+  pub emergence_score: f64,
+  pub protection_score: f64,
+  pub declared_truth_summary: String,
+  pub observed_truth_summary: String,
+  pub observed_evidence_summary: String,
+  pub phase_shift_summary: String,
+  pub alignment_summary: String,
+  pub last_evolved_at: String,
+  pub last_confirmed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TectonicTimelineSnapshot {
+  pub id: i64,
+  pub snapshot_kind: String,
+  pub recorded_at: String,
+  pub window_start: String,
+  pub window_end: String,
+  pub total_detector_activity: f64,
+  pub active_memory_count: i64,
+  pub summary_json: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySystemCount {
+  pub key: String,
+  pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySystemOverview {
+  pub total_memory_count: usize,
+  pub active_memory_count: usize,
+  pub historical_memory_count: usize,
+  pub detector_count: usize,
+  pub tectonic_snapshot_count: usize,
+  pub last_pass_at: Option<String>,
+  pub memory_type_breakdown: Vec<MemorySystemCount>,
+  pub detector_type_breakdown: Vec<MemorySystemCount>,
+  pub evolution_status_breakdown: Vec<MemorySystemCount>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemorySystemSnapshot {
+  pub memory_items: Vec<InterpretedMemoryItem>,
+  pub detector_records: Vec<DetectorRecord>,
+  pub evolution_states: Vec<MemoryEvolutionState>,
+  pub tectonic_timeline: Vec<TectonicTimelineSnapshot>,
+  pub overview: MemorySystemOverview,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CreateCompanionContextEntryInput {

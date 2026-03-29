@@ -1,8 +1,12 @@
-use std::{fs, path::PathBuf};
+use std::{
+  collections::{HashMap, HashSet},
+  fs,
+  path::PathBuf,
+};
 
-use chrono::{DateTime, Datelike, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveTime, Timelike, Utc};
 use chrono_tz::Tz;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 use serde_json::json;
 
 use crate::{
@@ -11,9 +15,11 @@ use crate::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DecisionRunResult,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSection, CompanionContextSnapshot, CompanionHomeSnapshot,
     CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput, UpdateCompanionContextEntryInput,
+    DetectorRecord, InterpretedMemoryItem, MemoryEvolutionState, MemorySystemCount, MemorySystemOverview, MemorySystemSnapshot, TectonicTimelineSnapshot,
     DecisionSnapshot, DiagnosticStatus, EndCallSessionInput, InboundMessage, InferredSleepWindow,
     LocationEventInput, ManualReflection, MemoryOverview, MomentDecision, OutreachEvent,
     MemoryGrowthSnapshot, MemoryItem, OutreachFeedback, PassiveContextSnapshot, PhaseOneSnapshot, PhaseThreeSnapshot, Place,
+    NorthStarCallReview,
     PlaceVisit, ProtectedRule, RawLocationEvent, ReflectionKindCount,
     RepeatedPlaceSummary, RealityCheckItem, RhythmBaselineEntry, SavedMoment, SettingsEntry,
     SimulationRunInput, SimulationRunResult, SimulationScenario, SimulationSuiteCheck,
@@ -22,7 +28,7 @@ use crate::{
   },
 };
 
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 18;
 
 const COMPANION_CONTEXT_CATEGORY_DEFS: [(&str, &str, &str, &str); 11] = [
     ("friends", "Friends", "The people you lean toward, miss, trust, or feel alive around.", "users"),
@@ -834,6 +840,2645 @@ pub fn update_companion_context_category_icon(
   ).map_err(AppError::from)
 }
 
+#[derive(Debug, Clone)]
+struct MemoryCandidate {
+  memory_key: String,
+  source_ref_id: i64,
+  source_category_key: String,
+  source_entry_title: String,
+  memory_type: String,
+  summary: String,
+  detail: String,
+  tags: Vec<String>,
+  confidence: f64,
+  salience: f64,
+  sensitivity: String,
+}
+
+#[derive(Debug, Clone)]
+struct DetectorSignal<'a> {
+  detector_type: &'a str,
+  target_kind: &'a str,
+  target_ref_id: Option<i64>,
+  target_key: String,
+  direction: &'a str,
+  strength: f64,
+  confidence: f64,
+  duration_seconds: i64,
+  summary: String,
+  evidence_json: String,
+}
+
+fn normalize_whitespace(value: &str) -> String {
+  value
+    .split_whitespace()
+    .collect::<Vec<_>>()
+    .join(" ")
+    .trim()
+    .to_string()
+}
+
+fn clamp_score(value: f64) -> f64 {
+  value.clamp(0.0, 1.0)
+}
+
+fn text_has_any_keyword(text: &str, keywords: &[&str]) -> bool {
+  let lowered = text.to_ascii_lowercase();
+  keywords.iter().any(|keyword| lowered.contains(keyword))
+}
+
+fn cleaned_match_tokens(text: &str) -> Vec<String> {
+  text
+    .to_ascii_lowercase()
+    .chars()
+    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { ' ' })
+    .collect::<String>()
+    .split_whitespace()
+    .filter(|token| token.len() >= 3)
+    .map(|token| token.to_string())
+    .collect()
+}
+
+fn memory_observation_terms(item: &InterpretedMemoryItem) -> Vec<String> {
+  let mut terms = Vec::new();
+  let title = normalize_whitespace(&item.source_entry_title).to_ascii_lowercase();
+  if title.len() >= 3 {
+    terms.push(title);
+  }
+  let title_tokens = cleaned_match_tokens(&item.source_entry_title);
+  for token in &title_tokens {
+    if !terms.iter().any(|term| term == token) {
+      terms.push(token.clone());
+    }
+  }
+  for window in title_tokens.windows(2) {
+    let phrase = window.join(" ");
+    if phrase.len() >= 3 && !terms.iter().any(|term| term == &phrase) {
+      terms.push(phrase);
+    }
+  }
+  for tag in &item.tags {
+    let normalized = normalize_whitespace(tag).to_ascii_lowercase();
+    if normalized.len() >= 3 && !terms.iter().any(|term| term == &normalized) {
+      terms.push(normalized);
+    }
+  }
+  terms
+}
+
+fn text_mentions_memory(text: &str, item: &InterpretedMemoryItem) -> bool {
+  let lowered = text.to_ascii_lowercase();
+  memory_observation_terms(item)
+    .into_iter()
+    .any(|term| lowered.contains(&term))
+}
+
+fn text_signals_memory_challenge(text: &str) -> bool {
+  text_has_any_keyword(
+    text,
+    &[
+      "not anymore",
+      "no longer",
+      "used to",
+      "don't",
+      "doesn't",
+      "never",
+      "stopped",
+      "quit",
+      "avoid",
+      "hard to",
+      "can't stand",
+      "cannot stand",
+      "less now",
+      "pulling away",
+    ],
+  )
+}
+
+fn text_signals_memory_support(text: &str) -> bool {
+  text_has_any_keyword(
+    text,
+    &[
+      "still",
+      "always",
+      "again",
+      "love",
+      "care about",
+      "important",
+      "steady",
+      "grounded",
+      "helps",
+      "matters",
+      "keeps",
+      "return to",
+    ],
+  )
+}
+
+fn review_sentiment_signals_support(sentiment: &str) -> bool {
+  text_has_any_keyword(
+    sentiment,
+    &["warm", "good", "positive", "supportive", "gentle", "grounded", "helpful", "close"],
+  )
+}
+
+fn review_sentiment_signals_challenge(sentiment: &str) -> bool {
+  text_has_any_keyword(
+    sentiment,
+    &["hard", "bad", "negative", "cold", "distant", "tense", "awkward", "painful", "off"],
+  )
+}
+
+fn category_primary_memory_type(category_key: &str) -> &'static str {
+  match category_key {
+    "friends" | "family" | "pet" => "relational_memory",
+    "life_principles" | "goals" => "value_memory",
+    "favorite_food" | "music" => "preference_memory",
+    "career" | "hobbies" => "behavioral_memory",
+    "favorite_places" | "home_location" => "factual_memory",
+    _ => "factual_memory",
+  }
+}
+
+fn category_secondary_memory_type(category_key: &str) -> Option<&'static str> {
+  match category_key {
+    "friends" | "family" | "pet" => Some("emotional_meaning_memory"),
+    "career" | "hobbies" | "music" => Some("identity_memory"),
+    "favorite_places" | "home_location" => Some("emotional_meaning_memory"),
+    "goals" => Some("temporal_phase_memory"),
+    _ => None,
+  }
+}
+
+fn candidate_summary_for_memory_type(memory_type: &str, title: &str, body: &str) -> String {
+  let body = normalize_whitespace(body);
+  let title = normalize_whitespace(title);
+  match memory_type {
+    "relational_memory" => format!("{title} is someone the user chose to place in living context. {body}"),
+    "value_memory" => format!("{title} reflects something the user is actively reaching toward or trying to live by. {body}"),
+    "preference_memory" => format!("{title} appears as a declared affinity or source of comfort. {body}"),
+    "behavioral_memory" => format!("{title} is part of how the user tends to spend time, effort, or attention. {body}"),
+    "emotional_meaning_memory" => format!("{title} carries stated meaning in the user's life. {body}"),
+    "temporal_phase_memory" => format!("{title} points to a current phase or directional movement. {body}"),
+    "identity_memory" => format!("{title} looks identity-relevant because the user chose it as self-description. {body}"),
+    _ => format!("{title}: {body}"),
+  }
+}
+
+fn candidate_detail(entry: &CompanionContextEntry) -> String {
+  let body = normalize_whitespace(&entry.body);
+  let notes = normalize_whitespace(&entry.notes);
+  if notes.is_empty() {
+    body
+  } else {
+    format!("{body} Notes: {notes}")
+  }
+}
+
+fn find_companion_context_entry_by_category_and_title(
+  connection: &Connection,
+  category_key: &str,
+  title: &str,
+) -> Result<Option<CompanionContextEntry>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        category_key,
+        title,
+        body,
+        tags_json,
+        notes,
+        display_order,
+        is_active,
+        deleted_at,
+        created_at,
+        updated_at
+      FROM companion_context_entries
+      WHERE category_key = ?1 AND title = ?2
+      ORDER BY id DESC
+      LIMIT 1
+    "#,
+  )?;
+
+  statement
+    .query_row(params![category_key, title], row_to_companion_context_entry)
+    .optional()
+    .map_err(AppError::from)
+}
+
+fn entry_sensitivity(entry: &CompanionContextEntry, memory_type: &str) -> String {
+  let joined = format!(
+    "{} {} {} {}",
+    entry.title,
+    entry.body,
+    entry.notes,
+    entry.tags.join(" ")
+  );
+  if text_has_any_keyword(
+    &joined,
+    &[
+      "private",
+      "sensitive",
+      "protect",
+      "boundary",
+      "medical",
+      "trauma",
+      "grief",
+      "pain",
+    ],
+  ) || memory_type == "sensitive_memory"
+  {
+    "high".into()
+  } else if text_has_any_keyword(&joined, &["family", "home", "relationship"]) {
+    "guarded".into()
+  } else {
+    "normal".into()
+  }
+}
+
+fn build_memory_candidates(entry: &CompanionContextEntry) -> Vec<MemoryCandidate> {
+  let primary_type = category_primary_memory_type(&entry.category_key);
+  let mut memory_types = vec![primary_type.to_string()];
+  if let Some(secondary) = category_secondary_memory_type(&entry.category_key) {
+    memory_types.push(secondary.to_string());
+  }
+
+  let detail = candidate_detail(entry);
+  let base_text = format!("{} {} {}", entry.title, entry.body, entry.notes);
+  let is_sensitive = text_has_any_keyword(
+    &base_text,
+    &["private", "sensitive", "boundary", "medical", "trauma", "grief"],
+  );
+
+  memory_types
+    .into_iter()
+    .enumerate()
+    .map(|(index, memory_type)| {
+      let confidence = if index == 0 { 0.84 } else { 0.72 };
+      let salience_boost = (entry.tags.len() as f64 * 0.04) + if !entry.notes.trim().is_empty() { 0.08 } else { 0.0 };
+      let sensitivity = if is_sensitive && index > 0 {
+        "high".into()
+      } else {
+        entry_sensitivity(entry, &memory_type)
+      };
+      MemoryCandidate {
+        memory_key: format!("context-entry-{}-{}", entry.id, memory_type),
+        source_ref_id: entry.id,
+        source_category_key: entry.category_key.clone(),
+        source_entry_title: entry.title.clone(),
+        memory_type: memory_type.clone(),
+        summary: candidate_summary_for_memory_type(&memory_type, &entry.title, &entry.body),
+        detail: detail.clone(),
+        tags: entry.tags.clone(),
+        confidence,
+        salience: clamp_score(0.58 + salience_boost + if index == 0 { 0.08 } else { 0.0 }),
+        sensitivity,
+      }
+    })
+    .collect()
+}
+
+fn row_to_interpreted_memory_item(row: &rusqlite::Row<'_>) -> Result<InterpretedMemoryItem, rusqlite::Error> {
+  let tags_json: String = row.get("tags_json")?;
+  Ok(InterpretedMemoryItem {
+    id: row.get("id")?,
+    memory_key: row.get("memory_key")?,
+    source_kind: row.get("source_kind")?,
+    source_ref_id: row.get("source_ref_id")?,
+    source_category_key: row.get("source_category_key")?,
+    source_entry_title: row.get("source_entry_title")?,
+    memory_type: row.get("memory_type")?,
+    summary: row.get("summary")?,
+    detail: row.get("detail")?,
+    tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+    confidence: row.get("confidence")?,
+    salience: row.get("salience")?,
+    sensitivity: row.get("sensitivity")?,
+    declared_by_user: row.get("declared_by_user")?,
+    status: row.get("status")?,
+    created_at: row.get("created_at")?,
+    updated_at: row.get("updated_at")?,
+    interpreted_at: row.get("interpreted_at")?,
+    last_observed_at: row.get("last_observed_at")?,
+    archived_at: row.get("archived_at")?,
+  })
+}
+
+fn row_to_detector_record(row: &rusqlite::Row<'_>) -> Result<DetectorRecord, rusqlite::Error> {
+  Ok(DetectorRecord {
+    id: row.get("id")?,
+    detector_key: row.get("detector_key")?,
+    detector_type: row.get("detector_type")?,
+    target_kind: row.get("target_kind")?,
+    target_ref_id: row.get("target_ref_id")?,
+    target_key: row.get("target_key")?,
+    direction: row.get("direction")?,
+    strength: row.get("strength")?,
+    confidence: row.get("confidence")?,
+    duration_seconds: row.get("duration_seconds")?,
+    repeat_count: row.get("repeat_count")?,
+    summary: row.get("summary")?,
+    evidence_json: row.get("evidence_json")?,
+    created_at: row.get("created_at")?,
+    last_seen_at: row.get("last_seen_at")?,
+  })
+}
+
+fn row_to_memory_evolution_state(row: &rusqlite::Row<'_>) -> Result<MemoryEvolutionState, rusqlite::Error> {
+  Ok(MemoryEvolutionState {
+    id: row.get("id")?,
+    memory_item_id: row.get("memory_item_id")?,
+    declared_confidence: row.get("declared_confidence")?,
+    observed_confidence: row.get("observed_confidence")?,
+    detector_balance: row.get("detector_balance")?,
+    observed_support_score: row.get("observed_support_score")?,
+    observed_challenge_score: row.get("observed_challenge_score")?,
+    divergence_score: row.get("divergence_score")?,
+    cumulative_support_score: row.get("cumulative_support_score")?,
+    cumulative_challenge_score: row.get("cumulative_challenge_score")?,
+    cumulative_divergence_score: row.get("cumulative_divergence_score")?,
+    support_source_count: row.get("support_source_count")?,
+    challenge_source_count: row.get("challenge_source_count")?,
+    source_coherence_score: row.get("source_coherence_score")?,
+    sustained_divergence_score: row.get("sustained_divergence_score")?,
+    phase_shift_score: row.get("phase_shift_score")?,
+    phase_shift_state: row.get("phase_shift_state")?,
+    truth_alignment: row.get("truth_alignment")?,
+    current_status: row.get("current_status")?,
+    reinforcement_score: row.get("reinforcement_score")?,
+    drift_score: row.get("drift_score")?,
+    tension_score: row.get("tension_score")?,
+    volatility_score: row.get("volatility_score")?,
+    emergence_score: row.get("emergence_score")?,
+    protection_score: row.get("protection_score")?,
+    declared_truth_summary: row.get("declared_truth_summary")?,
+    observed_truth_summary: row.get("observed_truth_summary")?,
+    observed_evidence_summary: row.get("observed_evidence_summary")?,
+    phase_shift_summary: row.get("phase_shift_summary")?,
+    alignment_summary: row.get("alignment_summary")?,
+    last_evolved_at: row.get("last_evolved_at")?,
+    last_confirmed_at: row.get("last_confirmed_at")?,
+  })
+}
+
+fn row_to_tectonic_timeline_snapshot(row: &rusqlite::Row<'_>) -> Result<TectonicTimelineSnapshot, rusqlite::Error> {
+  Ok(TectonicTimelineSnapshot {
+    id: row.get("id")?,
+    snapshot_kind: row.get("snapshot_kind")?,
+    recorded_at: row.get("recorded_at")?,
+    window_start: row.get("window_start")?,
+    window_end: row.get("window_end")?,
+    total_detector_activity: row.get("total_detector_activity")?,
+    active_memory_count: row.get("active_memory_count")?,
+    summary_json: row.get("summary_json")?,
+  })
+}
+
+#[derive(Debug, Clone)]
+struct StoredNorthStarCallReview {
+  id: i64,
+  review_id: String,
+  call_id: String,
+  user_handle: String,
+  sentiment: String,
+  notes: String,
+  created_at: String,
+  imported_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct MemoryEvolutionHistoryPoint {
+  divergence_score: f64,
+  source_coherence_score: f64,
+  observed_confidence: f64,
+}
+
+fn row_to_stored_north_star_call_review(
+  row: &rusqlite::Row<'_>,
+) -> Result<StoredNorthStarCallReview, rusqlite::Error> {
+  Ok(StoredNorthStarCallReview {
+    id: row.get("id")?,
+    review_id: row.get("review_id")?,
+    call_id: row.get("call_id")?,
+    user_handle: row.get("user_handle")?,
+    sentiment: row.get("sentiment")?,
+    notes: row.get("notes")?,
+    created_at: row.get("created_at")?,
+    imported_at: row.get("imported_at")?,
+  })
+}
+
+fn list_interpreted_memory_items(connection: &Connection) -> Result<Vec<InterpretedMemoryItem>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        memory_key,
+        source_kind,
+        source_ref_id,
+        source_category_key,
+        source_entry_title,
+        memory_type,
+        summary,
+        detail,
+        tags_json,
+        confidence,
+        salience,
+        sensitivity,
+        declared_by_user,
+        status,
+        created_at,
+        updated_at,
+        interpreted_at,
+        last_observed_at,
+        archived_at
+      FROM companion_memory_items
+      ORDER BY
+        CASE WHEN archived_at IS NULL THEN 0 ELSE 1 END,
+        salience DESC,
+        updated_at DESC,
+        id DESC
+    "#,
+  )?;
+  let rows = statement.query_map([], row_to_interpreted_memory_item)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn list_detector_records(connection: &Connection) -> Result<Vec<DetectorRecord>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        detector_key,
+        detector_type,
+        target_kind,
+        target_ref_id,
+        target_key,
+        direction,
+        strength,
+        confidence,
+        duration_seconds,
+        repeat_count,
+        summary,
+        evidence_json,
+        created_at,
+        last_seen_at
+      FROM memory_detector_records
+      ORDER BY last_seen_at DESC, strength DESC, id DESC
+    "#,
+  )?;
+  let rows = statement.query_map([], row_to_detector_record)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn list_memory_evolution_states(connection: &Connection) -> Result<Vec<MemoryEvolutionState>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        memory_item_id,
+        declared_confidence,
+        observed_confidence,
+        detector_balance,
+        observed_support_score,
+        observed_challenge_score,
+        divergence_score,
+        cumulative_support_score,
+        cumulative_challenge_score,
+        cumulative_divergence_score,
+        support_source_count,
+        challenge_source_count,
+        source_coherence_score,
+        sustained_divergence_score,
+        phase_shift_score,
+        phase_shift_state,
+        truth_alignment,
+        current_status,
+        reinforcement_score,
+        drift_score,
+        tension_score,
+        volatility_score,
+        emergence_score,
+        protection_score,
+        declared_truth_summary,
+        observed_truth_summary,
+        observed_evidence_summary,
+        phase_shift_summary,
+        alignment_summary,
+        last_evolved_at,
+        last_confirmed_at
+      FROM memory_evolution_state
+      ORDER BY last_evolved_at DESC, id DESC
+    "#,
+  )?;
+  let rows = statement.query_map([], row_to_memory_evolution_state)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn list_tectonic_timeline_snapshots(connection: &Connection, limit: usize) -> Result<Vec<TectonicTimelineSnapshot>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        snapshot_kind,
+        recorded_at,
+        window_start,
+        window_end,
+        total_detector_activity,
+        active_memory_count,
+        summary_json
+      FROM tectonic_timeline_snapshots
+      ORDER BY recorded_at DESC, id DESC
+      LIMIT ?1
+    "#,
+  )?;
+  let rows = statement.query_map(params![limit as i64], row_to_tectonic_timeline_snapshot)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn list_north_star_call_reviews(connection: &Connection) -> Result<Vec<StoredNorthStarCallReview>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        review_id,
+        call_id,
+        user_handle,
+        sentiment,
+        notes,
+        created_at,
+        imported_at
+      FROM north_star_call_reviews
+      ORDER BY created_at DESC, id DESC
+    "#,
+  )?;
+  let rows = statement.query_map([], row_to_stored_north_star_call_review)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn upsert_north_star_call_review(
+  connection: &Connection,
+  review: &NorthStarCallReview,
+  imported_at: &str,
+) -> Result<bool, AppError> {
+  let existing_id = connection
+    .query_row(
+      "SELECT id FROM north_star_call_reviews WHERE review_id = ?1",
+      params![review.review_id],
+      |row| row.get::<_, i64>(0),
+    )
+    .optional()?;
+
+  if let Some(id) = existing_id {
+    connection.execute(
+      r#"
+        UPDATE north_star_call_reviews
+        SET
+          call_id = ?2,
+          user_handle = ?3,
+          sentiment = ?4,
+          notes = ?5,
+          created_at = ?6,
+          imported_at = ?7
+        WHERE id = ?1
+      "#,
+      params![
+        id,
+        review.call_id,
+        review.user_handle,
+        review.sentiment,
+        review.notes,
+        review.created_at,
+        imported_at,
+      ],
+    )?;
+    Ok(false)
+  } else {
+    connection.execute(
+      r#"
+        INSERT INTO north_star_call_reviews (
+          review_id,
+          call_id,
+          user_handle,
+          sentiment,
+          notes,
+          created_at,
+          imported_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      "#,
+      params![
+        review.review_id,
+        review.call_id,
+        review.user_handle,
+        review.sentiment,
+        review.notes,
+        review.created_at,
+        imported_at,
+      ],
+    )?;
+    Ok(true)
+  }
+}
+
+fn build_count_breakdown(values: Vec<String>) -> Vec<MemorySystemCount> {
+  let mut counts: HashMap<String, usize> = HashMap::new();
+  for value in values {
+    *counts.entry(value).or_insert(0) += 1;
+  }
+  let mut items = counts
+    .into_iter()
+    .map(|(key, count)| MemorySystemCount { key, count })
+    .collect::<Vec<_>>();
+  items.sort_by(|left, right| right.count.cmp(&left.count).then_with(|| left.key.cmp(&right.key)));
+  items
+}
+
+fn tectonic_region_seed(target_kind: &str, index: usize) -> (f64, f64, f64) {
+  match target_kind {
+    "interaction_field" => (-26.0, -124.0, 138.0),
+    "interaction_boundary" => (28.0, -108.0, 126.0),
+    "conversation_theme" => (6.0, -42.0, 132.0),
+    "outreach_path" => (42.0, 28.0, 124.0),
+    "memory_item" => (-36.0, 18.0, 142.0),
+    "category" => (18.0, 72.0, 116.0),
+    _ => (-32.0 + (index as f64 * 24.0), -120.0 + (index as f64 * 36.0), 128.0),
+  }
+}
+
+fn latest_tectonic_region_state(connection: &Connection) -> Result<HashMap<String, (i64, f64)>, AppError> {
+  let previous_summary = connection
+    .query_row(
+      "SELECT summary_json FROM tectonic_timeline_snapshots ORDER BY recorded_at DESC, id DESC LIMIT 1",
+      [],
+      |row| row.get::<_, String>(0),
+    )
+    .optional()?;
+
+  let mut state = HashMap::new();
+  if let Some(summary_json) = previous_summary {
+    let parsed = serde_json::from_str::<serde_json::Value>(&summary_json).unwrap_or_else(|_| json!({}));
+    if let Some(regions) = parsed.get("regionContinuity").and_then(|value| value.as_array()) {
+      for region in regions {
+        if let Some(region_id) = region.get("regionId").and_then(|value| value.as_str()) {
+          let persistence_frames = region
+            .get("persistenceFrames")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(0);
+          let activity = region
+            .get("activity")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+          state.insert(region_id.to_string(), (persistence_frames, activity));
+        }
+      }
+    }
+  }
+
+  Ok(state)
+}
+
+fn build_tectonic_region_continuity(
+  connection: &Connection,
+  detector_records: &[DetectorRecord],
+  evolution_states: &[MemoryEvolutionState],
+) -> Result<Vec<serde_json::Value>, AppError> {
+  let previous_state = latest_tectonic_region_state(connection)?;
+  let mut grouped: HashMap<String, Vec<&DetectorRecord>> = HashMap::new();
+  for record in detector_records {
+    grouped.entry(record.target_kind.clone()).or_default().push(record);
+  }
+
+  let mut target_kinds = grouped.keys().cloned().collect::<Vec<_>>();
+  target_kinds.sort();
+
+  let mut regions = Vec::new();
+  for (index, target_kind) in target_kinds.into_iter().enumerate() {
+    let Some(records) = grouped.get(&target_kind) else {
+      continue;
+    };
+
+    let region_id = format!("region:{target_kind}");
+    let detector_activity = records.iter().map(|record| record.strength).sum::<f64>();
+    let detector_count = records.len();
+    let divergence_pressure = if target_kind == "memory_item" {
+      evolution_states
+        .iter()
+        .map(|state| state.cumulative_divergence_score + (state.source_coherence_score * 0.45))
+        .sum::<f64>()
+    } else {
+      0.0
+    };
+    let activity = detector_activity + (divergence_pressure * 0.35);
+
+    let direction_counts = build_count_breakdown(records.iter().map(|record| record.direction.clone()).collect());
+    let dominant_direction = direction_counts
+      .first()
+      .map(|item| item.key.clone())
+      .unwrap_or_else(|| "steadying".to_string());
+
+    let detector_types = build_count_breakdown(records.iter().map(|record| record.detector_type.clone()).collect());
+    let dominant_detector_type = detector_types
+      .first()
+      .map(|item| item.key.clone())
+      .unwrap_or_else(|| "quiet".to_string());
+
+    let (previous_frames, previous_activity) = previous_state.get(&region_id).copied().unwrap_or((0, 0.0));
+    let persistence_frames = previous_frames + 1;
+    let activity_delta = activity - previous_activity;
+    let (center_latitude, longitude_start, longitude_end) = tectonic_region_seed(&target_kind, index);
+
+    regions.push(json!({
+      "regionId": region_id,
+      "targetKind": target_kind,
+      "dominantDirection": dominant_direction,
+      "dominantDetectorType": dominant_detector_type,
+      "activity": activity,
+      "activityDelta": activity_delta,
+      "divergencePressure": divergence_pressure,
+      "detectorCount": detector_count,
+      "persistenceFrames": persistence_frames,
+      "centerLatitude": center_latitude,
+      "longitudeStart": longitude_start,
+      "longitudeEnd": longitude_end,
+    }));
+  }
+
+  regions.sort_by(|left, right| {
+    let right_activity = right.get("activity").and_then(|value| value.as_f64()).unwrap_or(0.0);
+    let left_activity = left.get("activity").and_then(|value| value.as_f64()).unwrap_or(0.0);
+    right_activity
+      .partial_cmp(&left_activity)
+      .unwrap_or(std::cmp::Ordering::Equal)
+  });
+  Ok(regions)
+}
+
+fn build_memory_system_snapshot(connection: &Connection) -> Result<MemorySystemSnapshot, AppError> {
+  let memory_items = list_interpreted_memory_items(connection)?;
+  let detector_records = list_detector_records(connection)?;
+  let evolution_states = list_memory_evolution_states(connection)?;
+  let mut tectonic_timeline = list_tectonic_timeline_snapshots(connection, 168)?;
+  tectonic_timeline.reverse();
+
+  let total_memory_count = memory_items.len();
+  let active_memory_count = memory_items.iter().filter(|item| item.archived_at.is_none()).count();
+  let historical_memory_count = memory_items.iter().filter(|item| item.archived_at.is_some()).count();
+  let detector_count = detector_records.len();
+  let tectonic_snapshot_count = tectonic_timeline.len();
+  let last_pass_at = tectonic_timeline.last().map(|snapshot| snapshot.recorded_at.clone());
+
+  Ok(MemorySystemSnapshot {
+    overview: MemorySystemOverview {
+      total_memory_count,
+      active_memory_count,
+      historical_memory_count,
+      detector_count,
+      tectonic_snapshot_count,
+      last_pass_at,
+      memory_type_breakdown: build_count_breakdown(memory_items.iter().map(|item| item.memory_type.clone()).collect()),
+      detector_type_breakdown: build_count_breakdown(detector_records.iter().map(|item| item.detector_type.clone()).collect()),
+      evolution_status_breakdown: build_count_breakdown(evolution_states.iter().map(|item| item.current_status.clone()).collect()),
+    },
+    memory_items,
+    detector_records,
+    evolution_states,
+    tectonic_timeline,
+  })
+}
+
+fn detector_signal_key(signal: &DetectorSignal<'_>) -> String {
+  format!("{}:{}:{}", signal.detector_type, signal.target_kind, signal.target_key)
+}
+
+fn upsert_detector_signal(connection: &Connection, signal: &DetectorSignal<'_>, now: &str) -> Result<(), AppError> {
+  let detector_key = detector_signal_key(signal);
+  let existing = connection
+    .query_row(
+      r#"
+        SELECT id, repeat_count
+        FROM memory_detector_records
+        WHERE detector_key = ?1
+      "#,
+      params![detector_key],
+      |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )
+    .optional()?;
+
+  if let Some((id, repeat_count)) = existing {
+    connection.execute(
+      r#"
+        UPDATE memory_detector_records
+        SET
+          target_ref_id = ?2,
+          direction = ?3,
+          strength = ?4,
+          confidence = ?5,
+          duration_seconds = ?6,
+          repeat_count = ?7,
+          summary = ?8,
+          evidence_json = ?9,
+          last_seen_at = ?10
+        WHERE id = ?1
+      "#,
+      params![
+        id,
+        signal.target_ref_id,
+        signal.direction,
+        signal.strength,
+        signal.confidence,
+        signal.duration_seconds,
+        repeat_count + 1,
+        signal.summary,
+        signal.evidence_json,
+        now,
+      ],
+    )?;
+  } else {
+    connection.execute(
+      r#"
+        INSERT INTO memory_detector_records (
+          detector_key,
+          detector_type,
+          target_kind,
+          target_ref_id,
+          target_key,
+          direction,
+          strength,
+          confidence,
+          duration_seconds,
+          repeat_count,
+          summary,
+          evidence_json,
+          created_at,
+          last_seen_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, ?10, ?11, ?12, ?12)
+      "#,
+      params![
+        detector_key,
+        signal.detector_type,
+        signal.target_kind,
+        signal.target_ref_id,
+        signal.target_key,
+        signal.direction,
+        signal.strength,
+        signal.confidence,
+        signal.duration_seconds,
+        signal.summary,
+        signal.evidence_json,
+        now,
+      ],
+    )?;
+  }
+
+  Ok(())
+}
+
+fn upsert_memory_candidate(
+  connection: &Connection,
+  candidate: &MemoryCandidate,
+  now: &str,
+) -> Result<(i64, bool, bool), AppError> {
+  let tags_json = serde_json::to_string(&candidate.tags)?;
+  let existing = connection
+    .query_row(
+      r#"
+        SELECT id, summary, detail, archived_at
+        FROM companion_memory_items
+        WHERE memory_key = ?1
+      "#,
+      params![candidate.memory_key],
+      |row| {
+        Ok((
+          row.get::<_, i64>(0)?,
+          row.get::<_, String>(1)?,
+          row.get::<_, String>(2)?,
+          row.get::<_, Option<String>>(3)?,
+        ))
+      },
+    )
+    .optional()?;
+
+  if let Some((id, previous_summary, previous_detail, archived_at)) = existing {
+    let changed = previous_summary != candidate.summary || previous_detail != candidate.detail;
+    connection.execute(
+      r#"
+        UPDATE companion_memory_items
+        SET
+          source_ref_id = ?2,
+          source_category_key = ?3,
+          source_entry_title = ?4,
+          memory_type = ?5,
+          summary = ?6,
+          detail = ?7,
+          tags_json = ?8,
+          confidence = ?9,
+          salience = ?10,
+          sensitivity = ?11,
+          declared_by_user = 1,
+          updated_at = ?12,
+          interpreted_at = ?12,
+          last_observed_at = ?12,
+          archived_at = NULL
+        WHERE id = ?1
+      "#,
+      params![
+        id,
+        candidate.source_ref_id,
+        candidate.source_category_key,
+        candidate.source_entry_title,
+        candidate.memory_type,
+        candidate.summary,
+        candidate.detail,
+        tags_json,
+        candidate.confidence,
+        candidate.salience,
+        candidate.sensitivity,
+        now,
+      ],
+    )?;
+    Ok((id, false, changed || archived_at.is_some()))
+  } else {
+    connection.execute(
+      r#"
+        INSERT INTO companion_memory_items (
+          memory_key,
+          source_kind,
+          source_ref_id,
+          source_category_key,
+          source_entry_title,
+          memory_type,
+          summary,
+          detail,
+          tags_json,
+          confidence,
+          salience,
+          sensitivity,
+          declared_by_user,
+          status,
+          created_at,
+          updated_at,
+          interpreted_at,
+          last_observed_at,
+          archived_at
+        ) VALUES (?1, 'manual_context_entry', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 1, 'active', ?12, ?12, ?12, ?12, NULL)
+      "#,
+      params![
+        candidate.memory_key,
+        candidate.source_ref_id,
+        candidate.source_category_key,
+        candidate.source_entry_title,
+        candidate.memory_type,
+        candidate.summary,
+        candidate.detail,
+        tags_json,
+        candidate.confidence,
+        candidate.salience,
+        candidate.sensitivity,
+        now,
+      ],
+    )?;
+    Ok((connection.last_insert_rowid(), true, false))
+  }
+}
+
+fn detector_score_for(
+  connection: &Connection,
+  target_key: &str,
+  detector_type: &str,
+  window_start: &str,
+) -> Result<f64, AppError> {
+  let score = connection.query_row(
+    r#"
+      SELECT COALESCE(MAX(strength), 0.0)
+      FROM memory_detector_records
+      WHERE target_key = ?1
+        AND detector_type = ?2
+        AND last_seen_at >= ?3
+    "#,
+    params![target_key, detector_type, window_start],
+    |row| row.get::<_, f64>(0),
+  )?;
+  Ok(score)
+}
+
+fn detector_records_for_target(
+  connection: &Connection,
+  target_key: &str,
+  window_start: &str,
+) -> Result<Vec<DetectorRecord>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id,
+        detector_key,
+        detector_type,
+        target_kind,
+        target_ref_id,
+        target_key,
+        direction,
+        strength,
+        confidence,
+        duration_seconds,
+        repeat_count,
+        summary,
+        evidence_json,
+        created_at,
+        last_seen_at
+      FROM memory_detector_records
+      WHERE target_key = ?1
+        AND last_seen_at >= ?2
+      ORDER BY last_seen_at DESC, id DESC
+    "#,
+  )?;
+  let rows = statement.query_map(params![target_key, window_start], row_to_detector_record)?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn detector_source_family(record: &DetectorRecord) -> String {
+  let parsed = serde_json::from_str::<serde_json::Value>(&record.evidence_json).unwrap_or_else(|_| json!({}));
+  let source = parsed
+    .get("source")
+    .and_then(|value| value.as_str())
+    .unwrap_or_default();
+
+  if source.contains("north_star_call_review") {
+    "call_review".into()
+  } else if source.contains("call_session") {
+    "call".into()
+  } else if source.contains("outreach_feedback") {
+    "feedback".into()
+  } else if source.contains("manual_context") || source.contains("sourceEntryId") {
+    "manual_context".into()
+  } else {
+    record.target_kind.clone()
+  }
+}
+
+fn build_observed_evidence_profile(
+  connection: &Connection,
+  target_key: &str,
+  window_start: &str,
+) -> Result<(i64, i64, f64, String), AppError> {
+  let records = detector_records_for_target(connection, target_key, window_start)?;
+  let mut support_sources = HashSet::new();
+  let mut challenge_sources = HashSet::new();
+  let mut support_hits = 0usize;
+  let mut challenge_hits = 0usize;
+
+  for record in &records {
+    let family = detector_source_family(record);
+    match record.detector_type.as_str() {
+      "reinforcement" | "emergence" | "protection" => {
+        support_sources.insert(family);
+        support_hits += 1;
+      }
+      "drift" | "tension" | "volatility" => {
+        challenge_sources.insert(family);
+        challenge_hits += 1;
+      }
+      _ => {}
+    }
+  }
+
+  let support_source_count = support_sources.len() as i64;
+  let challenge_source_count = challenge_sources.len() as i64;
+  let source_coherence_score = clamp_score(
+    ((support_source_count.max(challenge_source_count) as f64) * 0.22)
+      + ((support_hits.max(challenge_hits) as f64) * 0.04),
+  );
+
+  let mut summary_parts = Vec::new();
+  if support_source_count > 0 {
+    let mut sources = support_sources.into_iter().collect::<Vec<_>>();
+    sources.sort();
+    summary_parts.push(format!("support seen across {}", sources.join(", ")));
+  }
+  if challenge_source_count > 0 {
+    let mut sources = challenge_sources.into_iter().collect::<Vec<_>>();
+    sources.sort();
+    summary_parts.push(format!("challenge seen across {}", sources.join(", ")));
+  }
+  let observed_evidence_summary = if summary_parts.is_empty() {
+    "No recent lived evidence sources are attached to this memory yet.".to_string()
+  } else {
+    format!("Recent observed-truth pressure: {}.", summary_parts.join(" while "))
+  };
+
+  Ok((
+    support_source_count,
+    challenge_source_count,
+    source_coherence_score,
+    observed_evidence_summary,
+  ))
+}
+
+fn recent_memory_evolution_history(
+  connection: &Connection,
+  memory_item_id: i64,
+  limit: usize,
+) -> Result<Vec<MemoryEvolutionHistoryPoint>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        divergence_score,
+        source_coherence_score,
+        observed_confidence
+      FROM memory_evolution_history
+      WHERE memory_item_id = ?1
+      ORDER BY evolved_at DESC, id DESC
+      LIMIT ?2
+    "#,
+  )?;
+  let rows = statement.query_map(params![memory_item_id, limit as i64], |row| {
+    Ok(MemoryEvolutionHistoryPoint {
+      divergence_score: row.get(0)?,
+      source_coherence_score: row.get(1)?,
+      observed_confidence: row.get(2)?,
+    })
+  })?;
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn phase_shift_profile(
+  connection: &Connection,
+  item: &InterpretedMemoryItem,
+  divergence_score: f64,
+  source_coherence_score: f64,
+  observed_confidence: f64,
+) -> Result<(f64, f64, String, String), AppError> {
+  let mut history = recent_memory_evolution_history(connection, item.id, 6)?;
+  history.insert(
+    0,
+    MemoryEvolutionHistoryPoint {
+      divergence_score,
+      source_coherence_score,
+      observed_confidence,
+    },
+  );
+
+  let sustained_divergence_score = if history.is_empty() {
+    0.0
+  } else {
+    history
+      .iter()
+      .map(|point| point.divergence_score)
+      .sum::<f64>()
+      / history.len() as f64
+  };
+  let coherence_average = if history.is_empty() {
+    0.0
+  } else {
+    history
+      .iter()
+      .map(|point| point.source_coherence_score)
+      .sum::<f64>()
+      / history.len() as f64
+  };
+  let confidence_slope = if history.len() >= 2 {
+    (history[0].observed_confidence - history[history.len() - 1].observed_confidence).abs()
+  } else {
+    0.0
+  };
+  let phase_shift_score = clamp_score(
+    (sustained_divergence_score * 0.58) + (coherence_average * 0.27) + (confidence_slope * 0.42),
+  );
+  let phase_shift_state = if item.archived_at.is_some() {
+    "historical"
+  } else if phase_shift_score >= 0.72 {
+    "sustained_shift"
+  } else if phase_shift_score >= 0.42 {
+    "shifting"
+  } else {
+    "stable"
+  }
+  .to_string();
+
+  let phase_shift_summary = match phase_shift_state.as_str() {
+    "historical" => "This memory now belongs to an earlier phase and is being held historically.".to_string(),
+    "sustained_shift" => "This no longer looks like a brief wobble. The observed pattern is holding as a real phase shift.".to_string(),
+    "shifting" => "This memory is showing movement across multiple passes and may be entering a new phase.".to_string(),
+    _ => "This still reads as a local fluctuation more than a sustained phase change.".to_string(),
+  };
+
+  Ok((
+    sustained_divergence_score,
+    phase_shift_score,
+    phase_shift_state,
+    phase_shift_summary,
+  ))
+}
+
+fn evolve_memory_item(
+  connection: &Connection,
+  item: &InterpretedMemoryItem,
+  now: &str,
+  window_start: &str,
+) -> Result<(), AppError> {
+  let reinforcement_score = detector_score_for(connection, &item.memory_key, "reinforcement", window_start)?;
+  let drift_score = detector_score_for(connection, &item.memory_key, "drift", window_start)?;
+  let tension_score = detector_score_for(connection, &item.memory_key, "tension", window_start)?;
+  let volatility_score = detector_score_for(connection, &item.memory_key, "volatility", window_start)?;
+  let emergence_score = detector_score_for(connection, &item.memory_key, "emergence", window_start)?;
+  let protection_score = detector_score_for(connection, &item.memory_key, "protection", window_start)?;
+
+  let detector_balance =
+    reinforcement_score + emergence_score + protection_score - drift_score - tension_score - volatility_score;
+  let observed_support_score =
+    clamp_score(reinforcement_score + (emergence_score * 0.72) + (protection_score * 0.48));
+  let observed_challenge_score =
+    clamp_score(drift_score + (tension_score * 0.95) + (volatility_score * 0.82));
+  let observed_confidence = clamp_score(
+    item.confidence
+      + (reinforcement_score * 0.09)
+      + (emergence_score * 0.04)
+      + (protection_score * 0.02)
+      - (drift_score * 0.12)
+      - (tension_score * 0.10)
+      - (volatility_score * 0.08),
+  );
+  let divergence_score = clamp_score(
+    ((item.confidence - observed_confidence).abs() * 1.35)
+      + ((observed_challenge_score - (observed_support_score * 0.55)).max(0.0) * 0.85),
+  );
+  let (
+    support_source_count,
+    challenge_source_count,
+    source_coherence_score,
+    observed_evidence_summary,
+  ) = build_observed_evidence_profile(connection, &item.memory_key, window_start)?;
+  let (
+    sustained_divergence_score,
+    phase_shift_score,
+    phase_shift_state,
+    phase_shift_summary,
+  ) = phase_shift_profile(connection, item, divergence_score, source_coherence_score, observed_confidence)?;
+  let previous_cumulative = connection
+    .query_row(
+      r#"
+        SELECT cumulative_support_score, cumulative_challenge_score, cumulative_divergence_score
+        FROM memory_evolution_state
+        WHERE memory_item_id = ?1
+      "#,
+      params![item.id],
+      |row| {
+        Ok((
+          row.get::<_, f64>(0)?,
+          row.get::<_, f64>(1)?,
+          row.get::<_, f64>(2)?,
+        ))
+      },
+    )
+    .optional()?
+    .unwrap_or((0.0, 0.0, 0.0));
+  let cumulative_support_score =
+    clamp_score((previous_cumulative.0 * 0.72) + (observed_support_score * 0.78));
+  let cumulative_challenge_score =
+    clamp_score((previous_cumulative.1 * 0.72) + (observed_challenge_score * 0.82));
+  let cumulative_divergence_score =
+    clamp_score((previous_cumulative.2 * 0.76) + (divergence_score * 0.88));
+  let truth_alignment = if item.archived_at.is_some() {
+    "historical"
+  } else if protection_score >= 0.75 {
+    "guarded"
+  } else if cumulative_divergence_score >= 0.74
+    || divergence_score >= 0.72
+    || (challenge_source_count >= 2 && source_coherence_score >= 0.44 && cumulative_challenge_score >= 0.62)
+    || (drift_score >= 0.76 && observed_challenge_score >= (observed_support_score * 0.85))
+    || (cumulative_challenge_score >= 0.76 && cumulative_support_score < 0.56)
+    || (observed_challenge_score >= 0.72 && observed_support_score < 0.52)
+  {
+    "diverging"
+  } else if cumulative_divergence_score >= 0.42
+    || divergence_score >= 0.42
+    || (challenge_source_count >= 2 && source_coherence_score >= 0.28)
+    || cumulative_challenge_score >= 0.55
+    || observed_challenge_score >= 0.55
+  {
+    "watching"
+  } else {
+    "aligned"
+  };
+
+  let current_status = if item.archived_at.is_some() {
+    "historical"
+  } else if item.sensitivity == "high" && truth_alignment == "diverging" {
+    "awaiting_confirmation"
+  } else if protection_score >= 0.75 {
+    "protected"
+  } else if volatility_score >= 0.70 {
+    "volatile"
+  } else if tension_score >= 0.68 {
+    "conflicted"
+  } else if drift_score >= 0.64 && reinforcement_score < 0.55 {
+    "drifting"
+  } else if emergence_score >= 0.68 && reinforcement_score < 0.60 {
+    "emerging"
+  } else if reinforcement_score >= 0.78 {
+    "reinforced"
+    } else {
+      "active"
+    };
+
+  let alignment_summary = match truth_alignment {
+    "historical" => "The declared memory now belongs to earlier context rather than the active present.",
+    "guarded" => "Observed evidence should be handled carefully here because this area is boundary-sensitive.",
+    "diverging" => "Recent lived evidence has accumulated into a real pull away from the declared version of this memory.",
+    "watching" => "Observed life is not fully contradicting this memory, but the fit is no longer clean and the tension is accumulating across sources.",
+    _ => "Recent lived evidence still broadly supports the declared memory.",
+  }
+  .to_string();
+
+  let observed_truth_summary = match current_status {
+    "historical" => "The source context is no longer active, so this memory is being kept as historical context.",
+    "protected" => "This memory is being carried carefully because the source reads as protected or boundary-sensitive.",
+    "awaiting_confirmation" => "Observed life is pulling against a sensitive declared memory, so this should wait for clearer confirmation.",
+    "volatile" => "This memory is seeing unstable movement and should be treated as unsettled.",
+    "conflicted" => "This memory currently holds mixed signals rather than a settled interpretation.",
+    "drifting" => "Declared truth and recent movement are beginning to pull apart.",
+    "emerging" => "This memory is still taking shape and should stay light-touch.",
+    "reinforced" => "This memory has repeated support and is becoming more durable.",
+    _ => "This memory is active but still open to future movement.",
+  }
+  .to_string();
+
+  let last_confirmed_at = if item.declared_by_user {
+    Some(item.last_observed_at.clone())
+  } else {
+    None
+  };
+
+  let existing_id = connection
+    .query_row(
+      "SELECT id FROM memory_evolution_state WHERE memory_item_id = ?1",
+      params![item.id],
+      |row| row.get::<_, i64>(0),
+    )
+    .optional()?;
+
+  if let Some(id) = existing_id {
+    connection.execute(
+      r#"
+        UPDATE memory_evolution_state
+        SET
+          declared_confidence = ?2,
+          observed_confidence = ?3,
+          detector_balance = ?4,
+          observed_support_score = ?5,
+          observed_challenge_score = ?6,
+          divergence_score = ?7,
+          cumulative_support_score = ?8,
+          cumulative_challenge_score = ?9,
+          cumulative_divergence_score = ?10,
+          support_source_count = ?11,
+          challenge_source_count = ?12,
+          source_coherence_score = ?13,
+          sustained_divergence_score = ?14,
+          phase_shift_score = ?15,
+          phase_shift_state = ?16,
+          truth_alignment = ?17,
+          current_status = ?18,
+          reinforcement_score = ?19,
+          drift_score = ?20,
+          tension_score = ?21,
+          volatility_score = ?22,
+          emergence_score = ?23,
+          protection_score = ?24,
+          declared_truth_summary = ?25,
+          observed_truth_summary = ?26,
+          observed_evidence_summary = ?27,
+          phase_shift_summary = ?28,
+          alignment_summary = ?29,
+          last_evolved_at = ?30,
+          last_confirmed_at = ?31
+        WHERE id = ?1
+      "#,
+      params![
+        id,
+        item.confidence,
+        observed_confidence,
+        detector_balance,
+        observed_support_score,
+        observed_challenge_score,
+        divergence_score,
+        cumulative_support_score,
+        cumulative_challenge_score,
+        cumulative_divergence_score,
+        support_source_count,
+        challenge_source_count,
+        source_coherence_score,
+        sustained_divergence_score,
+        phase_shift_score,
+        phase_shift_state,
+        truth_alignment,
+        current_status,
+        reinforcement_score,
+        drift_score,
+        tension_score,
+        volatility_score,
+        emergence_score,
+        protection_score,
+        item.detail,
+        observed_truth_summary,
+        observed_evidence_summary,
+        phase_shift_summary,
+        alignment_summary,
+        now,
+        last_confirmed_at,
+      ],
+    )?;
+  } else {
+    connection.execute(
+      r#"
+        INSERT INTO memory_evolution_state (
+          memory_item_id,
+          declared_confidence,
+          observed_confidence,
+          detector_balance,
+          observed_support_score,
+          observed_challenge_score,
+          divergence_score,
+          cumulative_support_score,
+          cumulative_challenge_score,
+          cumulative_divergence_score,
+          support_source_count,
+          challenge_source_count,
+          source_coherence_score,
+          sustained_divergence_score,
+          phase_shift_score,
+          phase_shift_state,
+          truth_alignment,
+          current_status,
+          reinforcement_score,
+          drift_score,
+          tension_score,
+          volatility_score,
+          emergence_score,
+          protection_score,
+          declared_truth_summary,
+          observed_truth_summary,
+          observed_evidence_summary,
+          phase_shift_summary,
+          alignment_summary,
+          last_evolved_at,
+          last_confirmed_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+      "#,
+      params![
+        item.id,
+        item.confidence,
+        observed_confidence,
+        detector_balance,
+        observed_support_score,
+        observed_challenge_score,
+        divergence_score,
+        cumulative_support_score,
+        cumulative_challenge_score,
+        cumulative_divergence_score,
+        support_source_count,
+        challenge_source_count,
+        source_coherence_score,
+        sustained_divergence_score,
+        phase_shift_score,
+        phase_shift_state,
+        truth_alignment,
+        current_status,
+        reinforcement_score,
+        drift_score,
+        tension_score,
+        volatility_score,
+        emergence_score,
+        protection_score,
+        item.detail,
+        observed_truth_summary,
+        observed_evidence_summary,
+        phase_shift_summary,
+        alignment_summary,
+        now,
+        last_confirmed_at,
+      ],
+    )?;
+  }
+
+  connection.execute(
+    r#"
+      INSERT INTO memory_evolution_history (
+        memory_item_id,
+        evolved_at,
+        observed_confidence,
+        divergence_score,
+        source_coherence_score,
+        truth_alignment,
+        current_status,
+        phase_shift_state,
+        phase_shift_score
+      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+    "#,
+    params![
+      item.id,
+      now,
+      observed_confidence,
+      divergence_score,
+      source_coherence_score,
+      truth_alignment,
+      current_status,
+      phase_shift_state,
+      phase_shift_score,
+    ],
+  )?;
+
+  connection.execute(
+    "UPDATE companion_memory_items SET status = ?2, updated_at = ?3 WHERE id = ?1",
+    params![item.id, current_status, now],
+  )?;
+
+  Ok(())
+}
+
+fn create_tectonic_snapshot(connection: &Connection, now: DateTime<Utc>) -> Result<(), AppError> {
+  let window_start = (now - Duration::days(7)).to_rfc3339();
+  let now_text = now.to_rfc3339();
+  let detector_records = list_detector_records(connection)?
+    .into_iter()
+    .filter(|record| record.last_seen_at >= window_start)
+    .collect::<Vec<_>>();
+  let evolution_states = list_memory_evolution_states(connection)?;
+  let active_memory_count = evolution_states
+    .iter()
+    .filter(|state| state.current_status != "historical")
+    .count() as i64;
+  let total_detector_activity = detector_records.iter().map(|record| record.strength).sum::<f64>();
+  let region_continuity = build_tectonic_region_continuity(connection, &detector_records, &evolution_states)?;
+  let divergent_memory_count = evolution_states
+    .iter()
+    .filter(|state| state.truth_alignment == "diverging")
+    .count();
+  let cumulative_divergence_average = if evolution_states.is_empty() {
+    0.0
+  } else {
+    evolution_states
+      .iter()
+      .map(|state| state.cumulative_divergence_score)
+      .sum::<f64>()
+      / evolution_states.len() as f64
+  };
+  let cross_source_memory_count = evolution_states
+    .iter()
+    .filter(|state| state.support_source_count + state.challenge_source_count >= 2)
+    .count();
+  let source_coherence_average = if evolution_states.is_empty() {
+    0.0
+  } else {
+    evolution_states
+      .iter()
+      .map(|state| state.source_coherence_score)
+      .sum::<f64>()
+      / evolution_states.len() as f64
+  };
+  let sustained_shift_memory_count = evolution_states
+    .iter()
+    .filter(|state| state.phase_shift_state == "sustained_shift")
+    .count();
+  let phase_shift_average = if evolution_states.is_empty() {
+    0.0
+  } else {
+    evolution_states
+      .iter()
+      .map(|state| state.phase_shift_score)
+      .sum::<f64>()
+      / evolution_states.len() as f64
+  };
+  let summary_json = json!({
+    "detectorTypeBreakdown": build_count_breakdown(detector_records.iter().map(|item| item.detector_type.clone()).collect::<Vec<_>>()),
+    "evolutionStatusBreakdown": build_count_breakdown(evolution_states.iter().map(|item| item.current_status.clone()).collect::<Vec<_>>()),
+    "truthAlignmentBreakdown": build_count_breakdown(evolution_states.iter().map(|item| item.truth_alignment.clone()).collect::<Vec<_>>()),
+    "divergentMemoryCount": divergent_memory_count,
+    "cumulativeDivergenceAverage": cumulative_divergence_average,
+    "crossSourceMemoryCount": cross_source_memory_count,
+    "sourceCoherenceAverage": source_coherence_average,
+    "sustainedShiftMemoryCount": sustained_shift_memory_count,
+    "phaseShiftAverage": phase_shift_average,
+    "phaseShiftBreakdown": build_count_breakdown(evolution_states.iter().map(|item| item.phase_shift_state.clone()).collect::<Vec<_>>()),
+    "targetKindBreakdown": build_count_breakdown(detector_records.iter().map(|item| item.target_kind.clone()).collect::<Vec<_>>()),
+    "directionBreakdown": build_count_breakdown(detector_records.iter().map(|item| item.direction.clone()).collect::<Vec<_>>()),
+    "regionContinuity": region_continuity,
+  })
+  .to_string();
+
+  connection.execute(
+    r#"
+      INSERT INTO tectonic_timeline_snapshots (
+        snapshot_kind,
+        recorded_at,
+        window_start,
+        window_end,
+        total_detector_activity,
+        active_memory_count,
+        summary_json
+      ) VALUES ('context_memory_pass', ?1, ?2, ?1, ?3, ?4, ?5)
+    "#,
+    params![
+      now_text,
+      window_start,
+      total_detector_activity,
+      active_memory_count,
+      summary_json,
+    ],
+  )?;
+
+  connection.execute(
+    r#"
+      DELETE FROM tectonic_timeline_snapshots
+      WHERE id NOT IN (
+        SELECT id
+        FROM tectonic_timeline_snapshots
+        ORDER BY recorded_at DESC, id DESC
+        LIMIT 336
+      )
+    "#,
+    [],
+  )?;
+
+  Ok(())
+}
+
+fn timestamp_in_window(value: &str, window_start: DateTime<Utc>) -> bool {
+  parse_utc(value)
+    .map(|timestamp| timestamp >= window_start)
+    .unwrap_or(false)
+}
+
+fn apply_lived_interaction_detectors(
+  connection: &Connection,
+  now: DateTime<Utc>,
+  week_start: DateTime<Utc>,
+) -> Result<(), AppError> {
+  let now_text = now.to_rfc3339();
+
+  for session in list_call_sessions(connection)? {
+    let event_timestamp = session
+      .ended_at
+      .as_deref()
+      .or(session.started_at.as_deref())
+      .unwrap_or(&session.created_at);
+    if !timestamp_in_window(event_timestamp, week_start) {
+      continue;
+    }
+
+    let transcript_summary = normalize_whitespace(&session.transcript_summary);
+    let notes = normalize_whitespace(&session.notes);
+    let combined = format!("{transcript_summary} {notes}");
+    let duration_hours = (session.duration_seconds as f64 / 3600.0).clamp(0.0, 1.0);
+
+    match session.outcome.as_str() {
+      "completed" => {
+        let reinforcement_strength =
+          clamp_score(0.56 + (duration_hours * 0.24) + if !transcript_summary.is_empty() { 0.1 } else { 0.0 });
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "reinforcement",
+            target_kind: "interaction_field",
+            target_ref_id: Some(session.id),
+            target_key: "live_contact".into(),
+            direction: "warming",
+            strength: reinforcement_strength,
+            confidence: 0.78,
+            duration_seconds: session.duration_seconds.max(60),
+            summary: if transcript_summary.is_empty() {
+              "A recent completed call added supportive contact to the interaction field.".into()
+            } else {
+              format!("A recent completed call added grounded contact: {}.", transcript_summary)
+            },
+            evidence_json: json!({
+              "source": "call_session",
+              "sessionId": session.id,
+              "outcome": session.outcome,
+              "durationSeconds": session.duration_seconds,
+              "transcriptSummary": transcript_summary,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+
+        if text_has_any_keyword(
+          &combined,
+          &["calm", "grounded", "gentle", "safe", "steady", "soft", "relief", "settled"],
+        ) {
+          upsert_detector_signal(
+            connection,
+            &DetectorSignal {
+              detector_type: "protection",
+              target_kind: "interaction_boundary",
+              target_ref_id: Some(session.id),
+              target_key: "contact_safety".into(),
+              direction: "sheltering",
+              strength: 0.72,
+              confidence: 0.74,
+              duration_seconds: session.duration_seconds.max(60),
+              summary: "A recent call carried signs of grounded or protected contact.".into(),
+              evidence_json: json!({
+                "source": "call_session",
+                "sessionId": session.id,
+                "outcome": session.outcome,
+                "matchedFrom": combined,
+              })
+              .to_string(),
+            },
+            &now_text,
+          )?;
+        }
+
+        if text_has_any_keyword(
+          &combined,
+          &["stress", "overwhelmed", "anxious", "grief", "lonely", "tired", "conflict", "hard"],
+        ) {
+          upsert_detector_signal(
+            connection,
+            &DetectorSignal {
+              detector_type: "tension",
+              target_kind: "conversation_theme",
+              target_ref_id: Some(session.id),
+              target_key: "weight_in_contact".into(),
+              direction: "pressing",
+              strength: 0.66,
+              confidence: 0.68,
+              duration_seconds: session.duration_seconds.max(60),
+              summary: "A recent call carried heavier themes that may matter in the contact field.".into(),
+              evidence_json: json!({
+                "source": "call_session",
+                "sessionId": session.id,
+                "outcome": session.outcome,
+                "matchedFrom": combined,
+              })
+              .to_string(),
+            },
+            &now_text,
+          )?;
+        }
+      }
+      "declined" => {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "protection",
+            target_kind: "interaction_boundary",
+            target_ref_id: Some(session.id),
+            target_key: "call_boundary".into(),
+            direction: "guarding",
+            strength: 0.74,
+            confidence: 0.82,
+            duration_seconds: 0,
+            summary: "A declined call suggests the contact boundary should stay lighter-touch for now.".into(),
+            evidence_json: json!({
+              "source": "call_session",
+              "sessionId": session.id,
+              "outcome": session.outcome,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+      "interrupted" | "missed" => {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "volatility",
+            target_kind: "interaction_field",
+            target_ref_id: Some(session.id),
+            target_key: "live_contact".into(),
+            direction: "unsettling",
+            strength: 0.69,
+            confidence: 0.7,
+            duration_seconds: session.duration_seconds.max(0),
+            summary: "A recent call did not land cleanly, adding instability to the contact field.".into(),
+            evidence_json: json!({
+              "source": "call_session",
+              "sessionId": session.id,
+              "outcome": session.outcome,
+              "durationSeconds": session.duration_seconds,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+      _ => {}
+    }
+  }
+
+  for review in list_north_star_call_reviews(connection)? {
+    if !timestamp_in_window(&review.created_at, week_start) {
+      continue;
+    }
+
+    let combined = normalize_whitespace(&format!("{} {}", review.sentiment, review.notes));
+    if combined.is_empty() {
+      continue;
+    }
+
+    if review_sentiment_signals_support(&review.sentiment) || text_signals_memory_support(&combined) {
+      upsert_detector_signal(
+        connection,
+        &DetectorSignal {
+          detector_type: "reinforcement",
+          target_kind: "interaction_field",
+          target_ref_id: Some(review.id),
+          target_key: format!("north_star_review:{}", review.call_id),
+          direction: "affirming",
+          strength: 0.71,
+          confidence: 0.78,
+          duration_seconds: 0,
+          summary: "A North Star call review carried supportive contact after the call.".into(),
+          evidence_json: json!({
+            "source": "north_star_call_review",
+            "reviewId": review.review_id,
+            "callId": review.call_id,
+            "userHandle": review.user_handle,
+            "sentiment": review.sentiment,
+            "notes": review.notes,
+            "importedAt": review.imported_at,
+          })
+          .to_string(),
+        },
+        &now_text,
+      )?;
+    }
+
+    if review_sentiment_signals_challenge(&review.sentiment) || text_signals_memory_challenge(&combined) {
+      upsert_detector_signal(
+        connection,
+        &DetectorSignal {
+          detector_type: "tension",
+          target_kind: "interaction_field",
+          target_ref_id: Some(review.id),
+          target_key: format!("north_star_review:{}", review.call_id),
+          direction: "friction",
+          strength: 0.76,
+          confidence: 0.8,
+          duration_seconds: 0,
+          summary: "A North Star call review suggested the call landed with friction or distance.".into(),
+          evidence_json: json!({
+            "source": "north_star_call_review",
+            "reviewId": review.review_id,
+            "callId": review.call_id,
+            "userHandle": review.user_handle,
+            "sentiment": review.sentiment,
+            "notes": review.notes,
+            "importedAt": review.imported_at,
+          })
+          .to_string(),
+        },
+        &now_text,
+      )?;
+    }
+  }
+
+  for feedback in list_feedback_entries(connection)? {
+    if !timestamp_in_window(&feedback.created_at, week_start) {
+      continue;
+    }
+
+    let outreach = match get_outreach_event_by_id(connection, feedback.outreach_event_id) {
+      Ok(value) => value,
+      Err(_) => continue,
+    };
+    let target_key = format!("{}:{}", outreach.outreach_kind, outreach.channel);
+
+    if feedback.score > 0.0 {
+      upsert_detector_signal(
+        connection,
+        &DetectorSignal {
+          detector_type: "reinforcement",
+          target_kind: "outreach_path",
+          target_ref_id: Some(outreach.id),
+          target_key: target_key.clone(),
+          direction: "welcoming",
+          strength: clamp_score(0.52 + feedback.score.abs()),
+          confidence: 0.73,
+          duration_seconds: 0,
+          summary: format!("Recent '{}' feedback suggests this outreach path is landing well.", feedback.feedback_kind),
+          evidence_json: json!({
+            "source": "outreach_feedback",
+            "feedbackId": feedback.id,
+            "outreachEventId": outreach.id,
+            "feedbackKind": feedback.feedback_kind,
+            "score": feedback.score,
+            "notes": feedback.notes,
+          })
+          .to_string(),
+        },
+        &now_text,
+      )?;
+    } else if feedback.score < 0.0 {
+      upsert_detector_signal(
+        connection,
+        &DetectorSignal {
+          detector_type: "tension",
+          target_kind: "outreach_path",
+          target_ref_id: Some(outreach.id),
+          target_key: target_key.clone(),
+          direction: "resisting",
+          strength: clamp_score(0.5 + feedback.score.abs()),
+          confidence: 0.76,
+          duration_seconds: 0,
+          summary: format!("Recent '{}' feedback suggests friction in this outreach path.", feedback.feedback_kind),
+          evidence_json: json!({
+            "source": "outreach_feedback",
+            "feedbackId": feedback.id,
+            "outreachEventId": outreach.id,
+            "feedbackKind": feedback.feedback_kind,
+            "score": feedback.score,
+            "notes": feedback.notes,
+          })
+          .to_string(),
+        },
+        &now_text,
+      )?;
+
+      if matches!(feedback.feedback_kind.as_str(), "mistimed" | "intrusive") {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "protection",
+            target_kind: "interaction_boundary",
+            target_ref_id: Some(outreach.id),
+            target_key: "outreach_timing_boundary".into(),
+            direction: "guarding",
+            strength: clamp_score(0.58 + feedback.score.abs()),
+            confidence: 0.8,
+            duration_seconds: 0,
+            summary: "Recent feedback suggests timing or intensity boundaries should be handled more carefully.".into(),
+            evidence_json: json!({
+              "source": "outreach_feedback",
+              "feedbackId": feedback.id,
+              "outreachEventId": outreach.id,
+              "feedbackKind": feedback.feedback_kind,
+              "score": feedback.score,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+    }
+  }
+
+  Ok(())
+}
+
+fn apply_memory_specific_observation_detectors(
+  connection: &Connection,
+  now: DateTime<Utc>,
+  week_start: DateTime<Utc>,
+  items: &[InterpretedMemoryItem],
+) -> Result<(), AppError> {
+  if items.is_empty() {
+    return Ok(());
+  }
+
+  let now_text = now.to_rfc3339();
+  let sessions = list_call_sessions(connection)?;
+  let reviews = list_north_star_call_reviews(connection)?;
+  for item in items {
+    if item.archived_at.is_some() {
+      continue;
+    }
+
+    for session in &sessions {
+      let event_timestamp = session
+        .ended_at
+        .as_deref()
+        .or(session.started_at.as_deref())
+        .unwrap_or(&session.created_at);
+      if !timestamp_in_window(event_timestamp, week_start) {
+        continue;
+      }
+
+      let combined = normalize_whitespace(&format!("{} {}", session.transcript_summary, session.notes));
+      if combined.is_empty() || !text_mentions_memory(&combined, item) {
+        continue;
+      }
+
+      let challenged = text_signals_memory_challenge(&combined);
+      let supported = text_signals_memory_support(&combined) || !challenged;
+      if supported {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "reinforcement",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "echoing",
+            strength: clamp_score(0.61 + ((session.duration_seconds as f64 / 3600.0).min(1.0) * 0.14)),
+            confidence: 0.71,
+            duration_seconds: session.duration_seconds.max(60),
+            summary: format!(
+              "Recent live contact echoed the declared memory around '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "call_session_memory_match",
+              "sessionId": session.id,
+              "memoryKey": item.memory_key,
+              "matchedText": combined,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+
+      if challenged {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "drift",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "contradicting",
+            strength: 0.79,
+            confidence: 0.76,
+            duration_seconds: session.duration_seconds.max(60),
+            summary: format!(
+              "Recent live contact challenged the declared memory around '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "call_session_memory_match",
+              "sessionId": session.id,
+              "memoryKey": item.memory_key,
+              "matchedText": combined,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+    }
+
+    for review in &reviews {
+      if !timestamp_in_window(&review.created_at, week_start) {
+        continue;
+      }
+
+      let combined = normalize_whitespace(&format!("{} {}", review.sentiment, review.notes));
+      if combined.is_empty() || !text_mentions_memory(&combined, item) {
+        continue;
+      }
+
+      let challenged =
+        review_sentiment_signals_challenge(&review.sentiment) || text_signals_memory_challenge(&combined);
+      let supported =
+        review_sentiment_signals_support(&review.sentiment) || text_signals_memory_support(&combined) || !challenged;
+
+      if supported {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "reinforcement",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "reviewing",
+            strength: 0.74,
+            confidence: 0.77,
+            duration_seconds: 0,
+            summary: format!(
+              "A North Star call review affirmed the declared memory around '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "north_star_call_review_memory_match",
+              "reviewId": review.review_id,
+              "callId": review.call_id,
+              "userHandle": review.user_handle,
+              "memoryKey": item.memory_key,
+              "matchedText": combined,
+              "sentiment": review.sentiment,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+
+      if challenged {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "tension",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "reviewing",
+            strength: 0.81,
+            confidence: 0.82,
+            duration_seconds: 0,
+            summary: format!(
+              "A North Star call review challenged the declared memory around '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "north_star_call_review_memory_match",
+              "reviewId": review.review_id,
+              "callId": review.call_id,
+              "userHandle": review.user_handle,
+              "memoryKey": item.memory_key,
+              "matchedText": combined,
+              "sentiment": review.sentiment,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+    }
+
+    for feedback in list_feedback_entries(connection)? {
+      if !timestamp_in_window(&feedback.created_at, week_start) {
+        continue;
+      }
+      let notes = normalize_whitespace(&feedback.notes);
+      if notes.is_empty() || !text_mentions_memory(&notes, item) {
+        continue;
+      }
+
+      if feedback.score > 0.0 {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "reinforcement",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "confirming",
+            strength: clamp_score(0.54 + feedback.score.abs()),
+            confidence: 0.69,
+            duration_seconds: 0,
+            summary: format!(
+              "Recent feedback reinforced the declared memory around '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "outreach_feedback_memory_match",
+              "feedbackId": feedback.id,
+              "memoryKey": item.memory_key,
+              "notes": notes,
+              "score": feedback.score,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      } else if feedback.score < 0.0 || text_signals_memory_challenge(&notes) {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "tension",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "questioning",
+            strength: clamp_score(0.56 + feedback.score.abs()),
+            confidence: 0.74,
+            duration_seconds: 0,
+            summary: format!(
+              "Recent feedback added friction around the declared memory '{}'.",
+              item.source_entry_title
+            ),
+            evidence_json: json!({
+              "source": "outreach_feedback_memory_match",
+              "feedbackId": feedback.id,
+              "memoryKey": item.memory_key,
+              "notes": notes,
+              "score": feedback.score,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+    }
+  }
+
+  Ok(())
+}
+
+fn run_context_memory_pass_with_connection(connection: &Connection) -> Result<(), AppError> {
+  let now = Utc::now();
+  let now_text = now.to_rfc3339();
+  let week_start = now - Duration::days(7);
+  let week_start_text = week_start.to_rfc3339();
+  let context_sections = build_companion_context_snapshot_with_filter(connection, true)?;
+  let categories = companion_context_categories_with_visibility(connection)?;
+  let mut active_keys = HashSet::new();
+
+  for section in &context_sections {
+    for entry in &section.entries {
+      for candidate in build_memory_candidates(entry) {
+        let (memory_item_id, created, materially_changed) = upsert_memory_candidate(connection, &candidate, &now_text)?;
+        active_keys.insert(candidate.memory_key.clone());
+
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: if created { "emergence" } else { "reinforcement" },
+            target_kind: "memory_item",
+            target_ref_id: Some(memory_item_id),
+            target_key: candidate.memory_key.clone(),
+            direction: if created {
+              "appearing"
+            } else if materially_changed {
+              "restating"
+            } else {
+              "steadying"
+            },
+            strength: if created {
+              0.82
+            } else if materially_changed {
+              0.38
+            } else {
+              0.67
+            },
+            confidence: candidate.confidence,
+            duration_seconds: if created { 0 } else { 86_400 },
+            summary: if created {
+              format!("A new interpreted memory emerged from '{}'.", candidate.source_entry_title)
+            } else if materially_changed {
+              format!("'{}' was just restated, so the declared memory is present but not settled yet.", candidate.source_entry_title)
+            } else {
+              format!("'{}' continues to hold steady as declared context.", candidate.source_entry_title)
+            },
+            evidence_json: json!({
+              "memoryKey": candidate.memory_key,
+              "sourceEntryId": candidate.source_ref_id,
+              "memoryType": candidate.memory_type,
+              "materiallyChanged": materially_changed,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+
+        if materially_changed {
+          upsert_detector_signal(
+            connection,
+            &DetectorSignal {
+              detector_type: "drift",
+              target_kind: "memory_item",
+              target_ref_id: Some(memory_item_id),
+              target_key: candidate.memory_key.clone(),
+              direction: "shifting",
+              strength: 0.84,
+              confidence: 0.74,
+              duration_seconds: 0,
+              summary: format!(
+                "The declared wording around '{}' has shifted enough to register drift.",
+                candidate.source_entry_title
+              ),
+              evidence_json: json!({
+                "memoryKey": candidate.memory_key,
+                "sourceEntryId": candidate.source_ref_id,
+              })
+              .to_string(),
+            },
+            &now_text,
+          )?;
+
+          if text_signals_memory_challenge(&candidate.detail) {
+            upsert_detector_signal(
+              connection,
+              &DetectorSignal {
+                detector_type: "tension",
+                target_kind: "memory_item",
+                target_ref_id: Some(memory_item_id),
+                target_key: candidate.memory_key.clone(),
+                direction: "reversing",
+                strength: 0.78,
+                confidence: 0.76,
+                duration_seconds: 0,
+                summary: format!(
+                  "The new declared wording around '{}' sounds like a meaningful reversal, not just a small edit.",
+                  candidate.source_entry_title
+                ),
+                evidence_json: json!({
+                  "memoryKey": candidate.memory_key,
+                  "sourceEntryId": candidate.source_ref_id,
+                  "detail": candidate.detail,
+                })
+                .to_string(),
+              },
+              &now_text,
+            )?;
+          }
+        }
+
+        if candidate.sensitivity == "high" || candidate.sensitivity == "guarded" {
+          upsert_detector_signal(
+            connection,
+            &DetectorSignal {
+              detector_type: "protection",
+              target_kind: "memory_item",
+              target_ref_id: Some(memory_item_id),
+              target_key: candidate.memory_key.clone(),
+              direction: "guarding",
+              strength: if candidate.sensitivity == "high" { 0.86 } else { 0.62 },
+              confidence: 0.76,
+              duration_seconds: 86_400,
+              summary: format!(
+                "The memory around '{}' should be handled with extra care.",
+                candidate.source_entry_title
+              ),
+              evidence_json: json!({
+                "memoryKey": candidate.memory_key,
+                "sensitivity": candidate.sensitivity,
+              })
+              .to_string(),
+            },
+            &now_text,
+          )?;
+        }
+
+        if text_has_any_keyword(
+          &format!("{} {}", candidate.summary, candidate.detail),
+          &["but", "however", "mixed", "torn", "conflict", "although"],
+        ) {
+          upsert_detector_signal(
+            connection,
+            &DetectorSignal {
+              detector_type: "tension",
+              target_kind: "memory_item",
+              target_ref_id: Some(memory_item_id),
+              target_key: candidate.memory_key.clone(),
+              direction: "pulling",
+              strength: 0.66,
+              confidence: 0.62,
+              duration_seconds: 0,
+              summary: format!("'{}' carries internally mixed language.", candidate.source_entry_title),
+              evidence_json: json!({
+                "memoryKey": candidate.memory_key,
+              })
+              .to_string(),
+            },
+            &now_text,
+          )?;
+        }
+      }
+    }
+  }
+
+  for category in categories.into_iter().filter(|category| category.is_deleted) {
+    upsert_detector_signal(
+      connection,
+      &DetectorSignal {
+        detector_type: "drift",
+        target_kind: "category",
+        target_ref_id: None,
+        target_key: category.key.clone(),
+        direction: "removing",
+        strength: 0.74,
+        confidence: 0.8,
+        duration_seconds: 0,
+        summary: format!("The '{}' category has been removed from active manual context.", category.label),
+        evidence_json: json!({
+          "categoryKey": category.key,
+          "deletedAt": category.deleted_at,
+        })
+        .to_string(),
+      },
+      &now_text,
+    )?;
+  }
+
+  let existing_items = list_interpreted_memory_items(connection)?;
+  for item in existing_items {
+    if item.source_kind == "manual_context_entry" && !active_keys.contains(&item.memory_key) && item.archived_at.is_none() {
+      connection.execute(
+        r#"
+          UPDATE companion_memory_items
+          SET archived_at = ?2, status = 'historical', updated_at = ?2
+          WHERE id = ?1
+        "#,
+        params![item.id, now_text],
+      )?;
+
+      upsert_detector_signal(
+        connection,
+        &DetectorSignal {
+          detector_type: "drift",
+          target_kind: "memory_item",
+          target_ref_id: Some(item.id),
+          target_key: item.memory_key.clone(),
+          direction: "receding",
+          strength: 0.69,
+          confidence: 0.79,
+          duration_seconds: 0,
+          summary: format!(
+            "The manual context behind '{}' is no longer active, so the memory is receding into history.",
+            item.source_entry_title
+          ),
+          evidence_json: json!({
+            "memoryKey": item.memory_key,
+            "sourceEntryTitle": item.source_entry_title,
+          })
+          .to_string(),
+        },
+        &now_text,
+      )?;
+    }
+  }
+
+  for item in &list_interpreted_memory_items(connection)? {
+    evolve_memory_item(connection, item, &now_text, &week_start_text)?;
+  }
+
+  let current_items = list_interpreted_memory_items(connection)?;
+  for item in &current_items {
+    let evolution = connection
+      .query_row(
+        "SELECT current_status, detector_balance FROM memory_evolution_state WHERE memory_item_id = ?1",
+        params![item.id],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
+      )
+      .optional()?;
+    if let Some((current_status, detector_balance)) = evolution {
+      if current_status == "conflicted" && detector_balance.abs() >= 0.25 {
+        upsert_detector_signal(
+          connection,
+          &DetectorSignal {
+            detector_type: "volatility",
+            target_kind: "memory_item",
+            target_ref_id: Some(item.id),
+            target_key: item.memory_key.clone(),
+            direction: "swinging",
+            strength: clamp_score(detector_balance.abs() + 0.35),
+            confidence: 0.63,
+            duration_seconds: 86_400,
+            summary: format!("'{}' is showing unstable movement across detector signals.", item.source_entry_title),
+            evidence_json: json!({
+              "memoryKey": item.memory_key,
+              "detectorBalance": detector_balance,
+            })
+            .to_string(),
+          },
+          &now_text,
+        )?;
+      }
+    }
+  }
+
+  apply_lived_interaction_detectors(connection, now, week_start)?;
+  apply_memory_specific_observation_detectors(connection, now, week_start, &current_items)?;
+
+  for item in &list_interpreted_memory_items(connection)? {
+    evolve_memory_item(connection, item, &now_text, &week_start_text)?;
+  }
+
+  create_tectonic_snapshot(connection, now)?;
+  Ok(())
+}
+
+pub fn memory_system_snapshot(db_path: &PathBuf) -> Result<MemorySystemSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  build_memory_system_snapshot(&connection)
+}
+
+pub fn store_north_star_call_reviews(
+  db_path: &PathBuf,
+  reviews: &[NorthStarCallReview],
+) -> Result<usize, AppError> {
+  let connection = Connection::open(db_path)?;
+  let imported_at = Utc::now().to_rfc3339();
+  let mut imported = 0usize;
+  for review in reviews {
+    if upsert_north_star_call_review(&connection, review, &imported_at)? {
+      imported += 1;
+    }
+  }
+  Ok(imported)
+}
+
+pub fn run_context_memory_pass(db_path: &PathBuf) -> Result<MemorySystemSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  run_context_memory_pass_with_connection(&connection)?;
+  build_memory_system_snapshot(&connection)
+}
+
+pub fn seed_context_memory_example(
+  db_path: &PathBuf,
+  scenario_key: &str,
+) -> Result<MemorySystemSnapshot, AppError> {
+  reset_runtime_data(db_path)?;
+
+  let connection = Connection::open(db_path)?;
+  let now = Utc::now();
+  let now_text = now.to_rfc3339();
+  let title = "[Seed] Akai MPC";
+  let category_key = "career";
+  let (body, notes, call_notes, transcript_summary, review_sentiment, review_notes) = match scenario_key {
+    "support" => (
+      "I really like the Akai MPC and keep coming back to it.".to_string(),
+      "Seeded memory-evidence support example.".to_string(),
+      "We talked about how the Akai MPC still feels grounding and worth returning to.".to_string(),
+      "The Akai MPC still feels important, grounding, and like something I genuinely want to keep using.".to_string(),
+      "warm".to_string(),
+      "The call felt warm and confirming. The Akai MPC still feels like something I want to keep close.".to_string(),
+    ),
+    "contradiction" => (
+      "I really like the Akai MPC and keep coming back to it.".to_string(),
+      "Seeded memory-evidence contradiction example. Declared truth stays positive while lived evidence turns against it.".to_string(),
+      "We talked about how the Akai MPC does not fit anymore and mostly gets avoided now.".to_string(),
+      "I don't really like the Akai MPC anymore and I mostly avoid using it now.".to_string(),
+      "tense".to_string(),
+      "The call felt tense and off. The Akai MPC does not feel like me anymore and I keep pulling away from it now.".to_string(),
+    ),
+    other => {
+      return Err(AppError::Message(format!(
+        "Unknown context-memory seed scenario '{}'.",
+        other
+      )))
+    }
+  };
+
+  if let Some(existing) = find_companion_context_entry_by_category_and_title(&connection, category_key, title)? {
+    connection.execute(
+      r#"
+        UPDATE companion_context_entries
+        SET
+          body = ?2,
+          tags_json = ?3,
+          notes = ?4,
+          is_active = 1,
+          deleted_at = NULL,
+          updated_at = ?5
+        WHERE id = ?1
+      "#,
+      params![
+        existing.id,
+        body,
+        serde_json::to_string(&vec!["seeded", "music"])?,
+        notes,
+        now_text,
+      ],
+    )?;
+  } else {
+    let display_order: i64 = connection.query_row(
+      "SELECT COALESCE(MAX(display_order) + 1, 0) FROM companion_context_entries WHERE category_key = ?1",
+      params![category_key],
+      |row| row.get(0),
+    )?;
+    connection.execute(
+      r#"
+        INSERT INTO companion_context_entries (
+          category_key, title, body, tags_json, notes, display_order, is_active, deleted_at, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, NULL, ?7, ?7)
+      "#,
+      params![
+        category_key,
+        title,
+        body,
+        serde_json::to_string(&vec!["seeded", "music"])?,
+        notes,
+        display_order,
+        now_text,
+      ],
+    )?;
+  }
+
+  let started_at = (now - Duration::minutes(12)).to_rfc3339();
+  let ended_at = (now - Duration::minutes(2)).to_rfc3339();
+  connection.execute(
+    r#"
+      INSERT INTO call_sessions (
+        created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+        started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+      ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+    "#,
+    params![now_text, started_at, ended_at, call_notes, transcript_summary, 600_i64],
+  )?;
+
+  upsert_north_star_call_review(
+    &connection,
+    &NorthStarCallReview {
+      review_id: format!("seed-review-{scenario_key}"),
+      call_id: format!("seed-call-{scenario_key}"),
+      user_handle: "seeded-user".into(),
+      sentiment: review_sentiment,
+      notes: review_notes,
+      created_at: now_text.clone(),
+    },
+    &now_text,
+  )?;
+
+  run_context_memory_pass_with_connection(&connection)?;
+  build_memory_system_snapshot(&connection)
+}
+
 pub fn create_place(db_path: &PathBuf, payload: &CreatePlaceInput) -> Result<Place, AppError> {
   let connection = Connection::open(db_path)?;
   let timestamp = Utc::now().to_rfc3339();
@@ -1229,25 +3874,74 @@ pub fn seed_mvp_reality_check_scenario(
   build_mvp_reality_check_snapshot(&connection)
 }
 
+fn clear_tables(transaction: &Transaction<'_>, tables: &[&str]) -> Result<(), AppError> {
+  for table in tables {
+    transaction.execute(&format!("DELETE FROM {table}"), [])?;
+  }
+  Ok(())
+}
+
+fn reset_all_non_settings_data(db_path: &PathBuf) -> Result<(), AppError> {
+  let mut connection = Connection::open(db_path)?;
+  let transaction = connection.transaction()?;
+  clear_tables(
+    &transaction,
+    &[
+      "north_star_call_reviews",
+      "tectonic_timeline_snapshots",
+      "memory_evolution_state",
+      "memory_detector_records",
+      "companion_memory_items",
+      "memory_items",
+      "call_turns",
+      "call_sessions",
+      "outreach_feedback",
+      "inbound_messages",
+      "outreach_events",
+      "moment_decisions",
+      "saved_moments",
+      "place_visits",
+      "raw_location_events",
+      "manual_reflections",
+      "rules",
+      "places",
+      "companion_context_entries",
+      "companion_context_category_state",
+      "companion_context_categories",
+    ],
+  )?;
+  transaction.execute(
+    "DELETE FROM settings WHERE key = 'mvp_reality_check_seeded_at'",
+    [],
+  )?;
+  seed_companion_context_categories(&transaction)?;
+  transaction.commit()?;
+  Ok(())
+}
+
 pub fn reset_runtime_data(db_path: &PathBuf) -> Result<(), AppError> {
   let mut connection = Connection::open(db_path)?;
   let transaction = connection.transaction()?;
-  for table in [
+  clear_tables(
+    &transaction,
+    &[
+      "north_star_call_reviews",
+      "tectonic_timeline_snapshots",
+      "memory_evolution_state",
+      "memory_detector_records",
+    "companion_memory_items",
+    "memory_items",
     "call_turns",
     "call_sessions",
     "outreach_feedback",
     "inbound_messages",
     "outreach_events",
-    "moment_decisions",
-    "saved_moments",
-    "place_visits",
-    "raw_location_events",
-    "manual_reflections",
-    "rules",
-    "places",
-  ] {
-    transaction.execute(&format!("DELETE FROM {table}"), [])?;
-  }
+      "moment_decisions",
+      "saved_moments",
+      "place_visits",
+      "raw_location_events",
+    ],
+  )?;
   transaction.execute(
     "DELETE FROM settings WHERE key = 'mvp_reality_check_seeded_at'",
     [],
@@ -1498,7 +4192,7 @@ pub fn run_simulation_scenario(
   payload: &SimulationRunInput,
 ) -> Result<SimulationRunResult, AppError> {
   if payload.clear_existing {
-    reset_runtime_data(db_path)?;
+    reset_all_non_settings_data(db_path)?;
   }
 
   match payload.scenario_key.as_str() {
@@ -1853,6 +4547,138 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
         requires_confirmation INTEGER NOT NULL DEFAULT 0
       );
 
+      CREATE TABLE IF NOT EXISTS companion_memory_items (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_key TEXT NOT NULL UNIQUE,
+        source_kind TEXT NOT NULL,
+        source_ref_id INTEGER NULL,
+        source_category_key TEXT NOT NULL,
+        source_entry_title TEXT NOT NULL,
+        memory_type TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        detail TEXT NOT NULL,
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL NOT NULL DEFAULT 0.5,
+        salience REAL NOT NULL DEFAULT 0.5,
+        sensitivity TEXT NOT NULL DEFAULT 'normal',
+        declared_by_user INTEGER NOT NULL DEFAULT 1,
+        status TEXT NOT NULL DEFAULT 'active',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        interpreted_at TEXT NOT NULL,
+        last_observed_at TEXT NOT NULL,
+        archived_at TEXT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_detector_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        detector_key TEXT NOT NULL UNIQUE,
+        detector_type TEXT NOT NULL,
+        target_kind TEXT NOT NULL,
+        target_ref_id INTEGER NULL,
+        target_key TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        strength REAL NOT NULL DEFAULT 0.5,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        duration_seconds INTEGER NOT NULL DEFAULT 0,
+        repeat_count INTEGER NOT NULL DEFAULT 1,
+        summary TEXT NOT NULL,
+        evidence_json TEXT NOT NULL DEFAULT '{}',
+        created_at TEXT NOT NULL,
+        last_seen_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_evolution_state (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_item_id INTEGER NOT NULL UNIQUE,
+        declared_confidence REAL NOT NULL DEFAULT 0.5,
+        observed_confidence REAL NOT NULL DEFAULT 0.5,
+        detector_balance REAL NOT NULL DEFAULT 0.0,
+        observed_support_score REAL NOT NULL DEFAULT 0.0,
+        observed_challenge_score REAL NOT NULL DEFAULT 0.0,
+        divergence_score REAL NOT NULL DEFAULT 0.0,
+        cumulative_support_score REAL NOT NULL DEFAULT 0.0,
+        cumulative_challenge_score REAL NOT NULL DEFAULT 0.0,
+        cumulative_divergence_score REAL NOT NULL DEFAULT 0.0,
+        support_source_count INTEGER NOT NULL DEFAULT 0,
+        challenge_source_count INTEGER NOT NULL DEFAULT 0,
+        source_coherence_score REAL NOT NULL DEFAULT 0.0,
+        sustained_divergence_score REAL NOT NULL DEFAULT 0.0,
+        phase_shift_score REAL NOT NULL DEFAULT 0.0,
+        phase_shift_state TEXT NOT NULL DEFAULT 'stable',
+        truth_alignment TEXT NOT NULL DEFAULT 'aligned',
+        current_status TEXT NOT NULL DEFAULT 'active',
+        reinforcement_score REAL NOT NULL DEFAULT 0.0,
+        drift_score REAL NOT NULL DEFAULT 0.0,
+        tension_score REAL NOT NULL DEFAULT 0.0,
+        volatility_score REAL NOT NULL DEFAULT 0.0,
+        emergence_score REAL NOT NULL DEFAULT 0.0,
+        protection_score REAL NOT NULL DEFAULT 0.0,
+        declared_truth_summary TEXT NOT NULL DEFAULT '',
+        observed_truth_summary TEXT NOT NULL DEFAULT '',
+        observed_evidence_summary TEXT NOT NULL DEFAULT '',
+        phase_shift_summary TEXT NOT NULL DEFAULT '',
+        alignment_summary TEXT NOT NULL DEFAULT '',
+        last_evolved_at TEXT NOT NULL,
+        last_confirmed_at TEXT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS memory_evolution_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        memory_item_id INTEGER NOT NULL,
+        evolved_at TEXT NOT NULL,
+        observed_confidence REAL NOT NULL DEFAULT 0.0,
+        divergence_score REAL NOT NULL DEFAULT 0.0,
+        source_coherence_score REAL NOT NULL DEFAULT 0.0,
+        truth_alignment TEXT NOT NULL DEFAULT 'aligned',
+        current_status TEXT NOT NULL DEFAULT 'active',
+        phase_shift_state TEXT NOT NULL DEFAULT 'stable',
+        phase_shift_score REAL NOT NULL DEFAULT 0.0
+      );
+
+      CREATE TABLE IF NOT EXISTS tectonic_timeline_snapshots (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        snapshot_kind TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        window_start TEXT NOT NULL,
+        window_end TEXT NOT NULL,
+        total_detector_activity REAL NOT NULL DEFAULT 0.0,
+        active_memory_count INTEGER NOT NULL DEFAULT 0,
+        summary_json TEXT NOT NULL DEFAULT '{}'
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_companion_memory_items_source
+      ON companion_memory_items (source_kind, source_ref_id);
+
+      CREATE INDEX IF NOT EXISTS idx_memory_detector_target
+      ON memory_detector_records (target_key, detector_type, last_seen_at);
+
+      CREATE INDEX IF NOT EXISTS idx_memory_evolution_state_memory_item
+      ON memory_evolution_state (memory_item_id);
+
+      CREATE INDEX IF NOT EXISTS idx_memory_evolution_history_memory_item
+      ON memory_evolution_history (memory_item_id, evolved_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_tectonic_timeline_recorded_at
+      ON tectonic_timeline_snapshots (recorded_at DESC);
+
+      CREATE TABLE IF NOT EXISTS north_star_call_reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        review_id TEXT NOT NULL UNIQUE,
+        call_id TEXT NOT NULL,
+        user_handle TEXT NOT NULL DEFAULT '',
+        sentiment TEXT NOT NULL DEFAULT '',
+        notes TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL,
+        imported_at TEXT NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_north_star_call_reviews_created_at
+      ON north_star_call_reviews (created_at DESC);
+
+      CREATE INDEX IF NOT EXISTS idx_north_star_call_reviews_call_id
+      ON north_star_call_reviews (call_id);
+
       CREATE TABLE IF NOT EXISTS call_sessions (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         created_at TEXT NOT NULL,
@@ -1936,6 +4762,118 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
   if !entry_columns.iter().any(|column| column == "deleted_at") {
     connection.execute(
       "ALTER TABLE companion_context_entries ADD COLUMN deleted_at TEXT",
+      [],
+    )?;
+  }
+
+  let evolution_columns = table_columns(connection, "memory_evolution_state")?;
+  if !evolution_columns.iter().any(|column| column == "observed_support_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN observed_support_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "observed_challenge_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN observed_challenge_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "divergence_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN divergence_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "cumulative_support_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN cumulative_support_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "cumulative_challenge_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN cumulative_challenge_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "cumulative_divergence_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN cumulative_divergence_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "support_source_count") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN support_source_count INTEGER NOT NULL DEFAULT 0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "challenge_source_count") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN challenge_source_count INTEGER NOT NULL DEFAULT 0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "source_coherence_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN source_coherence_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "sustained_divergence_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN sustained_divergence_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "phase_shift_score") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN phase_shift_score REAL NOT NULL DEFAULT 0.0",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "phase_shift_state") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN phase_shift_state TEXT NOT NULL DEFAULT 'stable'",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "truth_alignment") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN truth_alignment TEXT NOT NULL DEFAULT 'aligned'",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "alignment_summary") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN alignment_summary TEXT NOT NULL DEFAULT ''",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "observed_evidence_summary") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN observed_evidence_summary TEXT NOT NULL DEFAULT ''",
+      [],
+    )?;
+  }
+  if !evolution_columns.iter().any(|column| column == "phase_shift_summary") {
+    connection.execute(
+      "ALTER TABLE memory_evolution_state ADD COLUMN phase_shift_summary TEXT NOT NULL DEFAULT ''",
+      [],
+    )?;
+  }
+
+  let review_columns = table_columns(connection, "north_star_call_reviews")?;
+  if !review_columns.iter().any(|column| column == "user_handle") {
+    connection.execute(
+      "ALTER TABLE north_star_call_reviews ADD COLUMN user_handle TEXT NOT NULL DEFAULT ''",
+      [],
+    )?;
+  }
+  if !review_columns.iter().any(|column| column == "imported_at") {
+    connection.execute(
+      "ALTER TABLE north_star_call_reviews ADD COLUMN imported_at TEXT NOT NULL DEFAULT ''",
       [],
     )?;
   }
@@ -6493,6 +9431,772 @@ mod tests {
 
     assert_eq!(result.promoted_count, 1);
     assert_eq!(result.draft_count, 1);
+  }
+
+  #[test]
+  fn context_memory_pass_creates_interpreted_memory_and_detectors() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "friends".into(),
+        title: "Mara".into(),
+        body: "A close friend I trust when things feel noisy.".into(),
+        tags: vec!["support".into(), "important".into()],
+        notes: "Protect this gently.".into(),
+      },
+    )
+    .expect("create companion context entry");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run context memory pass");
+
+    assert!(snapshot.memory_items.iter().any(|item| {
+      item.source_kind == "manual_context_entry"
+        && item.source_entry_title == "Mara"
+        && item.memory_type == "relational_memory"
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.detector_type == "emergence" || record.detector_type == "protection"
+    }));
+    assert!(!snapshot.evolution_states.is_empty());
+    assert_eq!(snapshot.tectonic_timeline.len(), 1);
+  }
+
+  #[test]
+  fn archived_context_entry_becomes_historical_memory() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let entry = create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "goals".into(),
+        title: "Move closer to the water".into(),
+        body: "I want home to feel calmer and more open.".into(),
+        tags: vec!["future".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    run_context_memory_pass(&db_path).expect("first memory pass");
+    archive_companion_context_entry(&db_path, entry.id).expect("archive context entry");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("second memory pass");
+    assert!(snapshot.memory_items.iter().any(|item| {
+      item.source_ref_id == Some(entry.id) && item.status == "historical" && item.archived_at.is_some()
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.detector_type == "drift" && record.direction == "receding"
+    }));
+  }
+
+  #[test]
+  fn context_memory_pass_adds_lived_call_detectors() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "friends".into(),
+        title: "Mara".into(),
+        body: "A close friend who helps me settle.".into(),
+        tags: vec!["support".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let created_at = Utc::now().to_rfc3339();
+    let started_at = (Utc::now() - Duration::minutes(14)).to_rfc3339();
+    let ended_at = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          created_at,
+          started_at,
+          ended_at,
+          "The call felt calm and safe.",
+          "We had a grounded call about stress and feeling overwhelmed.",
+          720_i64
+        ],
+      )
+      .expect("seed call session");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run context memory pass");
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "interaction_field"
+        && record.detector_type == "reinforcement"
+        && record.direction == "warming"
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "interaction_boundary"
+        && record.detector_type == "protection"
+        && record.target_key == "contact_safety"
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "conversation_theme"
+        && record.detector_type == "tension"
+        && record.target_key == "weight_in_contact"
+    }));
+    let summary: serde_json::Value = serde_json::from_str(&snapshot.tectonic_timeline[0].summary_json).expect("parse summary");
+    assert!(summary
+      .get("regionContinuity")
+      .and_then(|value| value.as_array())
+      .is_some_and(|regions| regions.iter().any(|region| {
+        region.get("regionId").and_then(|value| value.as_str()) == Some("region:interaction_field")
+      })));
+  }
+
+  #[test]
+  fn context_memory_pass_adds_memory_specific_observation_reinforcement() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let entry = create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "music".into(),
+        title: "Hippy music".into(),
+        body: "It still helps me settle and feel like myself.".into(),
+        tags: vec!["jam".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let created_at = Utc::now().to_rfc3339();
+    let started_at = (Utc::now() - Duration::minutes(10)).to_rfc3339();
+    let ended_at = (Utc::now() - Duration::minutes(2)).to_rfc3339();
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          created_at,
+          started_at,
+          ended_at,
+          "We kept coming back to hippy music and jam sessions.",
+          "Hippy music still feels important and grounding lately.",
+          540_i64
+        ],
+      )
+      .expect("seed call session");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run context memory pass");
+    let matching_memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_ref_id == Some(entry.id) && item.memory_type == "preference_memory")
+      .expect("matching memory item");
+
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_key == matching_memory.memory_key
+        && record.detector_type == "reinforcement"
+        && record.direction == "echoing"
+    }));
+  }
+
+  #[test]
+  fn context_memory_pass_marks_diverging_truth_when_live_contact_contradicts_manual_context() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let entry = create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "favorite_food".into(),
+        title: "Spicy food".into(),
+        body: "I love it and always come back to it.".into(),
+        tags: vec!["favorite".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let created_at = Utc::now().to_rfc3339();
+    let started_at = (Utc::now() - Duration::minutes(12)).to_rfc3339();
+    let ended_at = (Utc::now() - Duration::minutes(1)).to_rfc3339();
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          created_at,
+          started_at,
+          ended_at,
+          "We talked about spicy food and how it does not really fit anymore.",
+          "I don't like spicy food anymore and usually avoid it now.",
+          600_i64
+        ],
+      )
+      .expect("seed contradicting call session");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run context memory pass");
+    let matching_memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_ref_id == Some(entry.id) && item.memory_type == "preference_memory")
+      .expect("matching memory item");
+    let evolution = snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == matching_memory.id)
+      .expect("evolution state");
+
+    assert_eq!(evolution.truth_alignment, "diverging");
+    assert!(evolution.observed_challenge_score > evolution.observed_support_score);
+    assert!(
+      evolution.observed_truth_summary.to_lowercase().contains("pull")
+        || evolution.alignment_summary.to_lowercase().contains("pull")
+    );
+  }
+
+  #[test]
+  fn context_memory_pass_marks_manual_reversal_as_unsettled_truth() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let entry = create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "career".into(),
+        title: "Akai MPC".into(),
+        body: "I love using it and keep coming back to it.".into(),
+        tags: vec!["music".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    run_context_memory_pass(&db_path).expect("first pass");
+
+    update_companion_context_entry(
+      &db_path,
+      &UpdateCompanionContextEntryInput {
+        id: entry.id,
+        title: "Akai MPC".into(),
+        body: "I do not like the Akai MPC anymore and mostly avoid using it.".into(),
+        tags: vec!["music".into()],
+        notes: String::new(),
+        is_active: true,
+      },
+    )
+    .expect("update entry");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("second pass");
+    let matching_memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_ref_id == Some(entry.id))
+      .expect("matching memory item");
+    let evolution = snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == matching_memory.id)
+      .expect("evolution state");
+
+    assert!(evolution.truth_alignment == "watching" || evolution.truth_alignment == "diverging");
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_key == matching_memory.memory_key
+        && record.detector_type == "tension"
+        && record.direction == "reversing"
+    }));
+  }
+
+  #[test]
+  fn seeded_title_with_brackets_still_matches_lived_observation_terms() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    connection
+      .execute(
+        r#"
+          INSERT INTO companion_context_entries (
+            category_key, title, body, tags_json, notes, display_order, is_active, deleted_at, created_at, updated_at
+          ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 1, NULL, ?6, ?6)
+        "#,
+        params![
+          "career",
+          "[Seed] Akai MPC",
+          "I really like the Akai MPC and keep coming back to it.",
+          serde_json::to_string(&vec!["seeded", "music"]).expect("tags"),
+          "seeded",
+          Utc::now().to_rfc3339(),
+        ],
+      )
+      .expect("seed context entry");
+
+    let now = Utc::now();
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          now.to_rfc3339(),
+          (now - Duration::minutes(12)).to_rfc3339(),
+          (now - Duration::minutes(2)).to_rfc3339(),
+          "The Akai MPC does not fit anymore.",
+          "I don't really like the Akai MPC anymore and mostly avoid using it now.",
+          600_i64,
+        ],
+      )
+      .expect("seed call session");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run pass");
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "memory_item"
+        && record.direction == "contradicting"
+        && record.summary.to_lowercase().contains("akai mpc")
+    }));
+  }
+
+  #[test]
+  fn repeated_contradiction_pass_accumulates_divergence_history() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "career".into(),
+        title: "[Seed] Akai MPC".into(),
+        body: "I really like the Akai MPC and keep coming back to it.".into(),
+        tags: vec!["seeded".into(), "music".into()],
+        notes: "accumulation seed".into(),
+      },
+    )
+    .expect("create seeded context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let now = Utc::now();
+    for offset_minutes in [12_i64, 30_i64] {
+      connection
+        .execute(
+          r#"
+            INSERT INTO call_sessions (
+              created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+              started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+            ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+          "#,
+          params![
+            now.to_rfc3339(),
+            (now - Duration::minutes(offset_minutes)).to_rfc3339(),
+            (now - Duration::minutes(offset_minutes - 8)).to_rfc3339(),
+            "The Akai MPC does not fit anymore.",
+            "I don't really like the Akai MPC anymore and mostly avoid using it now.",
+            600_i64,
+          ],
+        )
+        .expect("seed contradictory call session");
+    }
+
+    let first_snapshot = run_context_memory_pass(&db_path).expect("first contradiction pass");
+    let first_memory = first_snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_entry_title == "[Seed] Akai MPC" && item.memory_type == "behavioral_memory")
+      .expect("seeded behavioral memory");
+    let first_evolution = first_snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == first_memory.id)
+      .expect("first evolution");
+
+    let later = Utc::now() + Duration::minutes(1);
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          later.to_rfc3339(),
+          (later - Duration::minutes(9)).to_rfc3339(),
+          (later - Duration::minutes(1)).to_rfc3339(),
+          "The Akai MPC still feels wrong lately.",
+          "I avoid the Akai MPC now and it does not feel like me anymore.",
+          540_i64,
+        ],
+      )
+      .expect("seed later contradictory call session");
+
+    let second_snapshot = run_context_memory_pass(&db_path).expect("second contradiction pass");
+    let second_memory = second_snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_entry_title == "[Seed] Akai MPC" && item.memory_type == "behavioral_memory")
+      .expect("seeded behavioral memory second");
+    let second_evolution = second_snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == second_memory.id)
+      .expect("second evolution");
+
+    assert!(second_evolution.cumulative_divergence_score >= first_evolution.cumulative_divergence_score);
+    assert!(second_evolution.cumulative_challenge_score >= first_evolution.cumulative_challenge_score);
+  }
+
+  #[test]
+  fn north_star_call_review_import_can_match_and_challenge_memory() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "career".into(),
+        title: "[Seed] Akai MPC".into(),
+        body: "I really like the Akai MPC and keep coming back to it.".into(),
+        tags: vec!["seeded".into(), "music".into()],
+        notes: "review challenge seed".into(),
+      },
+    )
+    .expect("create seeded context entry");
+
+    store_north_star_call_reviews(
+      &db_path,
+      &[NorthStarCallReview {
+        review_id: "review-1".into(),
+        call_id: "call-1".into(),
+        user_handle: "seeded-user".into(),
+        sentiment: "tense".into(),
+        notes: "The Akai MPC does not feel like me anymore and I keep pulling away from it now.".into(),
+        created_at: Utc::now().to_rfc3339(),
+      }],
+    )
+    .expect("store north star call review");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run pass");
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "memory_item"
+        && record.detector_type == "tension"
+        && record.direction == "reviewing"
+        && record.evidence_json.contains("north_star_call_review_memory_match")
+    }));
+
+    let memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_entry_title == "[Seed] Akai MPC" && item.memory_type == "behavioral_memory")
+      .expect("seeded behavioral memory");
+    let evolution = snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == memory.id)
+      .expect("evolution state");
+    assert!(evolution.truth_alignment == "watching" || evolution.truth_alignment == "diverging");
+  }
+
+  #[test]
+  fn cross_source_challenge_increases_source_coherence_for_memory() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "career".into(),
+        title: "[Seed] Akai MPC".into(),
+        body: "I really like the Akai MPC and keep coming back to it.".into(),
+        tags: vec!["seeded".into(), "music".into()],
+        notes: "cross-source challenge seed".into(),
+      },
+    )
+    .expect("create seeded context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let now = Utc::now();
+    connection
+      .execute(
+        r#"
+          INSERT INTO call_sessions (
+            created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+            started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+          ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+        "#,
+        params![
+          now.to_rfc3339(),
+          (now - Duration::minutes(10)).to_rfc3339(),
+          (now - Duration::minutes(2)).to_rfc3339(),
+          "The Akai MPC feels wrong now.",
+          "I do not really like the Akai MPC anymore and I mostly avoid it now.",
+          480_i64,
+        ],
+      )
+      .expect("insert contradictory call session");
+
+    store_north_star_call_reviews(
+      &db_path,
+      &[NorthStarCallReview {
+        review_id: "review-1".into(),
+        call_id: "call-1".into(),
+        user_handle: "seeded-user".into(),
+        sentiment: "tense".into(),
+        notes: "The Akai MPC does not feel like me anymore and I keep pulling away from it.".into(),
+        created_at: now.to_rfc3339(),
+      }],
+    )
+    .expect("store challenge review");
+
+    let outreach_id = {
+      connection
+        .execute(
+          r#"
+            INSERT INTO outreach_events (
+              created_at, saved_moment_id, outreach_kind, channel, reason_summary,
+              message_text, confidence, was_delivered, delivery_metadata_json, response_state
+            ) VALUES (?1, NULL, 'message', 'north_star', 'seed', 'seed', 0.76, 1, '{}', 'sent')
+          "#,
+          params![now.to_rfc3339()],
+        )
+        .expect("insert outreach");
+      connection.last_insert_rowid()
+    };
+
+    submit_outreach_feedback(
+      &db_path,
+      &SubmitFeedbackInput {
+        outreach_event_id: outreach_id,
+        feedback_kind: "intrusive".into(),
+        notes: "Bringing up the Akai MPC felt too much because I am pulling away from it now.".into(),
+      },
+    )
+    .expect("submit feedback");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run pass");
+    let memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_entry_title == "[Seed] Akai MPC" && item.memory_type == "behavioral_memory")
+      .expect("seeded memory");
+    let evolution = snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == memory.id)
+      .expect("evolution");
+
+    assert!(evolution.challenge_source_count >= 2);
+    assert!(evolution.source_coherence_score > 0.25);
+    assert!(evolution.observed_evidence_summary.to_lowercase().contains("challenge seen across"));
+  }
+
+  #[test]
+  fn repeated_cross_source_contradiction_becomes_temporal_phase_shift() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "career".into(),
+        title: "[Seed] Akai MPC".into(),
+        body: "I really like the Akai MPC and keep coming back to it.".into(),
+        tags: vec!["seeded".into(), "music".into()],
+        notes: "temporal phase shift seed".into(),
+      },
+    )
+    .expect("create context entry");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let now = Utc::now();
+    for offset in [30_i64, 18_i64, 6_i64] {
+      connection
+        .execute(
+          r#"
+            INSERT INTO call_sessions (
+              created_at, outreach_event_id, saved_moment_id, handoff_kind, session_state,
+              started_at, ended_at, outcome, notes, transcript_summary, duration_seconds
+            ) VALUES (?1, NULL, NULL, 'manual', 'ended', ?2, ?3, 'completed', ?4, ?5, ?6)
+          "#,
+          params![
+            now.to_rfc3339(),
+            (now - Duration::minutes(offset)).to_rfc3339(),
+            (now - Duration::minutes(offset - 5)).to_rfc3339(),
+            "The Akai MPC feels wrong and distant now.",
+            "I keep pulling away from the Akai MPC and it does not feel like me anymore.",
+            420_i64,
+          ],
+        )
+        .expect("insert call session");
+
+      store_north_star_call_reviews(
+        &db_path,
+        &[NorthStarCallReview {
+          review_id: format!("review-{offset}"),
+          call_id: format!("call-{offset}"),
+          user_handle: "seeded-user".into(),
+          sentiment: "tense".into(),
+          notes: "The Akai MPC feels off and I keep moving away from it now.".into(),
+          created_at: (now - Duration::minutes(offset)).to_rfc3339(),
+        }],
+      )
+      .expect("store call review");
+
+      run_context_memory_pass(&db_path).expect("run pass");
+    }
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run final pass");
+    let memory = snapshot
+      .memory_items
+      .iter()
+      .find(|item| item.source_entry_title == "[Seed] Akai MPC" && item.memory_type == "behavioral_memory")
+      .expect("seeded memory");
+    let evolution = snapshot
+      .evolution_states
+      .iter()
+      .find(|state| state.memory_item_id == memory.id)
+      .expect("evolution");
+
+    assert!(evolution.sustained_divergence_score > 0.35);
+    assert!(evolution.phase_shift_score > 0.42);
+    assert!(evolution.phase_shift_state == "shifting" || evolution.phase_shift_state == "sustained_shift");
+  }
+
+  #[test]
+  fn store_north_star_call_reviews_deduplicates_review_ids() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let review = NorthStarCallReview {
+      review_id: "review-1".into(),
+      call_id: "call-1".into(),
+      user_handle: "seeded-user".into(),
+      sentiment: "warm".into(),
+      notes: "Still feels grounding.".into(),
+      created_at: Utc::now().to_rfc3339(),
+    };
+
+    let first = store_north_star_call_reviews(&db_path, std::slice::from_ref(&review)).expect("first store");
+    let second = store_north_star_call_reviews(&db_path, &[review]).expect("second store");
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 0);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let stored_count: i64 = connection
+      .query_row("SELECT COUNT(*) FROM north_star_call_reviews", [], |row| row.get(0))
+      .expect("count stored reviews");
+    assert_eq!(stored_count, 1);
+  }
+
+  #[test]
+  fn context_memory_pass_adds_outreach_feedback_detectors() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let created_at = Utc::now().to_rfc3339();
+    connection
+      .execute(
+        r#"
+          INSERT INTO outreach_events (
+            created_at, saved_moment_id, outreach_kind, channel, reason_summary,
+            message_text, confidence, was_delivered, delivery_metadata_json, response_state
+          ) VALUES
+          (?1, NULL, 'message', 'north_star', 'helpful seed', 'seed', 0.82, 1, '{}', 'sent'),
+          (?2, NULL, 'call_request', 'north_star', 'intrusive seed', 'seed', 0.88, 1, '{}', 'sent')
+        "#,
+        params![created_at, created_at],
+      )
+      .expect("seed outreach events");
+
+    submit_outreach_feedback(
+      &db_path,
+      &SubmitFeedbackInput {
+        outreach_event_id: 1,
+        feedback_kind: "helpful".into(),
+        notes: "That landed well.".into(),
+      },
+    )
+    .expect("submit helpful feedback");
+
+    submit_outreach_feedback(
+      &db_path,
+      &SubmitFeedbackInput {
+        outreach_event_id: 2,
+        feedback_kind: "intrusive".into(),
+        notes: "That felt too much.".into(),
+      },
+    )
+    .expect("submit intrusive feedback");
+
+    let snapshot = run_context_memory_pass(&db_path).expect("run context memory pass");
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "outreach_path"
+        && record.detector_type == "reinforcement"
+        && record.direction == "welcoming"
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "outreach_path"
+        && record.detector_type == "tension"
+        && record.direction == "resisting"
+    }));
+    assert!(snapshot.detector_records.iter().any(|record| {
+      record.target_kind == "interaction_boundary"
+        && record.detector_type == "protection"
+        && record.target_key == "outreach_timing_boundary"
+    }));
+  }
+
+  #[test]
+  fn reset_runtime_data_keeps_manual_context_but_clears_generated_memory_layers() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "friends".into(),
+        title: "Mara".into(),
+        body: "A close friend who matters.".into(),
+        tags: vec!["important".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    run_context_memory_pass(&db_path).expect("run context memory pass");
+    reset_runtime_data(&db_path).expect("reset runtime data");
+
+    let companion_snapshot = companion_context_snapshot(&db_path).expect("companion context snapshot");
+    let memory_snapshot = memory_system_snapshot(&db_path).expect("memory system snapshot");
+    let passive_snapshot = passive_context_snapshot(&db_path).expect("passive context snapshot");
+
+    assert_eq!(companion_snapshot.categories.iter().map(|section| section.entries.len()).sum::<usize>(), 1);
+    assert!(memory_snapshot.memory_items.is_empty());
+    assert!(memory_snapshot.detector_records.is_empty());
+    assert!(memory_snapshot.evolution_states.is_empty());
+    assert!(memory_snapshot.tectonic_timeline.is_empty());
+    assert!(passive_snapshot.raw_events.is_empty());
+    assert!(passive_snapshot.visits.is_empty());
   }
 
   #[test]

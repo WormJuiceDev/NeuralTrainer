@@ -293,6 +293,118 @@ export type MemoryGrowthSnapshot = {
   archivedCount: number;
 };
 
+export type InterpretedMemoryItem = {
+  id: number;
+  memoryKey: string;
+  sourceKind: string;
+  sourceRefId: number | null;
+  sourceCategoryKey: string;
+  sourceEntryTitle: string;
+  memoryType: string;
+  summary: string;
+  detail: string;
+  tags: string[];
+  confidence: number;
+  salience: number;
+  sensitivity: string;
+  declaredByUser: boolean;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+  interpretedAt: string;
+  lastObservedAt: string;
+  archivedAt: string | null;
+};
+
+export type DetectorRecord = {
+  id: number;
+  detectorKey: string;
+  detectorType: string;
+  targetKind: string;
+  targetRefId: number | null;
+  targetKey: string;
+  direction: string;
+  strength: number;
+  confidence: number;
+  durationSeconds: number;
+  repeatCount: number;
+  summary: string;
+  evidenceJson: string;
+  createdAt: string;
+  lastSeenAt: string;
+};
+
+export type MemoryEvolutionState = {
+  id: number;
+  memoryItemId: number;
+  declaredConfidence: number;
+  observedConfidence: number;
+  detectorBalance: number;
+  observedSupportScore: number;
+  observedChallengeScore: number;
+  divergenceScore: number;
+  cumulativeSupportScore: number;
+  cumulativeChallengeScore: number;
+  cumulativeDivergenceScore: number;
+  supportSourceCount: number;
+  challengeSourceCount: number;
+  sourceCoherenceScore: number;
+  sustainedDivergenceScore: number;
+  phaseShiftScore: number;
+  phaseShiftState: string;
+  truthAlignment: string;
+  currentStatus: string;
+  reinforcementScore: number;
+  driftScore: number;
+  tensionScore: number;
+  volatilityScore: number;
+  emergenceScore: number;
+  protectionScore: number;
+  declaredTruthSummary: string;
+  observedTruthSummary: string;
+  observedEvidenceSummary: string;
+  phaseShiftSummary: string;
+  alignmentSummary: string;
+  lastEvolvedAt: string;
+  lastConfirmedAt: string | null;
+};
+
+export type TectonicTimelineSnapshot = {
+  id: number;
+  snapshotKind: string;
+  recordedAt: string;
+  windowStart: string;
+  windowEnd: string;
+  totalDetectorActivity: number;
+  activeMemoryCount: number;
+  summaryJson: string;
+};
+
+export type MemorySystemCount = {
+  key: string;
+  count: number;
+};
+
+export type MemorySystemOverview = {
+  totalMemoryCount: number;
+  activeMemoryCount: number;
+  historicalMemoryCount: number;
+  detectorCount: number;
+  tectonicSnapshotCount: number;
+  lastPassAt: string | null;
+  memoryTypeBreakdown: MemorySystemCount[];
+  detectorTypeBreakdown: MemorySystemCount[];
+  evolutionStatusBreakdown: MemorySystemCount[];
+};
+
+export type MemorySystemSnapshot = {
+  memoryItems: InterpretedMemoryItem[];
+  detectorRecords: DetectorRecord[];
+  evolutionStates: MemoryEvolutionState[];
+  tectonicTimeline: TectonicTimelineSnapshot[];
+  overview: MemorySystemOverview;
+};
+
 export type UpdateMemoryItemInput = {
   id: number;
   action: "confirm" | "dismiss" | "archive" | "revive";

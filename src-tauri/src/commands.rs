@@ -8,7 +8,7 @@ use crate::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSnapshot, CompanionHomeSnapshot, CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput,
     DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
-    MemoryGrowthSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
+    MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
     NorthStarRuntimeSnapshot, SimulationSuiteResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateCompanionContextEntryInput, UpdateMemoryItemInput,
@@ -274,7 +274,8 @@ pub fn import_north_star_call_reviews(
 ) -> Result<NorthStarSnapshot, AppError> {
   let settings = db::load_settings(&state.db_path)?;
   let snapshot = north_star::fetch_snapshot(&settings, None)?;
-  let mut imported = 0usize;
+  let imported = db::store_north_star_call_reviews(&state.db_path, &snapshot.call_reviews)?;
+  let mut reflected = 0usize;
 
   for review in &snapshot.call_reviews {
     let text = if review.notes.trim().is_empty() {
@@ -298,21 +299,25 @@ pub fn import_north_star_call_reviews(
         is_sensitive: false,
       },
     )? {
-      imported += 1;
+      reflected += 1;
     }
   }
 
   state.push_event(format!(
-    "Imported {} North Star call review(s) into local reflections.",
-    imported
+    "Imported {} North Star call review(s) into local review evidence and {} reflection(s).",
+    imported,
+    reflected
   ));
 
   north_star::fetch_snapshot(
     &settings,
-    Some(if imported == 0 {
+    Some(if imported == 0 && reflected == 0 {
       "No new North Star call reviews needed importing.".into()
     } else {
-      format!("Imported {} North Star call review(s) into local reflections.", imported)
+      format!(
+        "Imported {} North Star call review(s) into local review evidence and {} reflection(s).",
+        imported, reflected
+      )
     }),
   )
 }
@@ -1017,6 +1022,32 @@ pub fn run_memory_growth_pass(
 }
 
 #[tauri::command]
+pub fn get_memory_system_snapshot(
+  state: State<'_, AppState>,
+) -> Result<MemorySystemSnapshot, AppError> {
+  db::memory_system_snapshot(&state.db_path)
+}
+
+#[tauri::command]
+pub fn run_context_memory_pass(
+  state: State<'_, AppState>,
+) -> Result<MemorySystemSnapshot, AppError> {
+  let snapshot = db::run_context_memory_pass(&state.db_path)?;
+  state.push_event("Ran context-to-memory interpretation pass.");
+  Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn seed_context_memory_example(
+  state: State<'_, AppState>,
+  scenario_key: String,
+) -> Result<MemorySystemSnapshot, AppError> {
+  let snapshot = db::seed_context_memory_example(&state.db_path, &scenario_key)?;
+  state.push_event(format!("Seeded context-memory example '{}'.", scenario_key));
+  Ok(snapshot)
+}
+
+#[tauri::command]
 pub fn update_memory_item(
   state: State<'_, AppState>,
   payload: UpdateMemoryItemInput,
@@ -1189,7 +1220,7 @@ pub fn seed_mvp_reality_check_scenario(
 #[tauri::command]
 pub fn reset_runtime_data(state: State<'_, AppState>) -> Result<(), AppError> {
   db::reset_runtime_data(&state.db_path)?;
-  state.push_event("Cleared runtime data while keeping settings.");
+  state.push_event("Cleared generated runtime data while keeping settings and manual context.");
   Ok(())
 }
 

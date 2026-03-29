@@ -21,6 +21,7 @@ import type {
   LocationEventInput,
   ManualReflection,
   MemoryGrowthSnapshot,
+  MemorySystemSnapshot,
   MvpRealityCheckSnapshot,
   NorthStarRuntimeSnapshot,
   NorthStarSnapshot,
@@ -235,6 +236,15 @@ export const getMemoryGrowthSnapshot = () =>
 
 export const runMemoryGrowthPass = () =>
   invoke<MemoryGrowthSnapshot>("run_memory_growth_pass");
+
+export const getMemorySystemSnapshot = () =>
+  invoke<MemorySystemSnapshot>("get_memory_system_snapshot");
+
+export const runContextMemoryPass = () =>
+  invoke<MemorySystemSnapshot>("run_context_memory_pass");
+
+export const seedContextMemoryExample = (scenarioKey: "support" | "contradiction") =>
+  invoke<MemorySystemSnapshot>("seed_context_memory_example", { scenarioKey });
 
 export const updateMemoryItem = (payload: UpdateMemoryItemInput) =>
   invoke<MemoryGrowthSnapshot>("update_memory_item", { payload });
