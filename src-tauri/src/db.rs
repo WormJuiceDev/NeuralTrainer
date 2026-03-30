@@ -17,6 +17,7 @@ use crate::{
     CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput, UpdateCompanionContextEntryInput,
     DetectorRecord, InterpretedMemoryItem, MemoryEvolutionState, MemorySystemCount, MemorySystemOverview, MemorySystemSnapshot, TectonicTimelineSnapshot,
     DecisionSnapshot, DiagnosticStatus, EndCallSessionInput, InboundMessage, InferredSleepWindow,
+    LivedMomentAssessment, LivedMomentContactRhythmOption, LivedMomentDetectorPressure, LivedMomentMemoryInfluence, LivedMomentOpportunity, LivedMomentRelationalBridge, LivedMomentSafeguard, LivedMomentSignal, LivedMomentSituationalSignal, LivedMomentSnapshot,
     LocationEventInput, ManualReflection, MemoryOverview, MomentDecision, OutreachEvent,
     MemoryGrowthSnapshot, MemoryItem, OutreachFeedback, PassiveContextSnapshot, PhaseOneSnapshot, PhaseThreeSnapshot, Place,
     NorthStarCallReview,
@@ -3711,6 +3712,1246 @@ pub fn phase_three_snapshot(db_path: &PathBuf) -> Result<PhaseThreeSnapshot, App
   })
 }
 
+fn parse_timezone_or_utc(timezone: &str) -> Tz {
+  timezone.parse::<Tz>().unwrap_or(chrono_tz::UTC)
+}
+
+fn time_bucket_for_hour(hour: u32) -> String {
+  match hour {
+    0..=4 => "late_night".into(),
+    5..=8 => "early_morning".into(),
+    9..=11 => "morning".into(),
+    12..=16 => "afternoon".into(),
+    17..=20 => "evening".into(),
+    _ => "night".into(),
+  }
+}
+
+fn time_in_sleep_window(time_text: &str, window: &InferredSleepWindow) -> bool {
+  let current = match NaiveTime::parse_from_str(time_text, "%H:%M") {
+    Ok(value) => value,
+    Err(_) => return false,
+  };
+  let start = match NaiveTime::parse_from_str(&window.start, "%H:%M") {
+    Ok(value) => value,
+    Err(_) => return false,
+  };
+  let end = match NaiveTime::parse_from_str(&window.end, "%H:%M") {
+    Ok(value) => value,
+    Err(_) => return false,
+  };
+
+  if start <= end {
+    current >= start && current <= end
+  } else {
+    current >= start || current <= end
+  }
+}
+
+fn find_repeated_place_for_visit(
+  visit: Option<&PlaceVisit>,
+  repeated_places: &[RepeatedPlaceSummary],
+) -> Option<RepeatedPlaceSummary> {
+  let visit = visit?;
+  let context = serde_json::from_str::<serde_json::Value>(&visit.raw_context_json).ok()?;
+  let lat = context.get("anchor_latitude")?.as_f64()?;
+  let lng = context.get("anchor_longitude")?.as_f64()?;
+
+  repeated_places
+    .iter()
+    .find(|candidate| haversine_meters(lat, lng, candidate.latitude, candidate.longitude) <= 160.0)
+    .cloned()
+}
+
+fn rhythm_state_for_now(
+  active_visit: Option<&PlaceVisit>,
+  baseline: &[RhythmBaselineEntry],
+  now: DateTime<Utc>,
+) -> (String, f64) {
+  let bucket = baseline.iter().find(|entry| {
+    entry.day_of_week == now.weekday().num_days_from_monday() && entry.hour_bucket == now.hour()
+  });
+
+  match (active_visit, bucket) {
+    (Some(visit), Some(entry)) => {
+      let ratio = if entry.average_duration_seconds <= 0 {
+        1.0
+      } else {
+        visit.duration_seconds.max(1) as f64 / entry.average_duration_seconds.max(1) as f64
+      };
+
+      if ratio >= 1.7 {
+        ("outside_normal_rhythm".into(), clamp_score(0.58 + ((ratio - 1.0) * 0.16)))
+      } else {
+        ("within_known_rhythm".into(), clamp_score(0.45 + (entry.visit_count as f64 * 0.08)))
+      }
+    }
+    (Some(visit), None) if visit.duration_seconds >= 20 * 60 => ("outside_normal_rhythm".into(), 0.68),
+    (Some(_), None) => ("emerging_rhythm".into(), 0.42),
+    (None, Some(entry)) => ("between_known_rhythms".into(), clamp_score(0.34 + (entry.visit_count as f64 * 0.05))),
+    (None, None) => ("unreadable".into(), 0.2),
+  }
+}
+
+fn memory_relevance_for_context(
+  item: &InterpretedMemoryItem,
+  evolution: Option<&MemoryEvolutionState>,
+  matched_place: Option<&Place>,
+  repeated_place: Option<&RepeatedPlaceSummary>,
+  reflections: &[ManualReflection],
+) -> f64 {
+  let mut relevance = (item.salience * 0.5) + (item.confidence * 0.25);
+  let item_text = format!(
+    "{} {} {} {} {}",
+    item.source_category_key,
+    item.source_entry_title,
+    item.memory_type,
+    item.summary,
+    item.detail
+  )
+  .to_ascii_lowercase();
+  let item_tokens: HashSet<String> = cleaned_match_tokens(&item_text).into_iter().collect();
+
+  if let Some(place) = matched_place {
+    let place_text = format!("{} {} {} {}", place.label, place.place_kind, place.meaning_kind, place.notes)
+      .to_ascii_lowercase();
+    let overlaps = cleaned_match_tokens(&place_text)
+      .into_iter()
+      .filter(|token| item_tokens.contains(token))
+      .count();
+    if overlaps > 0 {
+      relevance += (overlaps as f64 * 0.12).min(0.36);
+    }
+    if place.is_protected && matches!(item.sensitivity.as_str(), "high" | "guarded") {
+      relevance += 0.18;
+    }
+    if place.significance_score >= 0.7 {
+      relevance += 0.08;
+    }
+  }
+
+  if let Some(repeated_place) = repeated_place {
+    let overlaps = cleaned_match_tokens(&repeated_place.label)
+      .into_iter()
+      .filter(|token| item_tokens.contains(token))
+      .count();
+    if overlaps > 0 {
+      relevance += 0.08 + (overlaps as f64 * 0.05).min(0.18);
+    }
+  }
+
+  let reflection_bonus = reflections
+    .iter()
+    .take(8)
+    .filter(|reflection| {
+      cleaned_match_tokens(&reflection.text)
+        .into_iter()
+        .any(|token| item_tokens.contains(&token))
+    })
+    .count();
+  if reflection_bonus > 0 {
+    relevance += (reflection_bonus as f64 * 0.07).min(0.21);
+  }
+
+  if let Some(evolution) = evolution {
+    relevance += evolution.phase_shift_score * 0.18;
+    if matches!(evolution.current_status.as_str(), "conflicted" | "questioned") {
+      relevance += 0.1;
+    }
+  }
+
+  clamp_score(relevance)
+}
+
+fn aggregate_detector_pressures(detectors: &[DetectorRecord]) -> Vec<LivedMomentDetectorPressure> {
+  let mut grouped: HashMap<String, Vec<&DetectorRecord>> = HashMap::new();
+  for detector in detectors {
+    grouped.entry(detector.detector_type.clone()).or_default().push(detector);
+  }
+
+  let mut pressures = grouped
+    .into_iter()
+    .map(|(detector_type, records)| {
+      let total_strength = clamp_score(records.iter().map(|record| record.strength).sum::<f64>());
+      let average_confidence =
+        records.iter().map(|record| record.confidence).sum::<f64>() / records.len().max(1) as f64;
+      let summary = records
+        .iter()
+        .max_by(|left, right| left.strength.total_cmp(&right.strength))
+        .map(|record| record.summary.clone())
+        .unwrap_or_default();
+
+      LivedMomentDetectorPressure {
+        detector_type,
+        total_strength,
+        average_confidence: clamp_score(average_confidence),
+        sample_count: records.len(),
+        summary,
+      }
+    })
+    .collect::<Vec<_>>();
+
+  pressures.sort_by(|left, right| right.total_strength.total_cmp(&left.total_strength));
+  pressures
+}
+
+fn push_assessment(
+  assessments: &mut Vec<LivedMomentAssessment>,
+  kind: &str,
+  score: f64,
+  confidence: f64,
+  summary: impl Into<String>,
+  evidence: Vec<String>,
+) {
+  if score < 0.45 {
+    return;
+  }
+
+  assessments.push(LivedMomentAssessment {
+    kind: kind.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    summary: summary.into(),
+    evidence,
+  });
+}
+
+fn assessment_score(assessments: &[LivedMomentAssessment], kind: &str) -> f64 {
+  assessments
+    .iter()
+    .find(|assessment| assessment.kind == kind)
+    .map(|assessment| assessment.score)
+    .unwrap_or(0.0)
+}
+
+fn push_signal(
+  signals: &mut Vec<LivedMomentSignal>,
+  kind: &str,
+  score: f64,
+  confidence: f64,
+  reason: impl Into<String>,
+) {
+  if score < 0.45 {
+    return;
+  }
+
+  signals.push(LivedMomentSignal {
+    kind: kind.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    reason: reason.into(),
+  });
+}
+
+fn push_opportunity(
+  opportunities: &mut Vec<LivedMomentOpportunity>,
+  kind: &str,
+  score: f64,
+  confidence: f64,
+  timing: &str,
+  summary: impl Into<String>,
+) {
+  if score < 0.45 {
+    return;
+  }
+
+  opportunities.push(LivedMomentOpportunity {
+    kind: kind.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    timing: timing.into(),
+    summary: summary.into(),
+  });
+}
+
+fn push_safeguard(
+  safeguards: &mut Vec<LivedMomentSafeguard>,
+  kind: &str,
+  score: f64,
+  confidence: f64,
+  urgency: &str,
+  summary: impl Into<String>,
+) {
+  if score < 0.45 {
+    return;
+  }
+
+  safeguards.push(LivedMomentSafeguard {
+    kind: kind.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    urgency: urgency.into(),
+    summary: summary.into(),
+  });
+}
+
+fn push_contact_rhythm_option(
+  options: &mut Vec<LivedMomentContactRhythmOption>,
+  level: &str,
+  score: f64,
+  confidence: f64,
+  reason: impl Into<String>,
+) {
+  if score < 0.35 {
+    return;
+  }
+
+  options.push(LivedMomentContactRhythmOption {
+    level: level.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    reason: reason.into(),
+  });
+}
+
+fn push_situational_signal(
+  signals: &mut Vec<LivedMomentSituationalSignal>,
+  kind: &str,
+  score: f64,
+  confidence: f64,
+  direction: &str,
+  summary: impl Into<String>,
+) {
+  if score < 0.4 {
+    return;
+  }
+
+  signals.push(LivedMomentSituationalSignal {
+    kind: kind.into(),
+    score: clamp_score(score),
+    confidence: clamp_score(confidence),
+    direction: direction.into(),
+    summary: summary.into(),
+  });
+}
+
+fn build_lived_moment_snapshot(
+  connection: &Connection,
+  timezone: &str,
+  now: DateTime<Utc>,
+) -> Result<LivedMomentSnapshot, AppError> {
+  let places = list_places(connection)?;
+  let reflections = list_reflections(connection)?;
+  let raw_events = list_raw_events(connection)?;
+  let visits = list_visits(connection)?;
+  let repeated_places = list_repeated_places(connection)?;
+  let saved_moments = list_saved_moments(connection)?;
+  let outreach_events = list_outreach_events(connection)?;
+  let call_sessions = list_call_sessions(connection)?;
+  let memory_items = list_interpreted_memory_items(connection)?;
+  let evolution_states = list_memory_evolution_states(connection)?;
+  let detector_records = list_detector_records(connection)?;
+  let context_sections = build_companion_context_snapshot_with_filter(connection, true)?;
+  let sleep_window = infer_sleep_window(&visits);
+  let rhythm_baseline = build_rhythm_baseline(&visits);
+
+  let latest_location_event = raw_events.first().cloned();
+  let active_visit = visits
+    .iter()
+    .find(|visit| visit.departure_mode == "unknown")
+    .cloned()
+    .or_else(|| visits.first().cloned());
+  let matched_place = active_visit
+    .as_ref()
+    .and_then(|visit| visit.place_id)
+    .and_then(|place_id| places.iter().find(|place| place.id == place_id).cloned())
+    .or_else(|| {
+      latest_location_event.as_ref().and_then(|event| {
+        places
+          .iter()
+          .find(|place| {
+            if let (Some(lat), Some(lng)) = (place.latitude, place.longitude) {
+              haversine_meters(lat, lng, event.latitude, event.longitude) <= place.radius_meters as f64
+            } else {
+              false
+            }
+          })
+          .cloned()
+      })
+    });
+  let repeated_place = find_repeated_place_for_visit(active_visit.as_ref(), &repeated_places);
+
+  let timezone = parse_timezone_or_utc(timezone);
+  let timezone_name = timezone.to_string();
+  let local_now = now.with_timezone(&timezone);
+  let local_time = local_now.format("%H:%M").to_string();
+  let local_date = local_now.format("%Y-%m-%d").to_string();
+  let local_day_of_week = local_now.format("%A").to_string();
+  let time_bucket = time_bucket_for_hour(local_now.hour());
+  let is_likely_sleep_window = time_in_sleep_window(&local_time, &sleep_window);
+  let (rhythm_state, rhythm_confidence) = rhythm_state_for_now(active_visit.as_ref(), &rhythm_baseline, now);
+
+  let evolution_by_memory_id = evolution_states
+    .iter()
+    .map(|state| (state.memory_item_id, state))
+    .collect::<HashMap<_, _>>();
+
+  let mut related_memories = memory_items
+    .iter()
+    .filter(|item| item.archived_at.is_none())
+    .filter_map(|item| {
+      let evolution = evolution_by_memory_id.get(&item.id).copied();
+      let relevance = memory_relevance_for_context(
+        item,
+        evolution,
+        matched_place.as_ref(),
+        repeated_place.as_ref(),
+        &reflections,
+      );
+
+      if relevance < 0.5 {
+        return None;
+      }
+
+      Some(LivedMomentMemoryInfluence {
+        memory_item_id: item.id,
+        memory_key: item.memory_key.clone(),
+        memory_type: item.memory_type.clone(),
+        summary: item.summary.clone(),
+        confidence: item.confidence,
+        salience: item.salience,
+        relevance_score: relevance,
+        sensitivity: item.sensitivity.clone(),
+        current_status: evolution.map(|state| state.current_status.clone()),
+        phase_shift_state: evolution.map(|state| state.phase_shift_state.clone()),
+        phase_shift_score: evolution.map(|state| state.phase_shift_score),
+      })
+    })
+    .collect::<Vec<_>>();
+  related_memories.sort_by(|left, right| right.relevance_score.total_cmp(&left.relevance_score));
+  related_memories.truncate(6);
+
+  let detector_pressures = aggregate_detector_pressures(&detector_records);
+  let detector_pressure_map = detector_pressures
+    .iter()
+    .map(|pressure| (pressure.detector_type.as_str(), pressure.total_strength))
+    .collect::<HashMap<_, _>>();
+
+  let dominant_phase = evolution_states
+    .iter()
+    .max_by(|left, right| left.phase_shift_score.total_cmp(&right.phase_shift_score));
+  let dominant_phase_shift_state = dominant_phase
+    .map(|state| state.phase_shift_state.clone())
+    .unwrap_or_else(|| "stable".into());
+  let dominant_phase_shift_score = dominant_phase.map(|state| state.phase_shift_score).unwrap_or(0.0);
+  let dominant_phase_shift_summary = dominant_phase
+    .map(|state| state.phase_shift_summary.clone())
+    .unwrap_or_else(|| "No meaningful phase movement has been recorded yet.".into());
+
+  let protective_pressure = detector_pressure_map.get("protection").copied().unwrap_or(0.0);
+  let tension_pressure = detector_pressure_map.get("tension").copied().unwrap_or(0.0);
+  let drift_pressure = detector_pressure_map.get("drift").copied().unwrap_or(0.0);
+  let emergence_pressure = detector_pressure_map.get("emergence").copied().unwrap_or(0.0);
+  let reinforcement_pressure = detector_pressure_map.get("reinforcement").copied().unwrap_or(0.0);
+  let volatility_pressure = detector_pressure_map.get("volatility").copied().unwrap_or(0.0);
+
+  let has_sensitive_memory = related_memories
+    .iter()
+    .any(|memory| matches!(memory.sensitivity.as_str(), "high" | "guarded"));
+  let meaningful_place_score = matched_place
+    .as_ref()
+    .map(|place| place.significance_score)
+    .or_else(|| repeated_place.as_ref().map(|place| clamp_score(0.3 + (place.visit_count as f64 * 0.07))))
+    .unwrap_or(0.0);
+  let place_kind = matched_place
+    .as_ref()
+    .map(|place| format!("{} {}", place.place_kind, place.meaning_kind).to_ascii_lowercase())
+    .unwrap_or_default();
+  let reflection_text = reflections
+    .iter()
+    .take(8)
+    .map(|reflection| reflection.text.to_ascii_lowercase())
+    .collect::<Vec<_>>()
+    .join(" ");
+  let relational_entries = context_sections
+    .iter()
+    .filter(|section| matches!(section.category.key.as_str(), "friends" | "family" | "pet"))
+    .flat_map(|section| section.entries.iter().cloned())
+    .collect::<Vec<_>>();
+  let recent_saved_moments = saved_moments.iter().take(6).cloned().collect::<Vec<_>>();
+  let recent_sent_24h = outreach_events
+    .iter()
+    .filter(|event| timestamp_in_window(&event.created_at, now - Duration::hours(24)))
+    .count();
+  let recent_sent_72h = outreach_events
+    .iter()
+    .filter(|event| timestamp_in_window(&event.created_at, now - Duration::hours(72)))
+    .count();
+  let recent_calls_7d = call_sessions
+    .iter()
+    .filter(|session| {
+      session
+        .ended_at
+        .as_deref()
+        .or(session.started_at.as_deref())
+        .map(|value| timestamp_in_window(value, now - Duration::days(7)))
+        .unwrap_or(false)
+    })
+    .count();
+  let recent_contact_load = clamp_score(
+    recent_sent_24h as f64 * 0.28 + recent_sent_72h as f64 * 0.12 + recent_calls_7d as f64 * 0.16,
+  );
+  let recent_contact_state = if recent_contact_load >= 0.7 {
+    "recently_active"
+  } else if recent_contact_load >= 0.4 {
+    "recently_touched"
+  } else {
+    "contact_light"
+  }
+  .to_string();
+  let recent_contact_summary = format!(
+    "{} outreach events in 24h, {} in 72h, {} call sessions in 7d.",
+    recent_sent_24h, recent_sent_72h, recent_calls_7d
+  );
+  let protected_time_active = is_in_protected_quiet_time(
+    &AppSettings {
+      timezone: timezone_name.clone(),
+      sleep_window_start: sleep_window.start.clone(),
+      sleep_window_end: sleep_window.end.clone(),
+      ..AppSettings::default()
+    },
+    &list_rules(connection)?,
+    now,
+  )
+  .unwrap_or(is_likely_sleep_window);
+
+  let mut assessments = Vec::new();
+
+  let exploratory_score = clamp_score(
+    if latest_location_event
+      .as_ref()
+      .map(|event| event.movement_state == "moving")
+      .unwrap_or(false)
+    {
+      0.28
+    } else {
+      0.0
+    } + if rhythm_state == "outside_normal_rhythm" { 0.24 } else { 0.0 }
+      + if matched_place.is_none() { 0.12 } else { 0.0 }
+      + if text_has_any_keyword(&place_kind, &["reflection", "park", "walk", "travel", "explore"]) {
+        0.16
+      } else {
+        0.0
+      }
+      + emergence_pressure * 0.15,
+  );
+  push_assessment(
+    &mut assessments,
+    "exploratory",
+    exploratory_score,
+    clamp_score(0.48 + emergence_pressure * 0.2 + rhythm_confidence * 0.2),
+    "The user appears to be moving through a less-routine or more exploratory slice of life right now.",
+    vec![
+      format!("Rhythm state is '{}'.", rhythm_state),
+      latest_location_event
+        .as_ref()
+        .map(|event| format!("Latest movement state is '{}'.", event.movement_state))
+        .unwrap_or_else(|| "No recent location event exists yet.".into()),
+    ],
+  );
+
+  let open_score = clamp_score(
+    reinforcement_pressure * 0.24
+      + emergence_pressure * 0.18
+      + if text_has_any_keyword(&reflection_text, &["open", "alive", "curious", "possibility", "light"]) {
+        0.28
+      } else {
+        0.0
+      }
+      + meaningful_place_score * 0.2
+      + if protective_pressure < 0.45 && tension_pressure < 0.45 { 0.12 } else { 0.0 },
+  );
+  push_assessment(
+    &mut assessments,
+    "open",
+    open_score,
+    clamp_score(0.44 + reinforcement_pressure * 0.2 + meaningful_place_score * 0.15),
+    "The moment has signs of openness rather than closure or contraction.",
+    vec![
+      if meaningful_place_score > 0.0 {
+        format!("The current place carries meaning score {:.2}.", meaningful_place_score)
+      } else {
+        "The current place has not yet accumulated strong meaning.".into()
+      },
+      if text_has_any_keyword(&reflection_text, &["open", "alive", "curious", "possibility", "light"]) {
+        "Recent reflections contain open or alive language.".into()
+      } else {
+        "Recent reflections do not explicitly name openness.".into()
+      },
+    ],
+  );
+
+  let vulnerable_score = clamp_score(
+    protective_pressure * 0.34
+      + tension_pressure * 0.22
+      + if has_sensitive_memory { 0.22 } else { 0.0 }
+      + if is_likely_sleep_window { 0.1 } else { 0.0 }
+      + if text_has_any_keyword(&reflection_text, &["fragile", "tender", "raw", "overwhelmed", "lonely"]) {
+        0.18
+      } else {
+        0.0
+      },
+  );
+  push_assessment(
+    &mut assessments,
+    "vulnerable",
+    vulnerable_score,
+    clamp_score(0.5 + protective_pressure * 0.18 + tension_pressure * 0.14),
+    "The moment looks emotionally or situationally exposed and may need care.",
+    vec![
+      format!("Protection pressure is {:.2}.", protective_pressure),
+      format!("Tension pressure is {:.2}.", tension_pressure),
+    ],
+  );
+
+  let protective_score = clamp_score(
+    protective_pressure * 0.36
+      + if matched_place.as_ref().map(|place| place.is_protected).unwrap_or(false) {
+        0.28
+      } else {
+        0.0
+      }
+      + if is_likely_sleep_window { 0.2 } else { 0.0 }
+      + if has_sensitive_memory { 0.12 } else { 0.0 },
+  );
+  push_assessment(
+    &mut assessments,
+    "protective",
+    protective_score,
+    clamp_score(0.52 + protective_pressure * 0.2),
+    "The moment is shaped by boundaries, care, or the need not to intrude bluntly.",
+    vec![
+      if is_likely_sleep_window {
+        "Local time sits inside the inferred sleep window.".into()
+      } else {
+        "Local time is outside the inferred sleep window.".into()
+      },
+      matched_place
+        .as_ref()
+        .map(|place| format!("Matched place '{}' protected={}.", place.label, place.is_protected))
+        .unwrap_or_else(|| "No protected place is currently matched.".into()),
+    ],
+  );
+
+  let connective_score = clamp_score(
+    if text_has_any_keyword(&place_kind, &["family", "belonging", "friend", "community"]) {
+      0.28
+    } else {
+      0.0
+    } + if text_has_any_keyword(&reflection_text, &["friend", "family", "someone", "reach out", "miss"]) {
+      0.24
+    } else {
+      0.0
+    } + reinforcement_pressure * 0.12
+      + meaningful_place_score * 0.14,
+  );
+  push_assessment(
+    &mut assessments,
+    "connective",
+    connective_score,
+    clamp_score(0.42 + meaningful_place_score * 0.2),
+    "The moment carries signs that human connection may fit it.",
+    vec![
+      if text_has_any_keyword(&place_kind, &["family", "belonging", "friend", "community"]) {
+        "The current place meaning leans relational.".into()
+      } else {
+        "The current place meaning is not explicitly relational.".into()
+      },
+      if text_has_any_keyword(&reflection_text, &["friend", "family", "someone", "reach out", "miss"]) {
+        "Recent reflections point toward contact or missing someone.".into()
+      } else {
+        "Recent reflections do not strongly point toward contact.".into()
+      },
+    ],
+  );
+
+  let opportunity_score = clamp_score(
+    exploratory_score * 0.28
+      + open_score * 0.28
+      + meaningful_place_score * 0.18
+      + if rhythm_state == "outside_normal_rhythm" { 0.12 } else { 0.0 }
+      + if !is_likely_sleep_window { 0.08 } else { 0.0 },
+  );
+  push_assessment(
+    &mut assessments,
+    "opportunity-rich",
+    opportunity_score,
+    clamp_score(0.46 + exploratory_score * 0.15 + open_score * 0.15),
+    "The moment looks like it could be widened or enriched before it closes.",
+    vec![
+      format!("Exploratory score is {:.2}.", exploratory_score),
+      format!("Open score is {:.2}.", open_score),
+    ],
+  );
+
+  let transition_score = clamp_score(
+    dominant_phase_shift_score * 0.36
+      + drift_pressure * 0.22
+      + volatility_pressure * 0.18
+      + tension_pressure * 0.14
+      + if drift_pressure >= 0.75 && tension_pressure >= 0.6 {
+        0.14
+      } else {
+        0.0
+      },
+  );
+  push_assessment(
+    &mut assessments,
+    "transition-heavy",
+    transition_score,
+    clamp_score(0.48 + dominant_phase_shift_score * 0.22),
+    "The moment sits inside a broader movement, threshold, or wobble rather than simple routine.",
+    vec![
+      format!("Dominant phase shift state is '{}'.", dominant_phase_shift_state),
+      dominant_phase_shift_summary.clone(),
+    ],
+  );
+
+  let urgent_score = clamp_score(
+    protective_pressure * 0.24
+      + tension_pressure * 0.22
+      + volatility_pressure * 0.18
+      + if text_has_any_keyword(&reflection_text, &["urgent", "danger", "panic", "unsafe", "now"]) {
+        0.3
+      } else {
+        0.0
+      },
+  );
+  push_assessment(
+    &mut assessments,
+    "urgent",
+    urgent_score,
+    clamp_score(0.45 + protective_pressure * 0.18 + volatility_pressure * 0.18),
+    "The moment carries enough immediate pressure that waiting may be costly.",
+    vec![
+      format!("Volatility pressure is {:.2}.", volatility_pressure),
+      if text_has_any_keyword(&reflection_text, &["urgent", "danger", "panic", "unsafe", "now"]) {
+        "Recent reflections contain explicit urgency language.".into()
+      } else {
+        "No explicit urgency language appears in recent reflections.".into()
+      },
+    ],
+  );
+
+  if assessments.is_empty() {
+    assessments.push(LivedMomentAssessment {
+      kind: "ordinary".into(),
+      score: 0.62,
+      confidence: 0.58,
+      summary: "Nothing currently points strongly toward intervention, enrichment, or protection.".into(),
+      evidence: vec![
+        "No assessment crossed the action-shaping threshold yet.".into(),
+        "This moment should stay mostly quiet until clearer evidence arrives.".into(),
+      ],
+    });
+  }
+
+  assessments.sort_by(|left, right| right.score.total_cmp(&left.score));
+  let primary_assessment = assessments
+    .first()
+    .map(|assessment| assessment.kind.clone())
+    .unwrap_or_else(|| "ordinary".into());
+
+  let open_assessment = assessment_score(&assessments, "open");
+  let exploratory_assessment = assessment_score(&assessments, "exploratory");
+  let vulnerable_assessment = assessment_score(&assessments, "vulnerable");
+  let urgent_assessment = assessment_score(&assessments, "urgent");
+  let protective_assessment = assessment_score(&assessments, "protective");
+  let connective_assessment = assessment_score(&assessments, "connective");
+  let opportunity_assessment = assessment_score(&assessments, "opportunity-rich");
+  let transition_assessment = assessment_score(&assessments, "transition-heavy");
+
+  let mut actionable_signals = Vec::new();
+  push_signal(
+    &mut actionable_signals,
+    "enrich_this_moment",
+    clamp_score(
+      opportunity_assessment * 0.48
+        + open_assessment * 0.22
+        + exploratory_assessment * 0.18
+        + if !is_likely_sleep_window { 0.08 } else { 0.0 }
+        + meaningful_place_score * 0.1
+        - protective_assessment * 0.12,
+    ),
+    clamp_score(0.46 + opportunity_assessment * 0.16 + open_assessment * 0.12),
+    "The moment carries enough openness and possibility to justify gentle enrichment.",
+  );
+  push_signal(
+    &mut actionable_signals,
+    "surface_this_opening",
+    clamp_score(
+      connective_assessment * 0.32
+        + opportunity_assessment * 0.28
+        + exploratory_assessment * 0.16
+        + if repeated_place.is_some() || meaningful_place_score >= 0.7 { 0.12 } else { 0.0 }
+        + reinforcement_pressure * 0.08,
+    ),
+    clamp_score(0.44 + connective_assessment * 0.14 + opportunity_assessment * 0.14),
+    "There is a practical or relational opening that may matter if surfaced in time.",
+  );
+  push_signal(
+    &mut actionable_signals,
+    "warn_now",
+    clamp_score(
+      urgent_assessment * 0.58
+        + protective_assessment * 0.2
+        + vulnerable_assessment * 0.14
+        + volatility_pressure * 0.08,
+    ),
+    clamp_score(0.5 + urgent_assessment * 0.18 + protective_assessment * 0.14),
+    "The moment looks pressured enough that warning or escalation should be considered now.",
+  );
+  push_signal(
+    &mut actionable_signals,
+    "watch_for_escalation",
+    clamp_score(
+      transition_assessment * 0.34
+        + vulnerable_assessment * 0.24
+        + urgent_assessment * 0.2
+        + tension_pressure * 0.12
+        + dominant_phase_shift_score * 0.08,
+    ),
+    clamp_score(0.45 + transition_assessment * 0.16 + vulnerable_assessment * 0.12),
+    "Pressure is accumulating, but the moment still looks like something to monitor rather than force.",
+  );
+  push_signal(
+    &mut actionable_signals,
+    "stay_quiet",
+    if primary_assessment == "ordinary" {
+      0.82
+    } else if is_likely_sleep_window && urgent_assessment < 0.55 {
+      0.72
+    } else if protective_assessment >= 0.62 && urgent_assessment < 0.55 {
+      0.61
+    } else {
+      0.0
+    },
+    0.64,
+    "The current read does not yet justify intervening more strongly than silence.",
+  );
+
+  if actionable_signals.is_empty() {
+    actionable_signals.push(LivedMomentSignal {
+      kind: "stay_quiet".into(),
+      score: 0.7,
+      confidence: 0.62,
+      reason: "No stronger action signal is grounded enough yet.".into(),
+    });
+  }
+  actionable_signals.sort_by(|left, right| right.score.total_cmp(&left.score));
+  let recommended_signal = actionable_signals
+    .first()
+    .map(|signal| signal.kind.clone())
+    .unwrap_or_else(|| "stay_quiet".into());
+
+  let mut opportunities = Vec::new();
+  push_opportunity(
+    &mut opportunities,
+    "enrichment_window",
+    clamp_score(opportunity_assessment * 0.52 + open_assessment * 0.24 + meaningful_place_score * 0.14),
+    clamp_score(0.46 + opportunity_assessment * 0.18),
+    if time_bucket == "late_night" || time_bucket == "night" { "soon" } else { "now" },
+    "This moment could be widened gently before the opening closes.",
+  );
+  push_opportunity(
+    &mut opportunities,
+    "place_based_opening",
+    clamp_score(
+      meaningful_place_score * 0.42
+        + exploratory_assessment * 0.22
+        + if matched_place.is_some() { 0.16 } else { 0.0 }
+        + if repeated_place.is_some() { 0.1 } else { 0.0 },
+    ),
+    clamp_score(0.44 + meaningful_place_score * 0.2),
+    "now",
+    "The current place itself may hold meaning or possibility worth surfacing while the user is still in it.",
+  );
+  push_opportunity(
+    &mut opportunities,
+    "relational_opening",
+    clamp_score(connective_assessment * 0.5 + opportunity_assessment * 0.18 + reinforcement_pressure * 0.12),
+    clamp_score(0.42 + connective_assessment * 0.22),
+    if is_likely_sleep_window { "later" } else { "soon" },
+    "There may be a timely human-contact opening here if approached gently.",
+  );
+  opportunities.sort_by(|left, right| right.score.total_cmp(&left.score));
+
+  let mut safeguards = Vec::new();
+  push_safeguard(
+    &mut safeguards,
+    "protect_quiet_window",
+    if protected_time_active {
+      0.82
+    } else if primary_assessment == "ordinary" || recommended_signal == "stay_quiet" {
+      0.72
+    } else {
+      clamp_score(protective_assessment * 0.38 + vulnerable_assessment * 0.16)
+    },
+    0.68,
+    "low",
+    "The current window looks like one to protect from unnecessary intrusion.",
+  );
+  push_safeguard(
+    &mut safeguards,
+    "sensitive_context",
+    clamp_score(protective_assessment * 0.34 + vulnerable_assessment * 0.28 + if has_sensitive_memory { 0.18 } else { 0.0 }),
+    clamp_score(0.48 + protective_assessment * 0.16),
+    if urgent_assessment >= 0.55 { "medium" } else { "low" },
+    "The moment carries enough sensitivity that pacing and tone matter more than assertiveness.",
+  );
+  push_safeguard(
+    &mut safeguards,
+    "escalation_watch",
+    clamp_score(urgent_assessment * 0.42 + transition_assessment * 0.18 + volatility_pressure * 0.2 + tension_pressure * 0.12),
+    clamp_score(0.48 + urgent_assessment * 0.18 + volatility_pressure * 0.12),
+    if urgent_assessment >= 0.7 { "high" } else { "medium" },
+    "Pressure is high enough that the system should keep watching for a need to warn or escalate.",
+  );
+  safeguards.sort_by(|left, right| right.score.total_cmp(&left.score));
+
+  let mut situational_signals = Vec::new();
+  push_situational_signal(
+    &mut situational_signals,
+    "protected_quiet_hours",
+    if protected_time_active { 0.88 } else { 0.0 },
+    0.82,
+    "protective",
+    "Protected quiet hours are active, so restraint matters more than momentum.",
+  );
+  push_situational_signal(
+    &mut situational_signals,
+    "late_night_movement",
+    if matches!(time_bucket.as_str(), "night" | "late_night")
+      && latest_location_event
+        .as_ref()
+        .map(|event| event.movement_state == "moving")
+        .unwrap_or(false)
+    {
+      0.72
+    } else {
+      0.0
+    },
+    0.68,
+    "protective",
+    "Movement late at night raises the situational need for caution and pacing.",
+  );
+  push_situational_signal(
+    &mut situational_signals,
+    "meaningful_place_window",
+    clamp_score(
+      meaningful_place_score * 0.46
+        + if matched_place.is_some() && !is_likely_sleep_window { 0.16 } else { 0.0 }
+        + if time_bucket == "evening" { 0.12 } else { 0.0 },
+    ),
+    clamp_score(0.48 + meaningful_place_score * 0.18),
+    "opportunity",
+    "The current place and timing create a live window where meaning could still be acted on.",
+  );
+  push_situational_signal(
+    &mut situational_signals,
+    "outside_routine_window",
+    clamp_score(
+      if rhythm_state == "outside_normal_rhythm" { 0.54 } else { 0.0 }
+        + exploratory_assessment * 0.16
+        + transition_assessment * 0.1,
+    ),
+    clamp_score(0.46 + rhythm_confidence * 0.2),
+    "opportunity",
+    "The user is outside usual rhythm, which can open both possibility and instability.",
+  );
+  push_situational_signal(
+    &mut situational_signals,
+    "contact_air_gap",
+    clamp_score(
+      if recent_contact_load <= 0.18 { 0.52 } else { 0.0 }
+        + connective_assessment * 0.14,
+    ),
+    0.58,
+    "opportunity",
+    "Recent contact has been light enough that a timely message or bridge may land cleanly.",
+  );
+  push_situational_signal(
+    &mut situational_signals,
+    "active_contact_cooldown",
+    clamp_score(if recent_contact_load >= 0.7 { 0.78 } else { recent_contact_load * 0.82 }),
+    clamp_score(0.52 + recent_contact_load * 0.16),
+    "protective",
+    "Recent contact load is already high, so another touch could feel heavier than intended.",
+  );
+  situational_signals.sort_by(|left, right| right.score.total_cmp(&left.score));
+  let top_bridge_seed = relational_entries
+    .iter()
+    .filter_map(|entry| {
+      let title_lower = entry.title.to_ascii_lowercase();
+      let entry_blob = format!(
+        "{} {} {} {}",
+        entry.title,
+        entry.body,
+        entry.notes,
+        entry.tags.join(" ")
+      )
+      .to_ascii_lowercase();
+      let direct_match_score = if reflection_text.contains(&title_lower) {
+        0.34
+      } else {
+        0.0
+      };
+      let memory_match_score = if memory_items.iter().any(|item| {
+        item.source_ref_id == Some(entry.id)
+          || item.source_entry_title.eq_ignore_ascii_case(&entry.title)
+      }) {
+        0.22
+      } else {
+        0.0
+      };
+      let supportive_profile_score = if text_has_any_keyword(
+        &entry_blob,
+        &["support", "trust", "close", "safe", "anchor", "family", "friend", "call"],
+      ) {
+        0.16
+      } else {
+        0.0
+      };
+      let score = clamp_score(
+        direct_match_score
+          + memory_match_score
+          + supportive_profile_score
+          + connective_assessment * 0.24
+          + vulnerable_assessment * 0.18
+          + opportunity_assessment * 0.1
+          + if entry.category_key == "family" && protective_assessment >= 0.55 {
+            0.08
+          } else {
+            0.0
+          }
+          - recent_contact_load * 0.08,
+      );
+      if score < 0.45 {
+        return None;
+      }
+
+      let bridge_kind = if urgent_assessment >= 0.6 || vulnerable_assessment >= 0.55 {
+        "supportive_reach"
+      } else if transition_assessment >= 0.55 {
+        "orientation_anchor"
+      } else {
+        "light_reconnect"
+      };
+
+      Some(LivedMomentRelationalBridge {
+        title: entry.title.clone(),
+        category_key: entry.category_key.clone(),
+        score,
+        confidence: clamp_score(0.44 + direct_match_score + memory_match_score * 0.5),
+        bridge_kind: bridge_kind.into(),
+        recent_contact_state: recent_contact_state.clone(),
+        reason: if direct_match_score > 0.0 {
+          format!("Recent reflections explicitly point toward {}.", entry.title)
+        } else if memory_match_score > 0.0 {
+          format!("{} is already anchored in living context and memory.", entry.title)
+        } else {
+          format!("{} looks like a fitting relational anchor for this moment.", entry.title)
+        },
+      })
+    })
+    .collect::<Vec<_>>();
+  let mut relational_bridges = top_bridge_seed;
+  relational_bridges.sort_by(|left, right| right.score.total_cmp(&left.score));
+  relational_bridges.truncate(5);
+  let top_bridge_score = relational_bridges.first().map(|bridge| bridge.score).unwrap_or(0.0);
+
+  let mut contact_rhythm_options = Vec::new();
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "stay_silent",
+    if primary_assessment == "ordinary" {
+      if top_bridge_score >= 0.55 && recent_contact_load < 0.55 {
+        0.56
+      } else {
+        0.82
+      }
+    } else {
+      clamp_score(
+        protective_assessment * 0.24
+          + recent_contact_load * 0.28
+          + if is_likely_sleep_window && urgent_assessment < 0.55 {
+            0.24
+          } else {
+            0.0
+          }
+          + if recommended_signal == "stay_quiet" { 0.18 } else { 0.0 },
+      )
+    },
+    0.66,
+    "The moment still looks best served by restraint rather than direct contact.",
+  );
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "send_light_message",
+    clamp_score(
+      opportunity_assessment * 0.3
+        + open_assessment * 0.2
+        + connective_assessment * 0.14
+        + if recent_contact_load < 0.45 { 0.18 } else { 0.0 }
+        + if !is_likely_sleep_window { 0.1 } else { 0.0 },
+    ),
+    clamp_score(0.44 + open_assessment * 0.12 + opportunity_assessment * 0.14),
+    "A light-touch message looks proportionate to the moment and the recent contact load.",
+  );
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "make_soft_suggestion",
+    clamp_score(
+      exploratory_assessment * 0.18
+        + opportunity_assessment * 0.26
+        + transition_assessment * 0.22
+        + situational_signals
+          .iter()
+          .find(|signal| signal.kind == "outside_routine_window")
+          .map(|signal| signal.score * 0.08)
+          .unwrap_or(0.0)
+        + if !is_likely_sleep_window { 0.08 } else { 0.0 }
+        - recent_contact_load * 0.08,
+    ),
+    clamp_score(0.42 + transition_assessment * 0.12 + opportunity_assessment * 0.14),
+    "The system can likely suggest without pushing if it keeps the tone quiet and optional.",
+  );
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "suggest_human_contact",
+    clamp_score(
+      top_bridge_score * 0.42
+        + connective_assessment * 0.22
+        + vulnerable_assessment * 0.16
+        + if top_bridge_score >= 0.55 && recent_contact_load < 0.55 {
+          0.18
+        } else {
+          0.0
+        }
+        + if recent_contact_load < 0.55 { 0.12 } else { 0.0 },
+    ),
+    clamp_score(0.44 + top_bridge_score * 0.2 + connective_assessment * 0.12),
+    "A specific human bridge looks plausible enough to surface gently now.",
+  );
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "send_warning",
+    clamp_score(
+      urgent_assessment * 0.52
+        + safeguards.first().map(|item| item.score).unwrap_or(0.0) * 0.18
+        + protective_assessment * 0.1,
+    ),
+    clamp_score(0.48 + urgent_assessment * 0.18),
+    "The moment carries enough pressure that a warning-level contact may be justified.",
+  );
+  push_contact_rhythm_option(
+    &mut contact_rhythm_options,
+    "escalate_to_call",
+    clamp_score(
+      urgent_assessment * 0.58
+        + vulnerable_assessment * 0.16
+        + if recent_calls_7d == 0 { 0.1 } else { 0.0 }
+        + if top_bridge_score >= 0.6 { 0.08 } else { 0.0 },
+    ),
+    clamp_score(0.5 + urgent_assessment * 0.16 + vulnerable_assessment * 0.1),
+    "The pressure looks high enough that a live call path may fit better than text.",
+  );
+  contact_rhythm_options.sort_by(|left, right| right.score.total_cmp(&left.score));
+  let recommended_contact_mode = contact_rhythm_options
+    .first()
+    .map(|option| option.level.clone())
+    .unwrap_or_else(|| "stay_silent".into());
+
+  let contact_rhythm_hint = if recommended_contact_mode == "escalate_to_call"
+    || recommended_contact_mode == "send_warning"
+    || primary_assessment == "urgent"
+  {
+    "warn_or_escalate"
+  } else if recommended_contact_mode == "suggest_human_contact" || primary_assessment == "connective" {
+    "gentle_bridge"
+  } else if recommended_contact_mode == "make_soft_suggestion" || primary_assessment == "transition-heavy" {
+    "orient_softly"
+  } else if recommended_contact_mode == "send_light_message"
+    || primary_assessment == "opportunity-rich"
+    || primary_assessment == "open"
+    || primary_assessment == "exploratory"
+  {
+    "light_suggestion"
+  } else if primary_assessment == "protective" || primary_assessment == "vulnerable" {
+    "move_gently"
+  } else {
+    "stay_quiet"
+  }
+  .to_string();
+
+  let action_bias = match primary_assessment.as_str() {
+    "urgent" | "protective" => "protect_now",
+    "vulnerable" => "protect_softly",
+    "connective" => "bridge",
+    "transition-heavy" => "orient",
+    "opportunity-rich" | "open" | "exploratory" => "enrich",
+    _ => "watchful_silence",
+  }
+  .to_string();
+
+  let summary = match primary_assessment.as_str() {
+    "urgent" => "This moment looks urgent enough that the companion should be prepared to warn or escalate.".into(),
+    "protective" => "This moment should be handled protectively, with respect for boundaries and timing.".into(),
+    "vulnerable" => "This moment looks vulnerable and calls for gentleness over force.".into(),
+    "connective" => "This moment leans relational and may be a fit for careful bridging.".into(),
+    "transition-heavy" => "This moment reads as part of a larger life shift and benefits from orientation.".into(),
+    "opportunity-rich" => "This moment contains unusual opening energy and may reward timely enrichment.".into(),
+    "open" => "This moment feels open enough to widen carefully without hijacking it.".into(),
+    "exploratory" => "This moment appears exploratory and should be met with light, non-closing companionship.".into(),
+    _ => "This moment currently reads as ordinary, so restraint is more appropriate than intervention.".into(),
+  };
+
+  Ok(LivedMomentSnapshot {
+    captured_at: now.to_rfc3339(),
+    timezone: timezone_name,
+    local_time,
+    local_date,
+    local_day_of_week,
+    time_bucket,
+    is_likely_sleep_window,
+    rhythm_state,
+    rhythm_confidence,
+    latest_location_event,
+    active_visit,
+    matched_place,
+    repeated_place,
+    recent_saved_moments,
+    related_memories,
+    detector_pressures,
+    dominant_phase_shift_state,
+    dominant_phase_shift_score,
+    dominant_phase_shift_summary,
+    assessments,
+    actionable_signals,
+    opportunities,
+    safeguards,
+    situational_signals,
+    relational_bridges,
+    contact_rhythm_options,
+    primary_assessment,
+    recommended_signal,
+    contact_rhythm_hint,
+    recommended_contact_mode,
+    recent_contact_load,
+    recent_contact_summary,
+    action_bias,
+    summary,
+  })
+}
+
+pub fn lived_moment_snapshot(
+  db_path: &PathBuf,
+  timezone: &str,
+) -> Result<LivedMomentSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  build_lived_moment_snapshot(&connection, timezone, Utc::now())
+}
+
 pub fn decision_snapshot(db_path: &PathBuf) -> Result<DecisionSnapshot, AppError> {
   let connection = Connection::open(db_path)?;
   Ok(DecisionSnapshot {
@@ -4184,6 +5425,21 @@ pub fn simulation_scenarios() -> Vec<SimulationScenario> {
       label: "Routine Place Does Not Become Rhythm Break".into(),
       description: "Seeds a stable repeated routine and checks that the system does not misclassify it as a rhythm break.".into(),
     },
+    SimulationScenario {
+      key: "lived_moment_open_window".into(),
+      label: "Lived Moment Open Window".into(),
+      description: "Seeds an unusually alive evening moment and checks that the lived-moment layer reads it as open and opportunity-rich.".into(),
+    },
+    SimulationScenario {
+      key: "lived_moment_protective_window".into(),
+      label: "Lived Moment Protective Window".into(),
+      description: "Seeds a late, sensitive moment and checks that the lived-moment layer leans protective or quiet rather than pushy.".into(),
+    },
+    SimulationScenario {
+      key: "lived_moment_transition_window".into(),
+      label: "Lived Moment Transition Window".into(),
+      description: "Seeds drift and accumulated movement so the lived-moment layer recognizes a transition-heavy threshold.".into(),
+    },
   ]
 }
 
@@ -4215,6 +5471,9 @@ pub fn run_simulation_scenario(
     "dismissed_sensitive_memory_stays_archived" => run_dismissed_sensitive_memory_stays_archived_simulation(db_path),
     "no_new_evidence_causes_no_memory_change" => run_no_new_evidence_causes_no_memory_change_simulation(db_path),
     "routine_place_does_not_become_rhythm_break" => run_routine_place_does_not_become_rhythm_break_simulation(db_path),
+    "lived_moment_open_window" => run_lived_moment_open_window_simulation(db_path),
+    "lived_moment_protective_window" => run_lived_moment_protective_window_simulation(db_path),
+    "lived_moment_transition_window" => run_lived_moment_transition_window_simulation(db_path),
     other => Err(AppError::Message(format!("Unknown simulation scenario '{}'.", other))),
   }
 }
@@ -4246,6 +5505,9 @@ pub fn run_automated_simulation_suite() -> Result<SimulationSuiteResult, AppErro
     "dismissed_sensitive_memory_stays_archived",
     "no_new_evidence_causes_no_memory_change",
     "routine_place_does_not_become_rhythm_break",
+    "lived_moment_open_window",
+    "lived_moment_protective_window",
+    "lived_moment_transition_window",
   ];
 
   let mut scenario_results = Vec::new();
@@ -4288,6 +5550,302 @@ pub fn run_call_request_decisions(db_path: &PathBuf) -> Result<DecisionRunResult
 pub fn drafted_outreach_events(db_path: &PathBuf) -> Result<Vec<OutreachEvent>, AppError> {
   let connection = Connection::open(db_path)?;
   list_drafted_outreach_events(&connection)
+}
+
+pub fn next_drafted_outreach_event(db_path: &PathBuf) -> Result<Option<OutreachEvent>, AppError> {
+  Ok(drafted_outreach_events(db_path)?.into_iter().next())
+}
+
+fn get_moment_decision_by_outreach_event_id(
+  connection: &Connection,
+  outreach_event_id: i64,
+) -> Result<Option<MomentDecision>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id, saved_moment_id, decided_at, decision_kind, reason_summary,
+        decision_metadata_json, created_outreach_event_id
+      FROM moment_decisions
+      WHERE created_outreach_event_id = ?1
+      ORDER BY decided_at DESC, id DESC
+      LIMIT 1
+    "#,
+  )?;
+
+  statement
+    .query_row(params![outreach_event_id], |row| {
+      Ok(MomentDecision {
+        id: row.get(0)?,
+        saved_moment_id: row.get(1)?,
+        decided_at: row.get(2)?,
+        decision_kind: row.get(3)?,
+        reason_summary: row.get(4)?,
+        decision_metadata_json: row.get(5)?,
+        created_outreach_event_id: row.get(6)?,
+      })
+    })
+    .optional()
+    .map_err(AppError::from)
+}
+
+fn merge_json_strings(base: &str, patch: serde_json::Value) -> String {
+  let mut root = serde_json::from_str::<serde_json::Value>(base).unwrap_or_else(|_| json!({}));
+  if !root.is_object() {
+    root = json!({});
+  }
+  if let (Some(root_obj), Some(patch_obj)) = (root.as_object_mut(), patch.as_object()) {
+    for (key, value) in patch_obj {
+      root_obj.insert(key.clone(), value.clone());
+    }
+  }
+  root.to_string()
+}
+
+fn lived_moment_for_outreach_event(
+  connection: &Connection,
+  outreach_event_id: i64,
+) -> Result<Option<serde_json::Value>, AppError> {
+  Ok(
+    get_moment_decision_by_outreach_event_id(connection, outreach_event_id)?
+      .and_then(|decision| serde_json::from_str::<serde_json::Value>(&decision.decision_metadata_json).ok())
+      .and_then(|value| value.get("livedMoment").cloned()),
+  )
+}
+
+fn auto_dispatch_eligibility_for_outreach(
+  connection: &Connection,
+  outreach: &OutreachEvent,
+) -> Result<(bool, String), AppError> {
+  if outreach.outreach_kind == "call_request" {
+    return Ok((
+      false,
+      "Call requests stay manual for now so live outreach remains deliberate.".into(),
+    ));
+  }
+
+  let Some(lived_moment) = lived_moment_for_outreach_event(connection, outreach.id)? else {
+    return Ok((
+      false,
+      "This draft does not have enough lived-moment context attached for safe auto-dispatch.".into(),
+    ));
+  };
+
+  let recommended_contact_mode = lived_moment
+    .get("recommendedContactMode")
+    .and_then(|value| value.as_str())
+    .unwrap_or("stay_silent");
+
+  let reason = match recommended_contact_mode {
+    "send_light_message" => Some("Ready to auto-send as a light message.".to_string()),
+    "make_soft_suggestion" => Some("Ready to auto-send as a soft suggestion.".to_string()),
+    "send_warning" => Some("Ready to auto-send as a timely warning.".to_string()),
+    "stay_silent" => None,
+    "suggest_human_contact" => None,
+    "escalate_to_call" => None,
+    _ => None,
+  };
+
+  if let Some(reason) = reason {
+    Ok((true, reason))
+  } else {
+    let hold_reason = match recommended_contact_mode {
+      "stay_silent" => "Not auto-sending because this moment still leans quiet.",
+      "suggest_human_contact" => "Keeping this as a manual send because it points toward human contact.",
+      "escalate_to_call" => "Keeping this as a manual send because it feels closer to a live call.",
+      _ => "Keeping this as a manual send for now.",
+    };
+    Ok((false, hold_reason.into()))
+  }
+}
+
+fn dispatch_reason_summary(
+  outreach_kind: &str,
+  pillar: &str,
+  primary_assessment: &str,
+) -> String {
+  if outreach_kind == "call_request" {
+    return match pillar {
+      "situational_safeguarding" => {
+        "Sending a live North Star check-in because this moment felt important not to leave alone.".into()
+      }
+      "relational_bridging" => {
+        "Sending a live North Star check-in because this moment felt more human than another text.".into()
+      }
+      "phase_navigation" => {
+        "Sending a live North Star check-in because your recent rhythm looked more in motion than usual.".into()
+      }
+      _ => {
+        "Sending a live North Star check-in because this felt like a moment worth meeting while it is still here.".into()
+      }
+    };
+  }
+
+  match pillar {
+    "situational_safeguarding" => {
+      "Sending a North Star message because this looked timely enough for a gentle heads-up.".into()
+    }
+    "relational_bridging" => {
+      "Sending a North Star message because this moment seemed to call for a small bridge toward contact.".into()
+    }
+    "phase_navigation" => {
+      "Sending a North Star message because this looked like part of a larger shift in rhythm.".into()
+    }
+    _ => match primary_assessment {
+      "open" | "opportunity-rich" | "exploratory" => {
+        "Sending a North Star message because this looked like an open moment worth meeting gently.".into()
+      }
+      "transition-heavy" => {
+        "Sending a North Star message because this moment looked like it sat inside a real transition.".into()
+      }
+      _ => {
+        "Sending a North Star message because this moment looked worth a light touch.".into()
+      }
+    },
+  }
+}
+
+pub fn next_auto_dispatchable_outreach_event(
+  db_path: &PathBuf,
+) -> Result<(Option<OutreachEvent>, Option<OutreachEvent>, Option<String>), AppError> {
+  let connection = Connection::open(db_path)?;
+  let drafted = list_drafted_outreach_events(&connection)?;
+
+  if drafted.is_empty() {
+    return Ok((None, None, None));
+  }
+
+  let mut first_held: Option<OutreachEvent> = None;
+  let mut first_hold_reason: Option<String> = None;
+  for outreach in drafted {
+    let (eligible, reason) = auto_dispatch_eligibility_for_outreach(&connection, &outreach)?;
+    if eligible {
+      return Ok((Some(outreach), None, Some(reason)));
+    }
+    if first_held.is_none() {
+      first_held = Some(outreach);
+      first_hold_reason = Some(reason);
+    }
+  }
+
+  Ok((None, first_held, first_hold_reason))
+}
+
+pub fn build_dispatch_payload_for_outreach(
+  db_path: &PathBuf,
+  outreach_event_id: i64,
+) -> Result<(OutreachEvent, String, String), AppError> {
+  let connection = Connection::open(db_path)?;
+  let outreach = get_outreach_event_by_id(&connection, outreach_event_id)?;
+  let lived_moment = lived_moment_for_outreach_event(&connection, outreach_event_id)?
+    .as_ref()
+    .cloned()
+    .unwrap_or_else(|| json!({}));
+
+  let pillar = lived_moment
+    .get("pillar")
+    .and_then(|value| value.as_str())
+    .unwrap_or("lived_moment_enrichment");
+  let primary_assessment = lived_moment
+    .get("primaryAssessment")
+    .and_then(|value| value.as_str())
+    .unwrap_or("ordinary");
+  let recommended_signal = lived_moment
+    .get("recommendedSignal")
+    .and_then(|value| value.as_str())
+    .unwrap_or("stay_quiet");
+  let top_bridge = lived_moment
+    .get("topRelationalBridge")
+    .and_then(|value| value.as_str());
+  let top_opportunity = lived_moment
+    .get("topOpportunity")
+    .and_then(|value| value.as_str());
+  let top_safeguard = lived_moment
+    .get("topSafeguard")
+    .and_then(|value| value.as_str());
+  let top_situational_signal = lived_moment
+    .get("topSituationalSignal")
+    .and_then(|value| value.as_str());
+
+  let call_note = if outreach.outreach_kind == "call_request" {
+    match pillar {
+      "situational_safeguarding" => {
+        if let Some(signal) = top_safeguard.or(top_situational_signal) {
+          format!(
+            "Something about this moment felt important enough not to leave alone, especially around {}.",
+            signal.replace('_', " ")
+          )
+        } else {
+          "Something about this moment felt important enough not to leave alone, so I wanted to call.".into()
+        }
+      }
+      "relational_bridging" => {
+        if let Some(name) = top_bridge {
+          format!(
+            "This felt like a moment that might need a more human kind of contact, with {} quietly in mind.",
+            name
+          )
+        } else {
+          "This felt like a moment that might need a more human kind of contact than another text.".into()
+        }
+      }
+      "phase_navigation" => {
+        "Your recent rhythm felt a little in motion, and a live check-in seemed gentler than leaving it abstract.".into()
+      }
+      _ => {
+        if let Some(opportunity) = top_opportunity {
+          format!(
+            "This felt like one of those moments worth meeting while it is still alive, especially around {}.",
+            opportunity.replace('_', " ")
+          )
+        } else {
+          "This felt like one of those moments worth meeting while it is still alive, so I wanted to call.".into()
+        }
+      }
+    }
+  } else {
+    String::new()
+  };
+
+  let payload = if outreach.outreach_kind == "call_request" {
+    call_note
+  } else {
+    outreach.message_text.clone()
+  };
+  let mut detail = dispatch_reason_summary(&outreach.outreach_kind, pillar, primary_assessment);
+  if recommended_signal == "warn_now" && outreach.outreach_kind != "call_request" {
+    detail.push_str(" It carried a warning tone.");
+  }
+  Ok((outreach, payload, detail))
+}
+
+pub fn mark_outreach_event_dispatched(
+  db_path: &PathBuf,
+  outreach_event_id: i64,
+  dispatched_payload: &str,
+  north_star_detail: &str,
+) -> Result<OutreachEvent, AppError> {
+  let connection = Connection::open(db_path)?;
+  let outreach = get_outreach_event_by_id(&connection, outreach_event_id)?;
+  let merged_metadata = merge_json_strings(
+    &outreach.delivery_metadata_json,
+    json!({
+      "dispatchedAt": Utc::now().to_rfc3339(),
+      "dispatchedPayload": dispatched_payload,
+      "northStarDetail": north_star_detail,
+      "dispatchChannel": "north_star"
+    }),
+  );
+  connection.execute(
+    r#"
+      UPDATE outreach_events
+      SET was_delivered = 1,
+          response_state = 'sent',
+          delivery_metadata_json = ?2
+      WHERE id = ?1
+    "#,
+    params![outreach_event_id, merged_metadata],
+  )?;
+  get_outreach_event_by_id(&connection, outreach_event_id)
 }
 
 pub fn save_inbound_message(
@@ -7643,6 +9201,272 @@ fn run_routine_place_does_not_become_rhythm_break_simulation(
   })
 }
 
+fn lived_moment_simulation_result(
+  db_path: &PathBuf,
+  scenario_key: &str,
+  scenario_label: &str,
+  seeded_event_count: usize,
+  now: DateTime<Utc>,
+  summary_prefix: &str,
+) -> Result<SimulationRunResult, AppError> {
+  let connection = Connection::open(db_path)?;
+  let snapshot = build_lived_moment_snapshot(&connection, "Europe/Amsterdam", now)?;
+  let draft_preview = Some(format!(
+    "{} / {} / {}",
+    snapshot.primary_assessment,
+    snapshot.recommended_signal,
+    snapshot.summary
+  ));
+
+  Ok(SimulationRunResult {
+    scenario_key: scenario_key.into(),
+    scenario_label: scenario_label.into(),
+    seeded_event_count,
+    promoted_count: snapshot
+      .actionable_signals
+      .iter()
+      .filter(|signal| signal.kind != "stay_quiet")
+      .count(),
+    suppressed_count: usize::from(snapshot.recommended_signal == "stay_quiet"),
+    draft_count: snapshot.assessments.len(),
+    draft_preview,
+    summary: format!(
+      "{summary_prefix} Primary read: {}. Recommended signal: {}.",
+      snapshot.primary_assessment, snapshot.recommended_signal
+    ),
+  })
+}
+
+fn run_lived_moment_open_window_simulation(
+  db_path: &PathBuf,
+) -> Result<SimulationRunResult, AppError> {
+  let place = create_place(
+    db_path,
+    &CreatePlaceInput {
+      label: "Canal edge".into(),
+      latitude: Some(52.3676),
+      longitude: Some(4.9041),
+      radius_meters: 140,
+      place_kind: "reflection".into(),
+      meaning_kind: "possibility".into(),
+      is_user_named: true,
+      is_protected: false,
+      notes: "A place that feels alive and slightly wider than routine.".into(),
+    },
+  )?;
+
+  create_companion_context_entry(
+    db_path,
+    &CreateCompanionContextEntryInput {
+      category_key: "hobbies".into(),
+      title: "Night walks".into(),
+      body: "Night walks by the water make me feel open, alive, and more available to possibility.".into(),
+      tags: vec!["alive".into(), "outside".into(), "walks".into()],
+      notes: "Seeded lived-moment open window.".into(),
+    },
+  )?;
+
+  create_reflection(
+    db_path,
+    &CreateReflectionInput {
+      reflection_kind: "week_state".into(),
+      text: "Tonight feels open, alive, and like I should not miss the window.".into(),
+      linked_place_id: Some(place.id),
+      weight: 0.84,
+      expires_at: None,
+      is_sensitive: false,
+    },
+  )?;
+
+  run_context_memory_pass(db_path)?;
+
+  for (occurred_at, speed_mps) in [
+    ("2026-03-29T19:55:00Z", 0.0),
+    ("2026-03-29T20:35:00Z", 0.0),
+  ] {
+    ingest_location_event(
+      db_path,
+      &LocationEventInput {
+        occurred_at: occurred_at.into(),
+        latitude: 52.3676,
+        longitude: 4.9041,
+        accuracy_meters: Some(14.0),
+        speed_mps: Some(speed_mps),
+        source: "simulation".into(),
+      },
+    )?;
+  }
+
+  lived_moment_simulation_result(
+    db_path,
+    "lived_moment_open_window",
+    "Lived Moment Open Window",
+    4,
+    parse_utc("2026-03-29T20:40:00Z")?,
+    "Seeded an unusually alive evening moment.",
+  )
+}
+
+fn run_lived_moment_protective_window_simulation(
+  db_path: &PathBuf,
+) -> Result<SimulationRunResult, AppError> {
+  let place = create_place(
+    db_path,
+    &CreatePlaceInput {
+      label: "Home".into(),
+      latitude: Some(52.3676),
+      longitude: Some(4.9041),
+      radius_meters: 120,
+      place_kind: "home".into(),
+      meaning_kind: "belonging".into(),
+      is_user_named: true,
+      is_protected: true,
+      notes: "Protected late-night space.".into(),
+    },
+  )?;
+
+  create_companion_context_entry(
+    db_path,
+    &CreateCompanionContextEntryInput {
+      category_key: "life_principles".into(),
+      title: "Quiet nights matter".into(),
+      body: "Late at night I need gentleness, less noise, and fewer demands.".into(),
+      tags: vec!["quiet".into(), "night".into(), "boundary".into()],
+      notes: "Seeded lived-moment protective window.".into(),
+    },
+  )?;
+
+  create_reflection(
+    db_path,
+    &CreateReflectionInput {
+      reflection_kind: "meaning".into(),
+      text: "Tonight feels tender and I do not want anything loud pushed at me.".into(),
+      linked_place_id: Some(place.id),
+      weight: 0.86,
+      expires_at: None,
+      is_sensitive: true,
+    },
+  )?;
+
+  run_context_memory_pass(db_path)?;
+
+  for occurred_at in ["2026-03-29T23:35:00Z", "2026-03-30T00:25:00Z"] {
+    ingest_location_event(
+      db_path,
+      &LocationEventInput {
+        occurred_at: occurred_at.into(),
+        latitude: 52.3676,
+        longitude: 4.9041,
+        accuracy_meters: Some(10.0),
+        speed_mps: Some(0.0),
+        source: "simulation".into(),
+      },
+    )?;
+  }
+
+  lived_moment_simulation_result(
+    db_path,
+    "lived_moment_protective_window",
+    "Lived Moment Protective Window",
+    4,
+    parse_utc("2026-03-30T00:30:00Z")?,
+    "Seeded a late sensitive home moment.",
+  )
+}
+
+fn run_lived_moment_transition_window_simulation(
+  db_path: &PathBuf,
+) -> Result<SimulationRunResult, AppError> {
+  create_companion_context_entry(
+    db_path,
+    &CreateCompanionContextEntryInput {
+      category_key: "goals".into(),
+      title: "Move toward the water".into(),
+      body: "I want life to feel calmer, wider, and closer to the water again.".into(),
+      tags: vec!["future".into(), "move".into(), "change".into()],
+      notes: "Seeded lived-moment transition window.".into(),
+    },
+  )?;
+
+  run_context_memory_pass(db_path)?;
+
+  let entry = find_companion_context_entry_by_category_and_title(&Connection::open(db_path)?, "goals", "Move toward the water")?
+    .ok_or_else(|| AppError::Message("Expected transition seed entry.".into()))?;
+
+  update_companion_context_entry(
+    db_path,
+    &UpdateCompanionContextEntryInput {
+      id: entry.id,
+      title: entry.title,
+      body: "I still want to move toward the water, but lately it feels unstable, close, and not fully decided.".into(),
+      tags: vec!["future".into(), "shift".into(), "threshold".into()],
+      notes: "Seeded drift for transition-heavy lived moment.".into(),
+      is_active: true,
+    },
+  )?;
+
+  create_reflection(
+    db_path,
+    &CreateReflectionInput {
+      reflection_kind: "week_state".into(),
+      text: "This week feels like a threshold instead of a stable continuation.".into(),
+      linked_place_id: None,
+      weight: 0.78,
+      expires_at: None,
+      is_sensitive: false,
+    },
+  )?;
+
+  run_context_memory_pass(db_path)?;
+
+  create_place(
+    db_path,
+    &CreatePlaceInput {
+      label: "Riverside route".into(),
+      latitude: Some(52.3705),
+      longitude: Some(4.9125),
+      radius_meters: 150,
+      place_kind: "discovery".into(),
+      meaning_kind: "return".into(),
+      is_user_named: false,
+      is_protected: false,
+      notes: "A route connected to possible change.".into(),
+    },
+  )?;
+
+  ingest_location_event(
+    db_path,
+    &LocationEventInput {
+      occurred_at: "2026-03-29T17:40:00Z".into(),
+      latitude: 52.3705,
+      longitude: 4.9125,
+      accuracy_meters: Some(16.0),
+      speed_mps: Some(0.0),
+      source: "simulation".into(),
+    },
+  )?;
+  ingest_location_event(
+    db_path,
+    &LocationEventInput {
+      occurred_at: "2026-03-29T18:25:00Z".into(),
+      latitude: 52.3705,
+      longitude: 4.9125,
+      accuracy_meters: Some(16.0),
+      speed_mps: Some(0.0),
+      source: "simulation".into(),
+    },
+  )?;
+
+  lived_moment_simulation_result(
+    db_path,
+    "lived_moment_transition_window",
+    "Lived Moment Transition Window",
+    5,
+    parse_utc("2026-03-29T18:30:00Z")?,
+    "Seeded drift and accumulated movement around a threshold.",
+  )
+}
+
 fn build_simulation_suite_checks(
   scenario_results: &[SimulationRunResult],
 ) -> Vec<SimulationSuiteCheck> {
@@ -7929,6 +9753,39 @@ fn build_simulation_suite_checks(
     });
   }
 
+  if let Some(result) = scenario_results.iter().find(|item| item.scenario_key == "lived_moment_open_window")
+  {
+    let preview = result.draft_preview.clone().unwrap_or_default().to_lowercase();
+    checks.push(SimulationSuiteCheck {
+      key: "lived_moment_open_window".into(),
+      label: "Open-window scenario reads as open or opportunity-rich".into(),
+      passed: preview.contains("open") || preview.contains("opportunity-rich"),
+      detail: format!("Preview {:?}.", result.draft_preview),
+    });
+  }
+
+  if let Some(result) = scenario_results.iter().find(|item| item.scenario_key == "lived_moment_protective_window")
+  {
+    let preview = result.draft_preview.clone().unwrap_or_default().to_lowercase();
+    checks.push(SimulationSuiteCheck {
+      key: "lived_moment_protective_window".into(),
+      label: "Protective-window scenario leans protective or quiet".into(),
+      passed: preview.contains("protective") || preview.contains("stay_quiet"),
+      detail: format!("Preview {:?}.", result.draft_preview),
+    });
+  }
+
+  if let Some(result) = scenario_results.iter().find(|item| item.scenario_key == "lived_moment_transition_window")
+  {
+    let preview = result.draft_preview.clone().unwrap_or_default().to_lowercase();
+    checks.push(SimulationSuiteCheck {
+      key: "lived_moment_transition_window".into(),
+      label: "Transition-window scenario reads as transition-heavy or watchful".into(),
+      passed: preview.contains("transition-heavy") || preview.contains("watch_for_escalation"),
+      detail: format!("Preview {:?}.", result.draft_preview),
+    });
+  }
+
   checks
 }
 
@@ -7960,12 +9817,114 @@ fn feedback_bias_for_moment_kind(
   Ok(average.unwrap_or(0.0))
 }
 
+fn lived_moment_message_bias(snapshot: &LivedMomentSnapshot) -> f64 {
+  let contact_bias = match snapshot.recommended_contact_mode.as_str() {
+    "stay_silent" => -0.03,
+    "send_light_message" => 0.04,
+    "make_soft_suggestion" => 0.03,
+    "suggest_human_contact" => 0.03,
+    "send_warning" => -0.02,
+    "escalate_to_call" => -0.05,
+    _ => 0.0,
+  };
+  let signal_bias = match snapshot.recommended_signal.as_str() {
+    "enrich_this_moment" => 0.02,
+    "surface_this_opening" => 0.02,
+    "watch_for_escalation" => -0.01,
+    "warn_now" => -0.03,
+    "stay_quiet" => -0.02,
+    _ => 0.0,
+  };
+  f64::min(f64::max(contact_bias + signal_bias, -0.08_f64), 0.08_f64)
+}
+
+fn lived_moment_call_bias(snapshot: &LivedMomentSnapshot) -> f64 {
+  let contact_bias = match snapshot.recommended_contact_mode.as_str() {
+    "stay_silent" => -0.03,
+    "send_light_message" => -0.02,
+    "make_soft_suggestion" => -0.01,
+    "suggest_human_contact" => 0.01,
+    "send_warning" => 0.04,
+    "escalate_to_call" => 0.06,
+    _ => 0.0,
+  };
+  let signal_bias = match snapshot.recommended_signal.as_str() {
+    "warn_now" => 0.04,
+    "watch_for_escalation" => 0.02,
+    "stay_quiet" => -0.02,
+    "enrich_this_moment" => -0.01,
+    "surface_this_opening" => -0.01,
+    _ => 0.0,
+  };
+  f64::min(f64::max(contact_bias + signal_bias, -0.08_f64), 0.1_f64)
+}
+
+fn lived_moment_pillar(snapshot: &LivedMomentSnapshot) -> &'static str {
+  match snapshot.recommended_signal.as_str() {
+    "warn_now" => "situational_safeguarding",
+    "surface_this_opening" => {
+      if !snapshot.relational_bridges.is_empty() {
+        "relational_bridging"
+      } else {
+        "opportunity_guidance"
+      }
+    }
+    "watch_for_escalation" => "phase_navigation",
+    "enrich_this_moment" => "lived_moment_enrichment",
+    _ => {
+      if !snapshot.relational_bridges.is_empty() {
+        "relational_bridging"
+      } else if snapshot.primary_assessment == "transition-heavy" {
+        "phase_navigation"
+      } else if !snapshot.opportunities.is_empty() {
+        "opportunity_guidance"
+      } else if !snapshot.safeguards.is_empty() {
+        "situational_safeguarding"
+      } else {
+        "lived_moment_enrichment"
+      }
+    }
+  }
+}
+
+fn escalation_stage(snapshot: &LivedMomentSnapshot) -> &'static str {
+  match snapshot.recommended_contact_mode.as_str() {
+    "stay_silent" => "silence",
+    "send_light_message" => "light_message",
+    "make_soft_suggestion" => "soft_suggestion",
+    "suggest_human_contact" => "bridging_suggestion",
+    "send_warning" => "warning_message",
+    "escalate_to_call" => "call_escalation",
+    _ => "silence",
+  }
+}
+
+fn lived_moment_metadata(snapshot: &LivedMomentSnapshot) -> serde_json::Value {
+  json!({
+    "pillar": lived_moment_pillar(snapshot),
+    "primaryAssessment": snapshot.primary_assessment,
+    "recommendedSignal": snapshot.recommended_signal,
+    "recommendedContactMode": snapshot.recommended_contact_mode,
+    "contactRhythmHint": snapshot.contact_rhythm_hint,
+    "recentContactLoad": snapshot.recent_contact_load,
+    "recentContactSummary": snapshot.recent_contact_summary,
+    "escalationStage": escalation_stage(snapshot),
+    "topOpportunity": snapshot.opportunities.first().map(|item| item.kind.clone()),
+    "topSafeguard": snapshot.safeguards.first().map(|item| item.kind.clone()),
+    "topSituationalSignal": snapshot.situational_signals.first().map(|item| item.kind.clone()),
+    "topRelationalBridge": snapshot.relational_bridges.first().map(|item| item.title.clone())
+  })
+}
+
 fn run_message_decisions_at(
   db_path: &PathBuf,
   evaluation_time: DateTime<Utc>,
 ) -> Result<DecisionRunResult, AppError> {
   let connection = Connection::open(db_path)?;
   let settings = load_settings(db_path)?;
+  let lived_moment_snapshot =
+    build_lived_moment_snapshot(&connection, &settings.timezone, evaluation_time)?;
+  let lived_moment_bias = lived_moment_message_bias(&lived_moment_snapshot);
   let saved_moments = list_saved_moments(&connection)?;
   let rules = list_rules(&connection)?;
   let recent_outreach_at = latest_recent_outreach_at(&connection)?;
@@ -7980,7 +9939,7 @@ fn run_message_decisions_at(
     .filter(|moment| get_moment_decision_by_saved_moment_id(&connection, moment.id).is_err())
   {
     let feedback_bias = feedback_bias_for_moment_kind(&connection, &moment.moment_kind)?;
-    let adjusted_confidence = (moment.confidence + feedback_bias).clamp(0.0, 1.0);
+    let adjusted_confidence = (moment.confidence + feedback_bias + lived_moment_bias).clamp(0.0, 1.0);
     let (decision_kind, reason_summary, metadata, outreach_event_id) =
       if adjusted_confidence < settings.medium_confidence_threshold {
         (
@@ -7991,8 +9950,10 @@ fn run_message_decisions_at(
             "confidence": moment.confidence,
             "adjustedConfidence": adjusted_confidence,
             "feedbackBias": feedback_bias,
+            "livedMomentBias": lived_moment_bias,
             "threshold": settings.medium_confidence_threshold,
-            "kind": "low_confidence"
+            "kind": "low_confidence",
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8002,7 +9963,8 @@ fn run_message_decisions_at(
           "Suppressed because the current time falls inside sleep or protected quiet hours."
             .to_string(),
           json!({
-            "kind": "protected_time"
+            "kind": "protected_time",
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8013,7 +9975,8 @@ fn run_message_decisions_at(
             .to_string(),
           json!({
             "kind": "batch_limit",
-            "limit": 1
+            "limit": 1,
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8026,7 +9989,8 @@ fn run_message_decisions_at(
             json!({
               "kind": "cooldown",
               "minutesSinceLastOutreach": minutes_since,
-              "cooldownMinutes": settings.message_cooldown_minutes
+              "cooldownMinutes": settings.message_cooldown_minutes,
+              "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
             }),
             None,
           )
@@ -8039,7 +10003,9 @@ fn run_message_decisions_at(
               "kind": "eligible",
               "confidence": moment.confidence,
               "adjustedConfidence": adjusted_confidence,
-              "feedbackBias": feedback_bias
+              "feedbackBias": feedback_bias,
+              "livedMomentBias": lived_moment_bias,
+              "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
             }),
             Some(outreach.id),
           )
@@ -8053,7 +10019,9 @@ fn run_message_decisions_at(
             "kind": "eligible",
             "confidence": moment.confidence,
             "adjustedConfidence": adjusted_confidence,
-            "feedbackBias": feedback_bias
+            "feedbackBias": feedback_bias,
+            "livedMomentBias": lived_moment_bias,
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           Some(outreach.id),
         )
@@ -8128,6 +10096,9 @@ fn run_call_request_decisions_at(
     });
   }
 
+  let lived_moment_snapshot =
+    build_lived_moment_snapshot(&connection, &settings.timezone, evaluation_time)?;
+  let lived_moment_bias = lived_moment_call_bias(&lived_moment_snapshot);
   let saved_moments = list_saved_moments(&connection)?;
   let rules = list_rules(&connection)?;
   let recent_outreach_at = latest_recent_outreach_at(&connection)?;
@@ -8142,7 +10113,7 @@ fn run_call_request_decisions_at(
     .filter(|moment| get_moment_decision_by_saved_moment_id(&connection, moment.id).is_err())
   {
     let feedback_bias = feedback_bias_for_moment_kind(&connection, &moment.moment_kind)?;
-    let adjusted_confidence = (moment.confidence + feedback_bias).clamp(0.0, 1.0);
+    let adjusted_confidence = (moment.confidence + feedback_bias + lived_moment_bias).clamp(0.0, 1.0);
     let (decision_kind, reason_summary, metadata, outreach_event_id) =
       if adjusted_confidence < settings.call_confidence_threshold {
         (
@@ -8153,8 +10124,10 @@ fn run_call_request_decisions_at(
             "confidence": moment.confidence,
             "adjustedConfidence": adjusted_confidence,
             "feedbackBias": feedback_bias,
+            "livedMomentBias": lived_moment_bias,
             "threshold": settings.call_confidence_threshold,
-            "kind": "call_threshold"
+            "kind": "call_threshold",
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8164,7 +10137,8 @@ fn run_call_request_decisions_at(
           "Suppressed because the current time falls inside sleep or protected quiet hours."
             .to_string(),
           json!({
-            "kind": "protected_time"
+            "kind": "protected_time",
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8176,7 +10150,8 @@ fn run_call_request_decisions_at(
           json!({
             "kind": "batch_limit",
             "limit": 1,
-            "outreachKind": "call_request"
+            "outreachKind": "call_request",
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           None,
         )
@@ -8189,7 +10164,8 @@ fn run_call_request_decisions_at(
             json!({
               "kind": "call_cooldown",
               "minutesSinceLastOutreach": minutes_since,
-              "cooldownMinutes": settings.call_cooldown_minutes
+              "cooldownMinutes": settings.call_cooldown_minutes,
+              "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
             }),
             None,
           )
@@ -8207,7 +10183,9 @@ fn run_call_request_decisions_at(
               "kind": "eligible_call_request",
               "confidence": moment.confidence,
               "adjustedConfidence": adjusted_confidence,
-              "feedbackBias": feedback_bias
+              "feedbackBias": feedback_bias,
+              "livedMomentBias": lived_moment_bias,
+              "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
             }),
             Some(outreach.id),
           )
@@ -8222,7 +10200,9 @@ fn run_call_request_decisions_at(
             "kind": "eligible_call_request",
             "confidence": moment.confidence,
             "adjustedConfidence": adjusted_confidence,
-            "feedbackBias": feedback_bias
+            "feedbackBias": feedback_bias,
+            "livedMomentBias": lived_moment_bias,
+            "livedMoment": lived_moment_metadata(&lived_moment_snapshot)
           }),
           Some(outreach.id),
         )
@@ -9185,6 +11165,203 @@ mod tests {
   }
 
   #[test]
+  fn lived_moment_snapshot_defaults_to_ordinary_when_context_is_thin() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let snapshot = build_lived_moment_snapshot(
+      &connection,
+      "Europe/Amsterdam",
+      parse_utc("2026-03-29T10:00:00Z").expect("parse time"),
+    )
+    .expect("lived moment snapshot");
+
+    assert_eq!(snapshot.primary_assessment, "ordinary");
+    assert_eq!(snapshot.recommended_signal, "stay_quiet");
+    assert_eq!(snapshot.contact_rhythm_hint, "stay_quiet");
+    assert_eq!(snapshot.recommended_contact_mode, "stay_silent");
+    assert_eq!(snapshot.action_bias, "watchful_silence");
+    assert!(snapshot.assessments.iter().any(|assessment| assessment.kind == "ordinary"));
+    assert!(snapshot.actionable_signals.iter().any(|signal| signal.kind == "stay_quiet"));
+    assert!(snapshot.safeguards.iter().any(|safeguard| safeguard.kind == "protect_quiet_window"));
+    assert!(snapshot
+      .situational_signals
+      .iter()
+      .any(|signal| signal.kind == "contact_air_gap" || signal.kind == "active_contact_cooldown"));
+    assert!(snapshot.relational_bridges.is_empty());
+    assert!(snapshot.contact_rhythm_options.iter().any(|option| option.level == "stay_silent"));
+  }
+
+  #[test]
+  fn lived_moment_snapshot_surfaces_open_and_transition_heavy_when_evidence_accumulates() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let place = create_place(
+      &db_path,
+      &CreatePlaceInput {
+        label: "Canal Bench".into(),
+        latitude: Some(52.3676),
+        longitude: Some(4.9041),
+        radius_meters: 140,
+        place_kind: "reflection".into(),
+        meaning_kind: "possibility".into(),
+        is_user_named: true,
+        is_protected: false,
+        notes: "A place that feels open, alive, and full of possibility.".into(),
+      },
+    )
+    .expect("create place");
+
+    let entry = create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "hobbies".into(),
+        title: "Night walks".into(),
+        body: "Night walks by the canal make me feel open and like life might widen again.".into(),
+        tags: vec!["walks".into(), "alive".into(), "outside".into()],
+        notes: "Initial grounding memory.".into(),
+      },
+    )
+    .expect("create context entry");
+
+    run_context_memory_pass(&db_path).expect("first context pass");
+
+    update_companion_context_entry(
+      &db_path,
+      &UpdateCompanionContextEntryInput {
+        id: entry.id,
+        title: entry.title.clone(),
+        body: "Night walks by the canal still matter, but lately they feel unstable and different from before.".into(),
+        tags: vec!["walks".into(), "change".into(), "alive".into()],
+        notes: "Shifted wording to create lived drift.".into(),
+        is_active: true,
+      },
+    )
+    .expect("update context entry");
+
+    create_reflection(
+      &db_path,
+      &CreateReflectionInput {
+        reflection_kind: "week_state".into(),
+        text: "Tonight feels open, alive, and like something could happen if I notice it in time.".into(),
+        linked_place_id: Some(place.id),
+        weight: 0.82,
+        expires_at: None,
+        is_sensitive: false,
+      },
+    )
+    .expect("create reflection");
+
+    run_context_memory_pass(&db_path).expect("second context pass");
+
+    ingest_location_event(
+      &db_path,
+      &LocationEventInput {
+        occurred_at: "2026-03-29T20:05:00Z".into(),
+        latitude: 52.3676,
+        longitude: 4.9041,
+        accuracy_meters: Some(15.0),
+        speed_mps: Some(0.0),
+        source: "test".into(),
+      },
+    )
+    .expect("ingest still event");
+    ingest_location_event(
+      &db_path,
+      &LocationEventInput {
+        occurred_at: "2026-03-29T20:42:00Z".into(),
+        latitude: 52.3676,
+        longitude: 4.9041,
+        accuracy_meters: Some(15.0),
+        speed_mps: Some(0.0),
+        source: "test".into(),
+      },
+    )
+    .expect("ingest second still event");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let snapshot = build_lived_moment_snapshot(
+      &connection,
+      "Europe/Amsterdam",
+      parse_utc("2026-03-29T20:45:00Z").expect("parse time"),
+    )
+    .expect("lived moment snapshot");
+
+    assert_eq!(snapshot.matched_place.as_ref().map(|item| item.id), Some(place.id));
+    assert!(snapshot.related_memories.iter().any(|memory| memory.relevance_score >= 0.5));
+    assert!(snapshot.assessments.iter().any(|assessment| assessment.kind == "open"));
+    assert!(snapshot.assessments.iter().any(|assessment| assessment.kind == "opportunity-rich"));
+    assert!(snapshot.assessments.iter().any(|assessment| assessment.kind == "transition-heavy"));
+    assert!(snapshot.actionable_signals.iter().any(|signal| signal.kind == "enrich_this_moment"));
+    assert!(snapshot.actionable_signals.iter().any(|signal| signal.kind == "surface_this_opening"));
+    assert!(snapshot
+      .situational_signals
+      .iter()
+      .any(|signal| signal.kind == "meaningful_place_window"));
+    assert!(snapshot.opportunities.iter().any(|opportunity| opportunity.kind == "enrichment_window"));
+    assert!(snapshot.opportunities.iter().any(|opportunity| opportunity.kind == "place_based_opening"));
+    assert!(!snapshot.contact_rhythm_options.is_empty());
+    assert!(!snapshot.recent_contact_summary.is_empty());
+    assert!(matches!(
+      snapshot.contact_rhythm_hint.as_str(),
+      "light_suggestion" | "orient_softly"
+    ));
+  }
+
+  #[test]
+  fn lived_moment_snapshot_can_surface_relational_bridges() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "friends".into(),
+        title: "Mara".into(),
+        body: "Mara is one of the people I trust when things get noisy.".into(),
+        tags: vec!["support".into(), "close".into(), "important".into()],
+        notes: "A steady friend and good call if life gets loud.".into(),
+      },
+    )
+    .expect("create friend context");
+
+    create_reflection(
+      &db_path,
+      &CreateReflectionInput {
+        reflection_kind: "week_state".into(),
+        text: "I keep thinking about Mara tonight and it feels like reaching out could help.".into(),
+        linked_place_id: None,
+        weight: 0.84,
+        expires_at: None,
+        is_sensitive: false,
+      },
+    )
+    .expect("create reflection");
+
+    run_context_memory_pass(&db_path).expect("run context pass");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    let snapshot = build_lived_moment_snapshot(
+      &connection,
+      "Europe/Amsterdam",
+      parse_utc("2026-03-29T19:30:00Z").expect("parse time"),
+    )
+    .expect("lived moment snapshot");
+
+    assert!(snapshot.relational_bridges.iter().any(|bridge| {
+      bridge.title == "Mara"
+        && matches!(bridge.bridge_kind.as_str(), "light_reconnect" | "supportive_reach")
+    }));
+    assert!(snapshot.contact_rhythm_options.iter().any(|option| option.level == "suggest_human_contact"));
+    assert!(matches!(
+      snapshot.recommended_contact_mode.as_str(),
+      "suggest_human_contact" | "send_light_message" | "make_soft_suggestion"
+    ));
+  }
+
+  #[test]
   fn phase_three_generates_saved_moments_and_baseline() {
     let db_path = test_db_path();
     init_test_db(&db_path);
@@ -9301,6 +11478,14 @@ mod tests {
       .iter()
       .any(|decision| decision.reason_summary.contains("confidence")));
     assert!(snapshot
+      .decisions
+      .iter()
+      .any(|decision| decision.decision_metadata_json.contains("\"livedMoment\"")));
+    assert!(snapshot
+      .decisions
+      .iter()
+      .any(|decision| decision.decision_metadata_json.contains("\"pillar\"")));
+    assert!(snapshot
       .outreach_events
       .iter()
       .any(|event| event.response_state == "drafted"));
@@ -9348,10 +11533,188 @@ mod tests {
       .decisions
       .iter()
       .any(|decision| decision.decision_kind == "promote_to_call_request"));
+    assert!(snapshot
+      .decisions
+      .iter()
+      .any(|decision| decision.decision_metadata_json.contains("\"escalationStage\"")));
     assert!(snapshot.outreach_events.iter().any(|event| {
       event.outreach_kind == "call_request"
         && event.message_text.to_lowercase().contains("call you for a moment")
     }));
+  }
+
+  #[test]
+  fn dispatch_payload_for_call_request_uses_lived_reasoning() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+    let mut settings = load_settings(&db_path).expect("load settings");
+    settings.call_requests_enabled = true;
+    save_settings(&db_path, &settings).expect("save settings");
+
+    let connection = Connection::open(&db_path).expect("open db");
+    connection
+      .execute(
+        r#"
+          INSERT INTO saved_moments (
+            created_at, visit_id, place_id, moment_kind, observed_context_json,
+            inferred_significance, confidence, action_taken, was_promoted_to_outreach, resolved_at
+          ) VALUES
+          (?1, 1, NULL, 'meaningful_departure', '{}', 'Threshold moment', 0.92, 'silent_save', 0, NULL)
+        "#,
+        params!["2026-03-23T10:00:00Z"],
+      )
+      .expect("seed moment");
+
+    run_call_request_decisions_at(
+      &db_path,
+      parse_utc("2026-03-23T14:00:00Z").expect("evaluation time"),
+    )
+    .expect("run call decisions");
+
+    let draft = drafted_outreach_events(&db_path)
+      .expect("drafts")
+      .into_iter()
+      .find(|event| event.outreach_kind == "call_request")
+      .expect("call draft");
+    let (_, payload, detail) =
+      build_dispatch_payload_for_outreach(&db_path, draft.id).expect("build payload");
+
+    assert!(!payload.trim().is_empty());
+    assert_ne!(payload, draft.message_text);
+    assert!(detail.contains("Sending a live North Star check-in"));
+  }
+
+  #[test]
+  fn mark_outreach_event_dispatched_marks_sent_and_records_payload() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    connection
+      .execute(
+        r#"
+          INSERT INTO outreach_events (
+            created_at, saved_moment_id, outreach_kind, channel, reason_summary,
+            message_text, confidence, was_delivered, delivery_metadata_json, response_state
+          ) VALUES (?1, NULL, 'message', 'north_star', 'test reason', 'hello there', 0.78, 0, '{}', 'drafted')
+        "#,
+        params!["2026-03-23T10:00:00Z"],
+      )
+      .expect("seed outreach");
+    let outreach_id = connection.last_insert_rowid();
+
+    let updated = mark_outreach_event_dispatched(
+      &db_path,
+      outreach_id,
+      "hello there",
+      "Dispatching message shaped by lived_moment_enrichment / open / enrich_this_moment.",
+    )
+    .expect("mark dispatched");
+
+    assert!(updated.was_delivered);
+    assert_eq!(updated.response_state, "sent");
+    assert!(updated.delivery_metadata_json.contains("\"dispatchedPayload\""));
+    assert!(updated.delivery_metadata_json.contains("\"northStarDetail\""));
+  }
+
+  #[test]
+  fn next_auto_dispatchable_outreach_event_picks_safe_message_draft() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    connection
+      .execute(
+        r#"
+          INSERT INTO outreach_events (
+            id, created_at, saved_moment_id, outreach_kind, channel, reason_summary,
+            message_text, confidence, was_delivered, delivery_metadata_json, response_state
+          ) VALUES
+          (101, ?1, 1, 'message', 'north_star', 'Safe message', 'hello', 0.7, 0, '{}', 'drafted')
+        "#,
+        params!["2026-03-23T10:00:00Z"],
+      )
+      .expect("seed outreach");
+    connection
+      .execute(
+        r#"
+          INSERT INTO moment_decisions (
+            saved_moment_id, decided_at, decision_kind, reason_summary,
+            decision_metadata_json, created_outreach_event_id
+          ) VALUES
+          (1, ?1, 'promote_to_outreach', 'Eligible', ?2, 101)
+        "#,
+        params![
+          "2026-03-23T10:00:00Z",
+          json!({
+            "livedMoment": {
+              "recommendedContactMode": "send_light_message"
+            }
+          })
+          .to_string()
+        ],
+      )
+      .expect("seed decision");
+
+    let (candidate, held, reason) =
+      next_auto_dispatchable_outreach_event(&db_path).expect("auto dispatch candidate");
+
+    assert_eq!(candidate.expect("candidate").id, 101);
+    assert!(held.is_none());
+    assert_eq!(
+      reason.expect("reason"),
+      "Ready to auto-send as a light message."
+    );
+  }
+
+  #[test]
+  fn next_auto_dispatchable_outreach_event_holds_call_request() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let connection = Connection::open(&db_path).expect("open db");
+    connection
+      .execute(
+        r#"
+          INSERT INTO outreach_events (
+            id, created_at, saved_moment_id, outreach_kind, channel, reason_summary,
+            message_text, confidence, was_delivered, delivery_metadata_json, response_state
+          ) VALUES
+          (202, ?1, 1, 'call_request', 'north_star', 'Manual call', 'call me', 0.9, 0, '{}', 'drafted')
+        "#,
+        params!["2026-03-23T10:00:00Z"],
+      )
+      .expect("seed outreach");
+    connection
+      .execute(
+        r#"
+          INSERT INTO moment_decisions (
+            saved_moment_id, decided_at, decision_kind, reason_summary,
+            decision_metadata_json, created_outreach_event_id
+          ) VALUES
+          (1, ?1, 'promote_to_call_request', 'Eligible', ?2, 202)
+        "#,
+        params![
+          "2026-03-23T10:00:00Z",
+          json!({
+            "livedMoment": {
+              "recommendedContactMode": "escalate_to_call"
+            }
+          })
+          .to_string()
+        ],
+      )
+      .expect("seed decision");
+
+    let (candidate, held, reason) =
+      next_auto_dispatchable_outreach_event(&db_path).expect("auto dispatch candidate");
+
+    assert!(candidate.is_none());
+    assert_eq!(held.expect("held outreach").id, 202);
+    assert_eq!(
+      reason.expect("reason"),
+      "Call requests stay manual for now so live outreach remains deliberate."
+    );
   }
 
   #[test]
@@ -9431,6 +11794,24 @@ mod tests {
 
     assert_eq!(result.promoted_count, 1);
     assert_eq!(result.draft_count, 1);
+  }
+
+  #[test]
+  fn lived_moment_open_window_simulation_reads_as_opening() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    let result = run_simulation_scenario(
+      &db_path,
+      &SimulationRunInput {
+        scenario_key: "lived_moment_open_window".into(),
+        clear_existing: true,
+      },
+    )
+    .expect("run simulation");
+
+    let preview = result.draft_preview.unwrap_or_default().to_lowercase();
+    assert!(preview.contains("open") || preview.contains("opportunity-rich"));
   }
 
   #[test]

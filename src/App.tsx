@@ -22,10 +22,13 @@ import {
   createPlace,
   createReflection,
   createRule,
+  autoDispatchEligibleOutreach,
   createNorthStarSession,
   clearAllLocalData,
   clearVoiceAssets,
   downloadKokoroAssets,
+  dispatchDraftedOutreach,
+  dispatchNextDraftedOutreach,
   endCallSession,
   getCallTurnsForSession,
   getCompanionContextSnapshot,
@@ -36,6 +39,7 @@ import {
   getMemoryGrowthSnapshot,
   getMemorySystemSnapshot,
   getMvpRealityCheckSnapshot,
+  getLivedMomentSnapshot,
   getNorthStarRuntimeSnapshot,
   getNorthStarSnapshot,
   getNorthStarRtcConfig,
@@ -101,8 +105,11 @@ import type {
   CreateReflectionInput,
   CreateRuleInput,
   DecisionSnapshot,
+  DraftedOutreachAutoDispatchResult,
   DiagnosticStatus,
+  DraftedOutreachDispatchResult,
   EndCallSessionInput,
+  LivedMomentSnapshot,
   LocationEventInput,
   MemoryItem,
   MemoryGrowthSnapshot,
@@ -135,7 +142,7 @@ type TabId = "home" | "context" | "tectonics" | "settings";
 type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
 type ContextSectionId = string;
-type PassiveSectionId = "ingest" | "timeline" | "patterns";
+type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
 type ReviewSectionId = "places" | "rules" | "moments" | "calls";
 const defaultCallTranscriptCleanupPrompt = `You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.
@@ -843,6 +850,182 @@ function prettyJson(value: string) {
   }
 }
 
+function parseJsonObject(value: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function decisionExplainability(value: string) {
+  const metadata = parseJsonObject(value);
+  const livedMoment = metadata?.livedMoment && typeof metadata.livedMoment === "object" && !Array.isArray(metadata.livedMoment)
+    ? metadata.livedMoment as Record<string, unknown>
+    : null;
+
+  return {
+    metadata,
+    pillar: typeof livedMoment?.pillar === "string" ? livedMoment.pillar : null,
+    primaryAssessment: typeof livedMoment?.primaryAssessment === "string" ? livedMoment.primaryAssessment : null,
+    recommendedSignal: typeof livedMoment?.recommendedSignal === "string" ? livedMoment.recommendedSignal : null,
+    recommendedContactMode: typeof livedMoment?.recommendedContactMode === "string" ? livedMoment.recommendedContactMode : null,
+    contactRhythmHint: typeof livedMoment?.contactRhythmHint === "string" ? livedMoment.contactRhythmHint : null,
+    escalationStage: typeof livedMoment?.escalationStage === "string" ? livedMoment.escalationStage : null,
+    topOpportunity: typeof livedMoment?.topOpportunity === "string" ? livedMoment.topOpportunity : null,
+    topSafeguard: typeof livedMoment?.topSafeguard === "string" ? livedMoment.topSafeguard : null,
+    topSituationalSignal: typeof livedMoment?.topSituationalSignal === "string" ? livedMoment.topSituationalSignal : null,
+    topRelationalBridge: typeof livedMoment?.topRelationalBridge === "string" ? livedMoment.topRelationalBridge : null,
+    recentContactSummary: typeof livedMoment?.recentContactSummary === "string" ? livedMoment.recentContactSummary : null,
+    adjustedConfidence: typeof metadata?.adjustedConfidence === "number" ? metadata.adjustedConfidence : null,
+    threshold: typeof metadata?.threshold === "number" ? metadata.threshold : null,
+    feedbackBias: typeof metadata?.feedbackBias === "number" ? metadata.feedbackBias : null,
+    livedMomentBias: typeof metadata?.livedMomentBias === "number" ? metadata.livedMomentBias : null,
+    kind: typeof metadata?.kind === "string" ? metadata.kind : null,
+    cooldownMinutes: typeof metadata?.cooldownMinutes === "number" ? metadata.cooldownMinutes : null,
+    minutesSinceLastOutreach: typeof metadata?.minutesSinceLastOutreach === "number" ? metadata.minutesSinceLastOutreach : null,
+  };
+}
+
+function autoDispatchAssessmentForEvent(eventId: number, snapshot: DecisionSnapshot | null) {
+  const decision = snapshot?.decisions.find((item) => item.createdOutreachEventId === eventId);
+  const explainability = decision ? decisionExplainability(decision.decisionMetadataJson) : null;
+  const mode = explainability?.recommendedContactMode;
+
+  switch (mode) {
+    case "send_light_message":
+      return { eligible: true, reason: "Ready to auto-send as a light message." };
+    case "make_soft_suggestion":
+      return { eligible: true, reason: "Ready to auto-send as a soft suggestion." };
+    case "send_warning":
+      return { eligible: true, reason: "Ready to auto-send as a timely warning." };
+    case "suggest_human_contact":
+      return { eligible: false, reason: "Keeping this as a manual send because it points toward human contact." };
+    case "escalate_to_call":
+      return { eligible: false, reason: "Keeping this as a manual send because it feels closer to a live call." };
+    case "stay_silent":
+      return { eligible: false, reason: "Not auto-sending because this moment still leans quiet." };
+    default:
+      return { eligible: false, reason: "Keeping this as a manual send for now." };
+  }
+}
+
+function explainabilityLabel(kind: string | null | undefined) {
+  if (!kind) return "Unknown";
+  switch (kind) {
+    case "lived_moment_enrichment":
+      return "Lived moment enrichment";
+    case "situational_safeguarding":
+      return "Situational safeguarding";
+    case "relational_bridging":
+      return "Relational bridging";
+    case "phase_navigation":
+      return "Phase navigation";
+    case "opportunity_guidance":
+      return "Opportunity guidance";
+    case "ordinary":
+      return "Ordinary";
+    case "open":
+      return "Open";
+    case "exploratory":
+      return "Exploratory";
+    case "vulnerable":
+      return "Vulnerable";
+    case "urgent":
+      return "Urgent";
+    case "protective":
+      return "Protective";
+    case "connective":
+      return "Connective";
+    case "opportunity-rich":
+      return "Opportunity-rich";
+    case "transition-heavy":
+      return "Transition-heavy";
+    case "enrich_this_moment":
+      return "Enrich this moment";
+    case "surface_this_opening":
+      return "Surface this opening";
+    case "warn_now":
+      return "Warn now";
+    case "stay_quiet":
+      return "Stay quiet";
+    case "watch_for_escalation":
+      return "Watch for escalation";
+    case "send_light_message":
+      return "Light message";
+    case "make_soft_suggestion":
+      return "Soft suggestion";
+    case "suggest_human_contact":
+      return "Suggest human contact";
+    case "send_warning":
+      return "Warning message";
+    case "escalate_to_call":
+      return "Live call";
+    case "silence":
+      return "Silence";
+    case "light_message":
+      return "Light message";
+    case "soft_suggestion":
+      return "Soft suggestion";
+    case "bridging_suggestion":
+      return "Bridge toward contact";
+    case "warning_message":
+      return "Warning message";
+    case "call_escalation":
+      return "Live call";
+    case "low_confidence":
+      return "Low confidence";
+    case "protected_time":
+      return "Protected time";
+    case "batch_limit":
+      return "Another stronger moment already won";
+    case "message_cooldown":
+      return "Message cooldown";
+    case "call_cooldown":
+      return "Call cooldown";
+    case "eligible_call_request":
+      return "Eligible for call request";
+    default:
+      return formatStatus(kind);
+  }
+}
+
+function decisionKindLabel(kind: string) {
+  switch (kind) {
+    case "promote_to_outreach":
+      return "Sent toward a message";
+    case "promote_to_call_request":
+      return "Sent toward a live call";
+    case "suppress":
+      return "Stayed quiet";
+    default:
+      return formatStatus(kind);
+  }
+}
+
+function decisionSummaryText(decision: DecisionSnapshot["decisions"][number], explainability: ReturnType<typeof decisionExplainability>) {
+  if (decision.decisionKind === "promote_to_outreach") {
+    return "The system chose to move toward a message.";
+  }
+  if (decision.decisionKind === "promote_to_call_request") {
+    return "The system chose to move toward a live call.";
+  }
+  if (explainability.kind === "protected_time") {
+    return "The system stayed quiet because the moment fell inside protected quiet time.";
+  }
+  if (explainability.kind === "low_confidence") {
+    return "The system stayed quiet because the moment did not feel strong enough yet.";
+  }
+  if (explainability.kind === "batch_limit") {
+    return "The system stayed quiet because another stronger moment had already been chosen.";
+  }
+  if (explainability.kind === "message_cooldown" || explainability.kind === "call_cooldown") {
+    return "The system stayed quiet because the recent contact cooldown was still active.";
+  }
+  return decision.reasonSummary;
+}
+
 function describeMemorySource(item: MemoryItem) {
   switch (item.sourceKind) {
     case "place":
@@ -1499,6 +1682,7 @@ function App() {
   const [snapshot, setSnapshot] = useState<PhaseOneSnapshot | null>(null);
   const [passiveSnapshot, setPassiveSnapshot] = useState<PassiveContextSnapshot | null>(null);
   const [phaseThreeSnapshot, setPhaseThreeSnapshot] = useState<PhaseThreeSnapshot | null>(null);
+  const [livedMomentSnapshot, setLivedMomentSnapshot] = useState<LivedMomentSnapshot | null>(null);
   const [decisionSnapshot, setDecisionSnapshot] = useState<DecisionSnapshot | null>(null);
   const [northStarRuntimeSnapshot, setNorthStarRuntimeSnapshot] = useState<NorthStarRuntimeProjection | null>(null);
   const [northStarConnectionsSnapshot, setNorthStarConnectionsSnapshot] = useState<NorthStarConnectionsProjection | null>(null);
@@ -1550,9 +1734,11 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [lastDraftDispatch, setLastDraftDispatch] = useState<DraftedOutreachDispatchResult | null>(null);
+  const [lastAutoDispatch, setLastAutoDispatch] = useState<DraftedOutreachAutoDispatchResult | null>(null);
   const [northStarLiveDiagnostics, setNorthStarLiveDiagnostics] = useState<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
   const [northStarIncomingAudioMeter, setNorthStarIncomingAudioMeter] = useState<NorthStarIncomingAudioMeter>(defaultNorthStarIncomingAudioMeter);
   const [northStarRemoteTrackStats, setNorthStarRemoteTrackStats] = useState<NorthStarRemoteTrackStats>(defaultNorthStarRemoteTrackStats);
@@ -1626,6 +1812,12 @@ function App() {
     selectedDecision?.createdOutreachEventId != null
       ? decisionSnapshot?.outreachEvents.find((event) => event.id === selectedDecision.createdOutreachEventId) ?? null
       : null;
+  const selectedDecisionExplainability =
+    selectedDecision ? decisionExplainability(selectedDecision.decisionMetadataJson) : null;
+  const selectedDecisionOutreachMetadata =
+    selectedDecisionOutreach ? parseJsonObject(selectedDecisionOutreach.deliveryMetadataJson) : null;
+  const draftedOutreachEvents =
+    (decisionSnapshot?.outreachEvents ?? []).filter((event) => event.responseState === "drafted");
   const selectedCallSession =
     callSessionSnapshot?.recentSessions.find((session) => session.id === selectedCallSessionId)
     ?? callSessionSnapshot?.activeSession
@@ -3067,6 +3259,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function refreshSnapshot() { setSnapshot(await getPhaseOneSnapshot()); }
   async function refreshPassiveSnapshot() { setPassiveSnapshot(await getPassiveContextSnapshot()); }
   async function refreshPhaseThreeSnapshot() { setPhaseThreeSnapshot(await getPhaseThreeSnapshot()); }
+  async function refreshLivedMomentSnapshot() { setLivedMomentSnapshot(await getLivedMomentSnapshot()); }
   async function refreshCallSessionSnapshot() { setCallSessionSnapshot(await getCallSessionSnapshot()); }
   async function refreshDecisionSnapshot() { setDecisionSnapshot(await getDecisionSnapshot()); }
   async function refreshRealityCheckSnapshot() { setRealityCheckSnapshot(await getMvpRealityCheckSnapshot()); }
@@ -3077,7 +3270,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     let active = true;
     async function bootstrap() {
       try {
-        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot, loadedMemorySystemSnapshot] = await Promise.all([
+        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedLivedMomentSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot, loadedMemorySystemSnapshot] = await Promise.all([
           loadSettings(),
           getDiagnostics(),
           getCompanionContextSnapshot(),
@@ -3088,6 +3281,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           getPhaseOneSnapshot(),
           getPassiveContextSnapshot(),
           getPhaseThreeSnapshot(),
+          getLivedMomentSnapshot(),
           getDecisionSnapshot(),
           getCallSessionSnapshot(),
           getMvpRealityCheckSnapshot(),
@@ -3106,6 +3300,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         setSnapshot(loadedSnapshot);
         setPassiveSnapshot(loadedPassiveSnapshot);
         setPhaseThreeSnapshot(loadedPhaseThreeSnapshot);
+        setLivedMomentSnapshot(loadedLivedMomentSnapshot);
         setDecisionSnapshot(loadedDecisionSnapshot);
         setCallSessionSnapshot(loadedCallSessionSnapshot);
         setRealityCheckSnapshot(loadedRealityCheckSnapshot);
@@ -3795,11 +3990,22 @@ async function playNorthStarReplyOverPeer(base64: string) {
       await ingestLocationEvent(locationForm);
       setLocationForm((current) => ({ ...current, occurredAt: new Date().toISOString() }));
       setMessage("Location event ingested.");
-      await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshLivedMomentSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setBusyPanel(null);
+    }
+  }
+
+  async function handleRefreshLivedMoment() {
+    setError("");
+    setMessage("");
+    try {
+      await refreshLivedMomentSnapshot();
+      setMessage("Lived-moment interpretation refreshed.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
@@ -3955,6 +4161,72 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
   }
 
+  async function handleDispatchDraftedOutreach(outreachEventId: number) {
+    setBusyPanel("draftDispatch");
+    setError("");
+    setMessage("");
+    try {
+      const result = await dispatchDraftedOutreach(outreachEventId);
+      setLastDraftDispatch(result);
+      setMessage(result.northStarDetail);
+      await Promise.all([
+        refreshDecisionSnapshot(),
+        refreshCallSessionSnapshot(),
+        refreshDiagnostics(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleDispatchNextDraftedOutreach() {
+    setBusyPanel("draftDispatch");
+    setError("");
+    setMessage("");
+    try {
+      const result = await dispatchNextDraftedOutreach();
+      setLastAutoDispatch(result);
+      if (result.dispatch) {
+        setLastDraftDispatch(result.dispatch);
+      }
+      setMessage(result.detail);
+      await Promise.all([
+        refreshDecisionSnapshot(),
+        refreshCallSessionSnapshot(),
+        refreshDiagnostics(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleAutoDispatchEligibleOutreach() {
+    setBusyPanel("draftDispatch");
+    setError("");
+    setMessage("");
+    try {
+      const result = await autoDispatchEligibleOutreach();
+      setLastAutoDispatch(result);
+      if (result.dispatch) {
+        setLastDraftDispatch(result.dispatch);
+      }
+      setMessage(result.detail);
+      await Promise.all([
+        refreshDecisionSnapshot(),
+        refreshCallSessionSnapshot(),
+        refreshDiagnostics(),
+      ]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
   async function handleRunDecisions() {
     setBusyPanel("decisions");
     setError("");
@@ -4031,7 +4303,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       ];
       setContextMemorySummary(summary);
       setMessage(`Context-to-memory pass complete. ${summary[0]}`);
-      await Promise.all([refreshDiagnostics(), refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot()]);
+      await Promise.all([refreshDiagnostics(), refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot(), refreshLivedMomentSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4052,6 +4324,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       await Promise.all([
         refreshCompanionContextSnapshot(),
         refreshCompanionHomeSnapshot(),
+        refreshLivedMomentSnapshot(),
       ]);
       setContextMemorySummary([
         `${nextSnapshot.overview.totalMemoryCount} interpreted memories tracked.`,
@@ -4089,7 +4362,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       } else {
         setMessage("Memory item moved back into active memory.");
       }
-      await Promise.all([refreshSnapshot(), refreshDiagnostics()]);
+      await Promise.all([refreshSnapshot(), refreshDiagnostics(), refreshLivedMomentSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4247,6 +4520,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshSnapshot(),
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
+        refreshLivedMomentSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshDiagnostics(),
@@ -4273,6 +4547,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshSnapshot(),
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
+        refreshLivedMomentSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
@@ -4310,6 +4585,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshCompanionHomeSnapshot(),
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
+        refreshLivedMomentSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
@@ -4962,6 +5238,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "ingest", label: "Ingest" },
           { id: "timeline", label: "Timeline" },
           { id: "patterns", label: "Patterns" },
+          { id: "moment", label: "Lived moment" },
         ], passiveSection, (next) => setPassiveSection(next as PassiveSectionId))}
 
         {passiveSection === "ingest" ? (
@@ -5040,6 +5317,221 @@ async function playNorthStarReplyOverPeer(base64: string) {
               </div>
             ) : <p>Loading patterns...</p>}
           </section>
+        ) : null}
+
+        {passiveSection === "moment" ? (
+          <div className="content-stack">
+            <section className="panel">
+              <div className="panel-header">
+                <h2>Lived-moment interpretation</h2>
+                <p>The first combined read of rhythm, place, memory, detector pressure, and phase movement.</p>
+              </div>
+              <div className="actions">
+                <button type="button" onClick={() => void handleRefreshLivedMoment()}>Refresh moment read</button>
+                <button type="button" className="ghost" onClick={() => void handleSeedContextMemoryExample("support")} disabled={busyPanel === "contextMemorySeed"}>
+                  {busyPanel === "contextMemorySeed" ? "Seeding..." : "Seed support context"}
+                </button>
+                <button type="button" className="ghost" onClick={() => void handleSeedRealityCheck()} disabled={busyPanel === "realitySeed"}>
+                  {busyPanel === "realitySeed" ? "Seeding..." : "Seed controlled scenario"}
+                </button>
+              </div>
+              <p className="memory-explanation">Use the existing prefills here instead of waiting on real-life data. The support seed enriches interpreted memory; the controlled scenario adds visits, saved moments, and judgment traces.</p>
+              {livedMomentSnapshot ? (
+                <>
+                  <dl className="facts">
+                    <div><dt>Primary read</dt><dd>{formatStatus(livedMomentSnapshot.primaryAssessment)}</dd></div>
+                    <div><dt>Recommended signal</dt><dd>{formatStatus(livedMomentSnapshot.recommendedSignal)}</dd></div>
+                    <div><dt>Contact rhythm</dt><dd>{formatStatus(livedMomentSnapshot.contactRhythmHint)}</dd></div>
+                    <div><dt>Recommended contact mode</dt><dd>{formatStatus(livedMomentSnapshot.recommendedContactMode)}</dd></div>
+                    <div><dt>Action bias</dt><dd>{formatStatus(livedMomentSnapshot.actionBias)}</dd></div>
+                    <div><dt>Rhythm state</dt><dd>{formatStatus(livedMomentSnapshot.rhythmState)}</dd></div>
+                    <div><dt>Time</dt><dd>{livedMomentSnapshot.localDayOfWeek}, {livedMomentSnapshot.localTime}</dd></div>
+                    <div><dt>Sleep window</dt><dd>{livedMomentSnapshot.isLikelySleepWindow ? "inside likely quiet time" : "outside likely quiet time"}</dd></div>
+                    <div><dt>Recent contact load</dt><dd>{livedMomentSnapshot.recentContactLoad.toFixed(2)}</dd></div>
+                  </dl>
+                  <div className="saved-state">
+                    <h3>Current read</h3>
+                    <p className="memory-detail-lead">{livedMomentSnapshot.summary}</p>
+                    <code>captured {formatDateTime(livedMomentSnapshot.capturedAt)} / timezone {livedMomentSnapshot.timezone} / bucket {formatStatus(livedMomentSnapshot.timeBucket)}</code>
+                    <code>dominant phase shift {formatStatus(livedMomentSnapshot.dominantPhaseShiftState)} / score {livedMomentSnapshot.dominantPhaseShiftScore.toFixed(2)}</code>
+                    <code>{livedMomentSnapshot.recentContactSummary}</code>
+                    <code>{livedMomentSnapshot.dominantPhaseShiftSummary}</code>
+                  </div>
+                </>
+              ) : <p>Loading lived-moment interpretation...</p>}
+            </section>
+
+            {livedMomentSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Assessment stack</h2><p>Action-shaping readings, not final truths.</p></div>
+                  <div className="saved-state">
+                    <ul>
+                      {livedMomentSnapshot.assessments.length ? livedMomentSnapshot.assessments.map((assessment) => (
+                        <li key={assessment.kind}>
+                          <strong>{formatStatus(assessment.kind)}</strong>
+                          <code>score {assessment.score.toFixed(2)} / confidence {assessment.confidence.toFixed(2)}</code>
+                          <code>{assessment.summary}</code>
+                          {assessment.evidence.map((line, index) => <code key={`${assessment.kind}-${index}`}>{line}</code>)}
+                        </li>
+                      )) : <li>No current assessments yet.</li>}
+                    </ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Action signals</h2><p>The first explicit “what should happen now?” layer built from the read.</p></div>
+                  <div className="saved-state">
+                    <ul>
+                      {livedMomentSnapshot.actionableSignals.length ? livedMomentSnapshot.actionableSignals.map((signal) => (
+                        <li key={signal.kind}>
+                          <strong>{formatStatus(signal.kind)}</strong>
+                          <code>score {signal.score.toFixed(2)} / confidence {signal.confidence.toFixed(2)}</code>
+                          <code>{signal.reason}</code>
+                        </li>
+                      )) : <li>No action signals are grounded enough yet.</li>}
+                    </ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {livedMomentSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Situational signals</h2><p>The concrete now-conditions shaping opportunity or caution.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.situationalSignals.length ? livedMomentSnapshot.situationalSignals.map((signal) => (
+                      <li key={signal.kind}>
+                        <strong>{formatStatus(signal.kind)}</strong>
+                        <code>score {signal.score.toFixed(2)} / confidence {signal.confidence.toFixed(2)} / {formatStatus(signal.direction)}</code>
+                        <code>{signal.summary}</code>
+                      </li>
+                    )) : <li>No situational signals are strongly in play yet.</li>}</ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Opportunities</h2><p>The openings the system thinks may exist in this moment right now.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.opportunities.length ? livedMomentSnapshot.opportunities.map((opportunity) => (
+                      <li key={opportunity.kind}>
+                        <strong>{formatStatus(opportunity.kind)}</strong>
+                        <code>score {opportunity.score.toFixed(2)} / confidence {opportunity.confidence.toFixed(2)} / timing {formatStatus(opportunity.timing)}</code>
+                        <code>{opportunity.summary}</code>
+                      </li>
+                    )) : <li>No meaningful opportunities are grounded enough yet.</li>}</ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Safeguards</h2><p>The cautions or protections that may matter in the same moment.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.safeguards.length ? livedMomentSnapshot.safeguards.map((safeguard) => (
+                      <li key={safeguard.kind}>
+                        <strong>{formatStatus(safeguard.kind)}</strong>
+                        <code>score {safeguard.score.toFixed(2)} / confidence {safeguard.confidence.toFixed(2)} / urgency {formatStatus(safeguard.urgency)}</code>
+                        <code>{safeguard.summary}</code>
+                      </li>
+                    )) : <li>No safeguards are strongly in play yet.</li>}</ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {livedMomentSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Contact rhythm</h2><p>The pacing options the system thinks are proportionate right now.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.contactRhythmOptions.length ? livedMomentSnapshot.contactRhythmOptions.map((option) => (
+                      <li key={option.level}>
+                        <strong>{formatStatus(option.level)}</strong>
+                        <code>score {option.score.toFixed(2)} / confidence {option.confidence.toFixed(2)}</code>
+                        <code>{option.reason}</code>
+                      </li>
+                    )) : <li>No contact pacing options are grounded enough yet.</li>}</ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Relational bridges</h2><p>The people or living bonds that may fit this moment if contact matters.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.relationalBridges.length ? livedMomentSnapshot.relationalBridges.map((bridge) => (
+                      <li key={`${bridge.categoryKey}-${bridge.title}`}>
+                        <strong>{bridge.title}</strong>
+                        <code>{formatStatus(bridge.categoryKey)} / {formatStatus(bridge.bridgeKind)}</code>
+                        <code>score {bridge.score.toFixed(2)} / confidence {bridge.confidence.toFixed(2)} / {formatStatus(bridge.recentContactState)}</code>
+                        <code>{bridge.reason}</code>
+                      </li>
+                    )) : <li>No fitting relational bridge is grounded enough yet.</li>}</ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {livedMomentSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Context anchors</h2><p>What the read is grounding itself in right now.</p></div>
+                  <div className="saved-state">
+                    <h3>Place and movement</h3>
+                    {livedMomentSnapshot.matchedPlace ? (
+                      <ul>
+                        <li><strong>{livedMomentSnapshot.matchedPlace.label}</strong><code>{livedMomentSnapshot.matchedPlace.placeKind} / {livedMomentSnapshot.matchedPlace.meaningKind}</code><code>significance {livedMomentSnapshot.matchedPlace.significanceScore.toFixed(2)} / protected {livedMomentSnapshot.matchedPlace.isProtected ? "yes" : "no"}</code></li>
+                      </ul>
+                    ) : (
+                      <ul><li>No named place is currently matched.</li></ul>
+                    )}
+                    {livedMomentSnapshot.latestLocationEvent ? <code>latest location {formatDateTime(livedMomentSnapshot.latestLocationEvent.occurredAt)} / {livedMomentSnapshot.latestLocationEvent.movementState}</code> : <code>No recent location event.</code>}
+                    {livedMomentSnapshot.activeVisit ? <code>active visit {formatDuration(livedMomentSnapshot.activeVisit.durationSeconds)} / confidence {livedMomentSnapshot.activeVisit.confidence.toFixed(2)}</code> : <code>No open visit right now.</code>}
+                    {livedMomentSnapshot.repeatedPlace ? <code>repeated place {livedMomentSnapshot.repeatedPlace.label} / {livedMomentSnapshot.repeatedPlace.visitCount} visits / avg {formatDuration(livedMomentSnapshot.repeatedPlace.averageDurationSeconds)}</code> : null}
+                  </div>
+                  <div className="saved-state">
+                    <h3>Detector pressure</h3>
+                    <ul>{livedMomentSnapshot.detectorPressures.length ? livedMomentSnapshot.detectorPressures.slice(0, 6).map((pressure) => (
+                      <li key={pressure.detectorType}>
+                        <strong>{formatStatus(pressure.detectorType)}</strong>
+                        <code>strength {pressure.totalStrength.toFixed(2)} / confidence {pressure.averageConfidence.toFixed(2)} / samples {pressure.sampleCount}</code>
+                        <code>{pressure.summary}</code>
+                      </li>
+                    )) : <li>No detector pressure yet.</li>}</ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {livedMomentSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Related memories</h2><p>The manual or interpreted truths most relevant to the current moment.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.relatedMemories.length ? livedMomentSnapshot.relatedMemories.map((memory) => (
+                      <li key={memory.memoryItemId}>
+                        <strong>{memory.memoryType}</strong>
+                        <code>{memory.summary}</code>
+                        <code>relevance {memory.relevanceScore.toFixed(2)} / confidence {memory.confidence.toFixed(2)} / salience {memory.salience.toFixed(2)}</code>
+                        <code>sensitivity {memory.sensitivity}{memory.currentStatus ? ` / status ${memory.currentStatus}` : ""}{memory.phaseShiftState ? ` / phase ${memory.phaseShiftState}` : ""}</code>
+                      </li>
+                    )) : <li>No interpreted memories are strongly tied to this moment yet.</li>}</ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Recent saved moments</h2><p>The nearby judgment history the current read can lean on.</p></div>
+                  <div className="saved-state">
+                    <ul>{livedMomentSnapshot.recentSavedMoments.length ? livedMomentSnapshot.recentSavedMoments.map((moment) => (
+                      <li key={moment.id}>
+                        <strong>{moment.momentKind}</strong>
+                        <code>{moment.inferredSignificance}</code>
+                        <code>{formatDateTime(moment.createdAt)} / confidence {moment.confidence.toFixed(2)} / action {moment.actionTaken}</code>
+                      </li>
+                    )) : <li>No recent saved moments yet.</li>}</ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+          </div>
         ) : null}
       </div>
     );
@@ -5158,10 +5650,58 @@ async function playNorthStarReplyOverPeer(base64: string) {
             <div><dt>Call-ready moments</dt><dd>{callReadyMomentCount}</dd></div>
             <div><dt>Call requests</dt><dd>{settings.callRequestsEnabled ? "Enabled" : "Disabled"}</dd></div>
             <div><dt>Call threshold</dt><dd>{settings.callConfidenceThreshold.toFixed(2)}</dd></div>
+            <div><dt>Drafted outreach</dt><dd>{draftedOutreachEvents.length}</dd></div>
           </dl>
           <div className="actions">
             <button type="button" onClick={() => void handleRunDecisions()} disabled={busyPanel === "decisions" || loading}>{busyPanel === "decisions" ? "Evaluating..." : "Run decision pass"}</button>
             <button type="button" className="ghost" onClick={() => void handleRunCallRequestDecisions()} disabled={busyPanel === "callDecisions" || loading}>{busyPanel === "callDecisions" ? "Evaluating calls..." : "Run call request pass"}</button>
+            <button type="button" className="ghost" onClick={() => void handleDispatchNextDraftedOutreach()} disabled={busyPanel === "draftDispatch" || !draftedOutreachEvents.length}>
+              {busyPanel === "draftDispatch" ? "Dispatching..." : "Dispatch next draft"}
+            </button>
+            <button type="button" className="ghost" onClick={() => void handleAutoDispatchEligibleOutreach()} disabled={busyPanel === "draftDispatch" || !draftedOutreachEvents.length}>
+              {busyPanel === "draftDispatch" ? "Sending..." : "Auto-send safe draft"}
+            </button>
+          </div>
+          <div className="saved-state">
+            <h3>Draft dispatch queue</h3>
+            <ul>
+              {draftedOutreachEvents.length ? draftedOutreachEvents.map((event) => {
+                const metadata = parseJsonObject(event.deliveryMetadataJson);
+                const autoDispatchAssessment = autoDispatchAssessmentForEvent(event.id, decisionSnapshot);
+                return (
+                  <li key={event.id}>
+                    <strong>{formatStatus(event.outreachKind)}</strong>
+                    <code>{event.reasonSummary}</code>
+                    <code>{event.messageText}</code>
+                    <code>{autoDispatchAssessment.reason}</code>
+                    {metadata?.structuredDraft && typeof metadata.structuredDraft === "string" ? (
+                      <code>Structured draft: {metadata.structuredDraft}</code>
+                    ) : null}
+                    <button
+                      type="button"
+                      className="ghost"
+                      onClick={() => void handleDispatchDraftedOutreach(event.id)}
+                      disabled={busyPanel === "draftDispatch"}
+                    >
+                      {busyPanel === "draftDispatch" ? "Dispatching..." : "Dispatch through North Star"}
+                    </button>
+                  </li>
+                );
+              }) : <li>No drafted outreach is waiting right now.</li>}
+            </ul>
+            {lastDraftDispatch ? (
+              <code>
+                Last send: {formatStatus(lastDraftDispatch.outreachEvent.outreachKind)} via {formatStatus(lastDraftDispatch.channel)}.
+                {" "}Payload: {lastDraftDispatch.dispatchedPayload}
+              </code>
+            ) : null}
+            {lastAutoDispatch && !lastAutoDispatch.dispatched ? <code>{lastAutoDispatch.detail}</code> : null}
+            {lastAutoDispatch?.heldOutreachEvent && lastAutoDispatch.eligibilityReason ? (
+              <code>
+                Kept in queue: {formatStatus(lastAutoDispatch.heldOutreachEvent.outreachKind)}.
+                {" "}{lastAutoDispatch.eligibilityReason}
+              </code>
+            ) : null}
           </div>
         </section>
 
@@ -5304,20 +5844,71 @@ async function playNorthStarReplyOverPeer(base64: string) {
         <div className="grid two-up">
           <section className="panel">
             <div className="panel-header"><h2>Decision history</h2><p>What was promoted, what was suppressed, and why.</p></div>
-            <div className="saved-state"><ul>{decisionSnapshot?.decisions.length ? decisionSnapshot.decisions.map((decision) => <li key={decision.id}><button type="button" className={`memory-item-button ${selectedDecision?.id === decision.id ? "active" : ""}`} onClick={() => setSelectedDecisionId(decision.id)}><strong>{decision.decisionKind}</strong><code>moment {decision.savedMomentId}</code><code>{decision.reasonSummary}</code></button></li>) : <li>No message or call-request decisions yet.</li>}</ul></div>
+            <div className="saved-state"><ul>{decisionSnapshot?.decisions.length ? decisionSnapshot.decisions.map((decision) => {
+              const explainability = decisionExplainability(decision.decisionMetadataJson);
+              const summary = decisionSummaryText(decision, explainability);
+              return (
+                <li key={decision.id}>
+                  <button type="button" className={`memory-item-button ${selectedDecision?.id === decision.id ? "active" : ""}`} onClick={() => setSelectedDecisionId(decision.id)}>
+                    <strong>{decisionKindLabel(decision.decisionKind)}</strong>
+                    <code>moment {decision.savedMomentId}</code>
+                    {explainability.pillar ? <code>{explainabilityLabel(explainability.pillar)}</code> : null}
+                    {explainability.recommendedContactMode ? <code>{explainabilityLabel(explainability.recommendedContactMode)}</code> : null}
+                    <code>{summary}</code>
+                  </button>
+                </li>
+              );
+            }) : <li>No message or call-request decisions yet.</li>}</ul></div>
           </section>
           <section className="panel">
             <div className="panel-header"><h2>Selected decision</h2><p>Why the system stayed silent or moved toward outreach.</p></div>
             {selectedDecision ? (
               <div className="saved-state">
-                <h3>{selectedDecision.decisionKind}</h3>
-                <p className="memory-detail-lead">{selectedDecision.reasonSummary}</p>
+                <h3>{decisionKindLabel(selectedDecision.decisionKind)}</h3>
+                <p className="memory-detail-lead">{decisionSummaryText(selectedDecision, selectedDecisionExplainability ?? decisionExplainability(selectedDecision.decisionMetadataJson))}</p>
                 <code>moment {selectedDecision.savedMomentId} / decided {formatDateTime(selectedDecision.decidedAt)}</code>
+                {selectedDecisionExplainability ? (
+                  <>
+                    <dl className="facts">
+                      <div><dt>Pillar</dt><dd>{explainabilityLabel(selectedDecisionExplainability.pillar)}</dd></div>
+                      <div><dt>Moment read</dt><dd>{explainabilityLabel(selectedDecisionExplainability.primaryAssessment)}</dd></div>
+                      <div><dt>Signal</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedSignal)}</dd></div>
+                      <div><dt>Contact mode</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedContactMode)}</dd></div>
+                      <div><dt>Escalation path</dt><dd>{explainabilityLabel(selectedDecisionExplainability.escalationStage)}</dd></div>
+                      <div><dt>Decision context</dt><dd>{explainabilityLabel(selectedDecisionExplainability.kind)}</dd></div>
+                    </dl>
+                    <div className="saved-state">
+                      <h3>Why this happened</h3>
+                      {selectedDecisionExplainability.topOpportunity ? <code>Opportunity in play: {explainabilityLabel(selectedDecisionExplainability.topOpportunity)}</code> : null}
+                      {selectedDecisionExplainability.topSafeguard ? <code>Safeguard in play: {explainabilityLabel(selectedDecisionExplainability.topSafeguard)}</code> : null}
+                      {selectedDecisionExplainability.topSituationalSignal ? <code>Situational signal in play: {explainabilityLabel(selectedDecisionExplainability.topSituationalSignal)}</code> : null}
+                      {selectedDecisionExplainability.topRelationalBridge ? <code>Relational bridge in play: {selectedDecisionExplainability.topRelationalBridge}</code> : null}
+                      {selectedDecisionExplainability.recentContactSummary ? <code>{selectedDecisionExplainability.recentContactSummary}</code> : null}
+                      {selectedDecisionExplainability.adjustedConfidence != null ? (
+                        <code>
+                          adjusted confidence {selectedDecisionExplainability.adjustedConfidence.toFixed(2)}
+                          {selectedDecisionExplainability.threshold != null ? ` / threshold ${selectedDecisionExplainability.threshold.toFixed(2)}` : ""}
+                          {selectedDecisionExplainability.feedbackBias != null ? ` / feedback bias ${selectedDecisionExplainability.feedbackBias.toFixed(2)}` : ""}
+                          {selectedDecisionExplainability.livedMomentBias != null ? ` / lived-moment bias ${selectedDecisionExplainability.livedMomentBias.toFixed(2)}` : ""}
+                        </code>
+                      ) : null}
+                      {selectedDecisionExplainability.minutesSinceLastOutreach != null ? (
+                        <code>
+                          last outreach {selectedDecisionExplainability.minutesSinceLastOutreach} minutes ago
+                          {selectedDecisionExplainability.cooldownMinutes != null ? ` / cooldown ${selectedDecisionExplainability.cooldownMinutes} minutes` : ""}
+                        </code>
+                      ) : null}
+                    </div>
+                  </>
+                ) : null}
                 <code>{prettyJson(selectedDecision.decisionMetadataJson)}</code>
                 {selectedDecisionOutreach ? (
                   <>
                     <p className="memory-explanation"><strong>Created outreach:</strong> {selectedDecisionOutreach.outreachKind} / {selectedDecisionOutreach.responseState}</p>
                     <code>{selectedDecisionOutreach.messageText}</code>
+                    {selectedDecisionOutreachMetadata?.structuredDraft && typeof selectedDecisionOutreachMetadata.structuredDraft === "string" ? (
+                      <code>Structured draft: {selectedDecisionOutreachMetadata.structuredDraft}</code>
+                    ) : null}
                   </>
                 ) : null}
               </div>

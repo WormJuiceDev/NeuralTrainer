@@ -494,6 +494,121 @@ export type PhaseThreeSnapshot = {
   rhythmBaseline: RhythmBaselineEntry[];
 };
 
+export type LivedMomentMemoryInfluence = {
+  memoryItemId: number;
+  memoryKey: string;
+  memoryType: string;
+  summary: string;
+  confidence: number;
+  salience: number;
+  relevanceScore: number;
+  sensitivity: string;
+  currentStatus: string | null;
+  phaseShiftState: string | null;
+  phaseShiftScore: number | null;
+};
+
+export type LivedMomentDetectorPressure = {
+  detectorType: string;
+  totalStrength: number;
+  averageConfidence: number;
+  sampleCount: number;
+  summary: string;
+};
+
+export type LivedMomentAssessment = {
+  kind: string;
+  score: number;
+  confidence: number;
+  summary: string;
+  evidence: string[];
+};
+
+export type LivedMomentSignal = {
+  kind: string;
+  score: number;
+  confidence: number;
+  reason: string;
+};
+
+export type LivedMomentOpportunity = {
+  kind: string;
+  score: number;
+  confidence: number;
+  timing: string;
+  summary: string;
+};
+
+export type LivedMomentSafeguard = {
+  kind: string;
+  score: number;
+  confidence: number;
+  urgency: string;
+  summary: string;
+};
+
+export type LivedMomentSituationalSignal = {
+  kind: string;
+  score: number;
+  confidence: number;
+  direction: string;
+  summary: string;
+};
+
+export type LivedMomentRelationalBridge = {
+  title: string;
+  categoryKey: string;
+  score: number;
+  confidence: number;
+  bridgeKind: string;
+  recentContactState: string;
+  reason: string;
+};
+
+export type LivedMomentContactRhythmOption = {
+  level: string;
+  score: number;
+  confidence: number;
+  reason: string;
+};
+
+export type LivedMomentSnapshot = {
+  capturedAt: string;
+  timezone: string;
+  localTime: string;
+  localDate: string;
+  localDayOfWeek: string;
+  timeBucket: string;
+  isLikelySleepWindow: boolean;
+  rhythmState: string;
+  rhythmConfidence: number;
+  latestLocationEvent: RawLocationEvent | null;
+  activeVisit: PlaceVisit | null;
+  matchedPlace: Place | null;
+  repeatedPlace: RepeatedPlaceSummary | null;
+  recentSavedMoments: SavedMoment[];
+  relatedMemories: LivedMomentMemoryInfluence[];
+  detectorPressures: LivedMomentDetectorPressure[];
+  dominantPhaseShiftState: string;
+  dominantPhaseShiftScore: number;
+  dominantPhaseShiftSummary: string;
+  assessments: LivedMomentAssessment[];
+  actionableSignals: LivedMomentSignal[];
+  opportunities: LivedMomentOpportunity[];
+  safeguards: LivedMomentSafeguard[];
+  situationalSignals: LivedMomentSituationalSignal[];
+  relationalBridges: LivedMomentRelationalBridge[];
+  contactRhythmOptions: LivedMomentContactRhythmOption[];
+  primaryAssessment: string;
+  recommendedSignal: string;
+  contactRhythmHint: string;
+  recommendedContactMode: string;
+  recentContactLoad: number;
+  recentContactSummary: string;
+  actionBias: string;
+  summary: string;
+};
+
 export type OutreachEvent = {
   id: number;
   createdAt: string;
@@ -628,6 +743,21 @@ export type SimulationSuiteResult = {
   passedCount: number;
   totalCount: number;
   summary: string;
+};
+
+export type DraftedOutreachDispatchResult = {
+  outreachEvent: OutreachEvent;
+  dispatchedPayload: string;
+  channel: string;
+  northStarDetail: string;
+};
+
+export type DraftedOutreachAutoDispatchResult = {
+  dispatched: boolean;
+  dispatch: DraftedOutreachDispatchResult | null;
+  detail: string;
+  heldOutreachEvent: OutreachEvent | null;
+  eligibilityReason: string | null;
 };
 
 export type OutreachFeedback = {

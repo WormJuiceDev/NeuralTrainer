@@ -17,8 +17,11 @@ import type {
   EndCallSessionInput,
   DecisionRunResult,
   DecisionSnapshot,
+  DraftedOutreachAutoDispatchResult,
   DiagnosticStatus,
+  DraftedOutreachDispatchResult,
   LocationEventInput,
+  LivedMomentSnapshot,
   ManualReflection,
   MemoryGrowthSnapshot,
   MemorySystemSnapshot,
@@ -110,6 +113,15 @@ export const sendNorthStarMessage = (text: string) =>
 
 export const sendNorthStarCallRequest = (note: string) =>
   invoke<NorthStarSnapshot>("send_north_star_call_request", { note });
+
+export const dispatchDraftedOutreach = (outreachEventId: number) =>
+  invoke<DraftedOutreachDispatchResult>("dispatch_drafted_outreach", { outreachEventId });
+
+export const dispatchNextDraftedOutreach = () =>
+  invoke<DraftedOutreachAutoDispatchResult>("dispatch_next_drafted_outreach");
+
+export const autoDispatchEligibleOutreach = () =>
+  invoke<DraftedOutreachAutoDispatchResult>("auto_dispatch_eligible_outreach");
 
 export const pullNorthStarLocationEvents = () =>
   invoke<NorthStarSnapshot>("pull_north_star_location_events");
@@ -257,6 +269,9 @@ export const getPassiveContextSnapshot = () =>
 
 export const getPhaseThreeSnapshot = () =>
   invoke<PhaseThreeSnapshot>("get_phase_three_snapshot");
+
+export const getLivedMomentSnapshot = () =>
+  invoke<LivedMomentSnapshot>("get_lived_moment_snapshot");
 
 export const runMessageDecisions = () =>
   invoke<DecisionRunResult>("run_message_decisions");

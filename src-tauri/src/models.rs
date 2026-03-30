@@ -503,6 +503,141 @@ pub struct PhaseThreeSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LivedMomentMemoryInfluence {
+  pub memory_item_id: i64,
+  pub memory_key: String,
+  pub memory_type: String,
+  pub summary: String,
+  pub confidence: f64,
+  pub salience: f64,
+  pub relevance_score: f64,
+  pub sensitivity: String,
+  pub current_status: Option<String>,
+  pub phase_shift_state: Option<String>,
+  pub phase_shift_score: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentDetectorPressure {
+  pub detector_type: String,
+  pub total_strength: f64,
+  pub average_confidence: f64,
+  pub sample_count: usize,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentAssessment {
+  pub kind: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub summary: String,
+  pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentSignal {
+  pub kind: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentOpportunity {
+  pub kind: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub timing: String,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentSafeguard {
+  pub kind: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub urgency: String,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentSituationalSignal {
+  pub kind: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub direction: String,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentRelationalBridge {
+  pub title: String,
+  pub category_key: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub bridge_kind: String,
+  pub recent_contact_state: String,
+  pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentContactRhythmOption {
+  pub level: String,
+  pub score: f64,
+  pub confidence: f64,
+  pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LivedMomentSnapshot {
+  pub captured_at: String,
+  pub timezone: String,
+  pub local_time: String,
+  pub local_date: String,
+  pub local_day_of_week: String,
+  pub time_bucket: String,
+  pub is_likely_sleep_window: bool,
+  pub rhythm_state: String,
+  pub rhythm_confidence: f64,
+  pub latest_location_event: Option<RawLocationEvent>,
+  pub active_visit: Option<PlaceVisit>,
+  pub matched_place: Option<Place>,
+  pub repeated_place: Option<RepeatedPlaceSummary>,
+  pub recent_saved_moments: Vec<SavedMoment>,
+  pub related_memories: Vec<LivedMomentMemoryInfluence>,
+  pub detector_pressures: Vec<LivedMomentDetectorPressure>,
+  pub dominant_phase_shift_state: String,
+  pub dominant_phase_shift_score: f64,
+  pub dominant_phase_shift_summary: String,
+  pub assessments: Vec<LivedMomentAssessment>,
+  pub actionable_signals: Vec<LivedMomentSignal>,
+  pub opportunities: Vec<LivedMomentOpportunity>,
+  pub safeguards: Vec<LivedMomentSafeguard>,
+  pub situational_signals: Vec<LivedMomentSituationalSignal>,
+  pub relational_bridges: Vec<LivedMomentRelationalBridge>,
+  pub contact_rhythm_options: Vec<LivedMomentContactRhythmOption>,
+  pub primary_assessment: String,
+  pub recommended_signal: String,
+  pub contact_rhythm_hint: String,
+  pub recommended_contact_mode: String,
+  pub recent_contact_load: f64,
+  pub recent_contact_summary: String,
+  pub action_bias: String,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutreachEvent {
   pub id: i64,
   pub created_at: String,
@@ -681,6 +816,25 @@ pub struct SimulationSuiteResult {
   pub passed_count: usize,
   pub total_count: usize,
   pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftedOutreachDispatchResult {
+  pub outreach_event: OutreachEvent,
+  pub dispatched_payload: String,
+  pub channel: String,
+  pub north_star_detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DraftedOutreachAutoDispatchResult {
+  pub dispatched: bool,
+  pub dispatch: Option<DraftedOutreachDispatchResult>,
+  pub detail: String,
+  pub held_outreach_event: Option<OutreachEvent>,
+  pub eligibility_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

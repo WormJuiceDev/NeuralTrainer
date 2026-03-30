@@ -7,8 +7,8 @@ use crate::{
   models::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSnapshot, CompanionHomeSnapshot, CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput,
-    DecisionRunResult, DecisionSnapshot, EndCallSessionInput, LocationEventInput, ManualReflection,
-    MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
+    DecisionRunResult, DecisionSnapshot, DraftedOutreachAutoDispatchResult, DraftedOutreachDispatchResult, EndCallSessionInput, LocationEventInput, ManualReflection,
+    LivedMomentSnapshot, MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
     NorthStarRuntimeSnapshot, SimulationSuiteResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateCompanionContextEntryInput, UpdateMemoryItemInput,
@@ -255,6 +255,102 @@ pub fn send_north_star_call_request(
   let snapshot = north_star::send_call_request(&settings, &note)?;
   state.push_event("Sent a North Star call request from the desktop.");
   Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn dispatch_drafted_outreach(
+  state: State<'_, AppState>,
+  outreach_event_id: i64,
+) -> Result<DraftedOutreachDispatchResult, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let (outreach, payload, detail) =
+    db::build_dispatch_payload_for_outreach(&state.db_path, outreach_event_id)?;
+
+  match outreach.outreach_kind.as_str() {
+    "call_request" => {
+      north_star::send_call_request(&settings, &payload)?;
+    }
+    _ => {
+      north_star::send_desktop_message(&settings, &payload)?;
+    }
+  }
+
+  let updated_outreach =
+    db::mark_outreach_event_dispatched(&state.db_path, outreach_event_id, &payload, &detail)?;
+  state.push_event(format!(
+    "Dispatched drafted {} {} through North Star.",
+    updated_outreach.channel, updated_outreach.outreach_kind
+  ));
+
+  Ok(DraftedOutreachDispatchResult {
+    outreach_event: updated_outreach,
+    dispatched_payload: payload,
+    channel: "north_star".into(),
+    north_star_detail: detail,
+  })
+}
+
+#[tauri::command]
+pub fn dispatch_next_drafted_outreach(
+  state: State<'_, AppState>,
+) -> Result<DraftedOutreachAutoDispatchResult, AppError> {
+  let next = db::next_drafted_outreach_event(&state.db_path)?;
+  let Some(outreach) = next else {
+    return Ok(DraftedOutreachAutoDispatchResult {
+      dispatched: false,
+      dispatch: None,
+      detail: "No drafted outreach is waiting to dispatch.".into(),
+      held_outreach_event: None,
+      eligibility_reason: None,
+    });
+  };
+
+  let dispatch = dispatch_drafted_outreach(state, outreach.id)?;
+  Ok(DraftedOutreachAutoDispatchResult {
+    dispatched: true,
+    detail: dispatch.north_star_detail.clone(),
+    dispatch: Some(dispatch),
+    held_outreach_event: None,
+    eligibility_reason: None,
+  })
+}
+
+#[tauri::command]
+pub fn auto_dispatch_eligible_outreach(
+  state: State<'_, AppState>,
+) -> Result<DraftedOutreachAutoDispatchResult, AppError> {
+  let drafted = db::drafted_outreach_events(&state.db_path)?;
+  if drafted.is_empty() {
+    return Ok(DraftedOutreachAutoDispatchResult {
+      dispatched: false,
+      dispatch: None,
+      detail: "No drafted outreach is waiting to send automatically.".into(),
+      held_outreach_event: None,
+      eligibility_reason: None,
+    });
+  }
+
+  let (candidate, held, reason) = db::next_auto_dispatchable_outreach_event(&state.db_path)?;
+  if let Some(outreach) = candidate {
+    let dispatch = dispatch_drafted_outreach(state, outreach.id)?;
+    return Ok(DraftedOutreachAutoDispatchResult {
+      dispatched: true,
+      detail: format!("Sent the next low-friction draft automatically. {}", dispatch.north_star_detail),
+      dispatch: Some(dispatch),
+      held_outreach_event: None,
+      eligibility_reason: None,
+    });
+  }
+
+  Ok(DraftedOutreachAutoDispatchResult {
+    dispatched: false,
+    dispatch: None,
+    detail: reason
+      .clone()
+      .unwrap_or_else(|| "No drafted outreach was ready to send automatically.".into()),
+    held_outreach_event: held,
+    eligibility_reason: reason,
+  })
 }
 
 #[tauri::command]
@@ -1092,6 +1188,14 @@ pub fn get_phase_three_snapshot(
   state: State<'_, AppState>,
 ) -> Result<PhaseThreeSnapshot, AppError> {
   db::phase_three_snapshot(&state.db_path)
+}
+
+#[tauri::command]
+pub fn get_lived_moment_snapshot(
+  state: State<'_, AppState>,
+) -> Result<LivedMomentSnapshot, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  db::lived_moment_snapshot(&state.db_path, &settings.timezone)
 }
 
 #[tauri::command]
