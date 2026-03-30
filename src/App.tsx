@@ -92,6 +92,7 @@ import {
 } from "./tauri";
 import type {
   AppSettings,
+  CallSession,
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
@@ -892,22 +893,28 @@ function autoDispatchAssessmentForEvent(eventId: number, snapshot: DecisionSnaps
   const decision = snapshot?.decisions.find((item) => item.createdOutreachEventId === eventId);
   const explainability = decision ? decisionExplainability(decision.decisionMetadataJson) : null;
   const mode = explainability?.recommendedContactMode;
+  const basisParts = [
+    explainability?.primaryAssessment ? explainabilityLabel(explainability.primaryAssessment) : null,
+    explainability?.recommendedSignal ? explainabilityLabel(explainability.recommendedSignal) : null,
+    explainability?.recommendedContactMode ? explainabilityLabel(explainability.recommendedContactMode) : null,
+  ].filter((value): value is string => Boolean(value));
+  const basis = basisParts.length ? `Basis: ${basisParts.join(" / ")}.` : "Basis: not enough lived-moment context was attached.";
 
   switch (mode) {
     case "send_light_message":
-      return { eligible: true, reason: "Ready to auto-send as a light message." };
+      return { eligible: true, reason: "Ready to auto-send as a light message.", basis };
     case "make_soft_suggestion":
-      return { eligible: true, reason: "Ready to auto-send as a soft suggestion." };
+      return { eligible: true, reason: "Ready to auto-send as a soft suggestion.", basis };
     case "send_warning":
-      return { eligible: true, reason: "Ready to auto-send as a timely warning." };
+      return { eligible: true, reason: "Ready to auto-send as a timely warning.", basis };
     case "suggest_human_contact":
-      return { eligible: false, reason: "Keeping this as a manual send because it points toward human contact." };
+      return { eligible: false, reason: "Keeping this as a manual send because it points toward human contact.", basis };
     case "escalate_to_call":
-      return { eligible: false, reason: "Keeping this as a manual send because it feels closer to a live call." };
+      return { eligible: false, reason: "Keeping this as a manual send because it feels closer to a live call.", basis };
     case "stay_silent":
-      return { eligible: false, reason: "Not auto-sending because this moment still leans quiet." };
+      return { eligible: false, reason: "Not auto-sending because this moment still leans quiet.", basis };
     default:
-      return { eligible: false, reason: "Keeping this as a manual send for now." };
+      return { eligible: false, reason: "Keeping this as a manual send for now.", basis };
   }
 }
 
@@ -939,9 +946,9 @@ function explainabilityLabel(kind: string | null | undefined) {
     case "connective":
       return "Connective";
     case "opportunity-rich":
-      return "Opportunity-rich";
+      return "Open opportunity";
     case "transition-heavy":
-      return "Transition-heavy";
+      return "Transition threshold";
     case "enrich_this_moment":
       return "Enrich this moment";
     case "surface_this_opening":
@@ -1024,6 +1031,171 @@ function decisionSummaryText(decision: DecisionSnapshot["decisions"][number], ex
     return "The system stayed quiet because the recent contact cooldown was still active.";
   }
   return decision.reasonSummary;
+}
+
+function outreachKindLabel(kind: string) {
+  switch (kind) {
+    case "message":
+      return "Message";
+    case "call_request":
+      return "Live call";
+    default:
+      return formatStatus(kind);
+  }
+}
+
+function outreachStateLabel(state: string) {
+  switch (state) {
+    case "drafted":
+      return "In queue";
+    case "sent":
+      return "Sent";
+    case "accepted":
+      return "Accepted";
+    case "declined":
+      return "Declined";
+    case "replied":
+      return "Replied";
+    case "call_started":
+      return "Call started";
+    case "completed":
+      return "Completed";
+    case "interrupted":
+      return "Interrupted";
+    case "missed":
+      return "Missed";
+    default:
+      return formatStatus(state);
+  }
+}
+
+function livedMomentMetaLabel(value: string) {
+  switch (value) {
+    case "settled":
+      return "Settled";
+    case "off_rhythm":
+      return "Off rhythm";
+    case "emerging":
+      return "Emerging";
+    case "quiet":
+      return "Quiet";
+    case "light":
+      return "Light";
+    case "gentle":
+      return "Gentle";
+    case "protective":
+      return "Protective";
+    case "urgent":
+      return "Urgent";
+    case "enrich":
+      return "Enrich";
+    case "protect":
+      return "Protect";
+    case "connect":
+      return "Connect";
+    case "orient":
+      return "Orient";
+    case "wait":
+      return "Wait";
+    case "rising":
+      return "Rising";
+    case "stable":
+      return "Stable";
+    case "fading":
+      return "Fading";
+    case "immediate":
+      return "Immediate";
+    case "near_term":
+      return "Near term";
+    case "ambient":
+      return "Ambient";
+    case "low":
+      return "Low";
+    case "medium":
+      return "Medium";
+    case "high":
+      return "High";
+    case "recent":
+      return "Recent";
+    case "cooling":
+      return "Cooling";
+    case "dormant":
+      return "Dormant";
+    default:
+      return explainabilityLabel(value);
+  }
+}
+
+function callHandoffLabel(value: string) {
+  switch (value) {
+    case "north_star_companion":
+      return "North Star companion call";
+    case "accepted_handoff":
+      return "Accepted North Star handoff";
+    default:
+      return formatStatus(value);
+  }
+}
+
+function callSessionStateLabel(value: string) {
+  switch (value) {
+    case "starting":
+      return "Starting";
+    case "active":
+      return "Active";
+    case "ended":
+      return "Ended";
+    default:
+      return formatStatus(value);
+  }
+}
+
+function callOutcomeLabel(value: string) {
+  switch (value) {
+    case "pending":
+      return "Call underway";
+    case "completed":
+      return "Completed";
+    case "interrupted":
+      return "Interrupted";
+    case "missed":
+      return "Missed";
+    case "declined":
+      return "Declined";
+    default:
+      return formatStatus(value);
+  }
+}
+
+function callFlowSummary(session: CallSession) {
+  if (session.sessionState === "active" || session.outcome === "pending") {
+    return "The call is currently underway.";
+  }
+  switch (session.outcome) {
+    case "completed":
+      return "The call ran to completion and kept a grounded summary.";
+    case "interrupted":
+      return "The call began but did not finish cleanly.";
+    case "missed":
+      return "The live check-in did not fully connect.";
+    case "declined":
+      return "The live check-in was declined.";
+    default:
+      return "The call path was created and tracked here.";
+  }
+}
+
+function durationLabel(seconds: number) {
+  return seconds > 0 ? formatDuration(seconds) : "No duration recorded yet";
+}
+
+function simulationDraftPreviewLabel(scenarioKey: string, preview: string | null) {
+  if (!preview) return null;
+  if (scenarioKey === "accepted_call_request_starts_session") {
+    const [handoff, state] = preview.split("/").map((part) => part.trim());
+    return `${callHandoffLabel(handoff)} / ${callSessionStateLabel(state)}`;
+  }
+  return preview;
 }
 
 function describeMemorySource(item: MemoryItem) {
@@ -1607,9 +1779,10 @@ const CallHistoryPanel = memo(function CallHistoryPanel({
         <ul>
           {sessions.length ? sessions.map((session) => (
             <li key={session.id}>
-              <strong>{session.handoffKind} / {session.outcome}</strong>
-              <code>session {session.id} / {session.sessionState}</code>
-              <code>{session.durationSeconds > 0 ? formatDuration(session.durationSeconds) : "not timed yet"}</code>
+              <strong>{callHandoffLabel(session.handoffKind)} / {callOutcomeLabel(session.outcome)}</strong>
+              <code>session {session.id} / {callSessionStateLabel(session.sessionState)}</code>
+              <code>{durationLabel(session.durationSeconds)}</code>
+              <code>{callFlowSummary(session)}</code>
               {session.transcriptSummary ? <code>{session.transcriptSummary}</code> : null}
             </li>
           )) : <li>No call sessions yet.</li>}
@@ -5339,12 +5512,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
               {livedMomentSnapshot ? (
                 <>
                   <dl className="facts">
-                    <div><dt>Primary read</dt><dd>{formatStatus(livedMomentSnapshot.primaryAssessment)}</dd></div>
-                    <div><dt>Recommended signal</dt><dd>{formatStatus(livedMomentSnapshot.recommendedSignal)}</dd></div>
-                    <div><dt>Contact rhythm</dt><dd>{formatStatus(livedMomentSnapshot.contactRhythmHint)}</dd></div>
-                    <div><dt>Recommended contact mode</dt><dd>{formatStatus(livedMomentSnapshot.recommendedContactMode)}</dd></div>
-                    <div><dt>Action bias</dt><dd>{formatStatus(livedMomentSnapshot.actionBias)}</dd></div>
-                    <div><dt>Rhythm state</dt><dd>{formatStatus(livedMomentSnapshot.rhythmState)}</dd></div>
+                    <div><dt>Primary read</dt><dd>{explainabilityLabel(livedMomentSnapshot.primaryAssessment)}</dd></div>
+                    <div><dt>Recommended signal</dt><dd>{explainabilityLabel(livedMomentSnapshot.recommendedSignal)}</dd></div>
+                    <div><dt>Contact rhythm</dt><dd>{livedMomentMetaLabel(livedMomentSnapshot.contactRhythmHint)}</dd></div>
+                    <div><dt>Recommended contact mode</dt><dd>{explainabilityLabel(livedMomentSnapshot.recommendedContactMode)}</dd></div>
+                    <div><dt>Action bias</dt><dd>{livedMomentMetaLabel(livedMomentSnapshot.actionBias)}</dd></div>
+                    <div><dt>Rhythm state</dt><dd>{livedMomentMetaLabel(livedMomentSnapshot.rhythmState)}</dd></div>
                     <div><dt>Time</dt><dd>{livedMomentSnapshot.localDayOfWeek}, {livedMomentSnapshot.localTime}</dd></div>
                     <div><dt>Sleep window</dt><dd>{livedMomentSnapshot.isLikelySleepWindow ? "inside likely quiet time" : "outside likely quiet time"}</dd></div>
                     <div><dt>Recent contact load</dt><dd>{livedMomentSnapshot.recentContactLoad.toFixed(2)}</dd></div>
@@ -5352,8 +5525,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   <div className="saved-state">
                     <h3>Current read</h3>
                     <p className="memory-detail-lead">{livedMomentSnapshot.summary}</p>
-                    <code>captured {formatDateTime(livedMomentSnapshot.capturedAt)} / timezone {livedMomentSnapshot.timezone} / bucket {formatStatus(livedMomentSnapshot.timeBucket)}</code>
-                    <code>dominant phase shift {formatStatus(livedMomentSnapshot.dominantPhaseShiftState)} / score {livedMomentSnapshot.dominantPhaseShiftScore.toFixed(2)}</code>
+                    <code>captured {formatDateTime(livedMomentSnapshot.capturedAt)} / timezone {livedMomentSnapshot.timezone} / bucket {livedMomentMetaLabel(livedMomentSnapshot.timeBucket)}</code>
+                    <code>dominant phase shift {livedMomentMetaLabel(livedMomentSnapshot.dominantPhaseShiftState)} / score {livedMomentSnapshot.dominantPhaseShiftScore.toFixed(2)}</code>
                     <code>{livedMomentSnapshot.recentContactSummary}</code>
                     <code>{livedMomentSnapshot.dominantPhaseShiftSummary}</code>
                   </div>
@@ -5369,7 +5542,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     <ul>
                       {livedMomentSnapshot.assessments.length ? livedMomentSnapshot.assessments.map((assessment) => (
                         <li key={assessment.kind}>
-                          <strong>{formatStatus(assessment.kind)}</strong>
+                          <strong>{explainabilityLabel(assessment.kind)}</strong>
                           <code>score {assessment.score.toFixed(2)} / confidence {assessment.confidence.toFixed(2)}</code>
                           <code>{assessment.summary}</code>
                           {assessment.evidence.map((line, index) => <code key={`${assessment.kind}-${index}`}>{line}</code>)}
@@ -5385,7 +5558,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     <ul>
                       {livedMomentSnapshot.actionableSignals.length ? livedMomentSnapshot.actionableSignals.map((signal) => (
                         <li key={signal.kind}>
-                          <strong>{formatStatus(signal.kind)}</strong>
+                          <strong>{explainabilityLabel(signal.kind)}</strong>
                           <code>score {signal.score.toFixed(2)} / confidence {signal.confidence.toFixed(2)}</code>
                           <code>{signal.reason}</code>
                         </li>
@@ -5403,8 +5576,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   <div className="saved-state">
                     <ul>{livedMomentSnapshot.situationalSignals.length ? livedMomentSnapshot.situationalSignals.map((signal) => (
                       <li key={signal.kind}>
-                        <strong>{formatStatus(signal.kind)}</strong>
-                        <code>score {signal.score.toFixed(2)} / confidence {signal.confidence.toFixed(2)} / {formatStatus(signal.direction)}</code>
+                        <strong>{explainabilityLabel(signal.kind)}</strong>
+                        <code>score {signal.score.toFixed(2)} / confidence {signal.confidence.toFixed(2)} / {livedMomentMetaLabel(signal.direction)}</code>
                         <code>{signal.summary}</code>
                       </li>
                     )) : <li>No situational signals are strongly in play yet.</li>}</ul>
@@ -5416,8 +5589,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   <div className="saved-state">
                     <ul>{livedMomentSnapshot.opportunities.length ? livedMomentSnapshot.opportunities.map((opportunity) => (
                       <li key={opportunity.kind}>
-                        <strong>{formatStatus(opportunity.kind)}</strong>
-                        <code>score {opportunity.score.toFixed(2)} / confidence {opportunity.confidence.toFixed(2)} / timing {formatStatus(opportunity.timing)}</code>
+                        <strong>{explainabilityLabel(opportunity.kind)}</strong>
+                        <code>score {opportunity.score.toFixed(2)} / confidence {opportunity.confidence.toFixed(2)} / timing {livedMomentMetaLabel(opportunity.timing)}</code>
                         <code>{opportunity.summary}</code>
                       </li>
                     )) : <li>No meaningful opportunities are grounded enough yet.</li>}</ul>
@@ -5429,8 +5602,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   <div className="saved-state">
                     <ul>{livedMomentSnapshot.safeguards.length ? livedMomentSnapshot.safeguards.map((safeguard) => (
                       <li key={safeguard.kind}>
-                        <strong>{formatStatus(safeguard.kind)}</strong>
-                        <code>score {safeguard.score.toFixed(2)} / confidence {safeguard.confidence.toFixed(2)} / urgency {formatStatus(safeguard.urgency)}</code>
+                        <strong>{explainabilityLabel(safeguard.kind)}</strong>
+                        <code>score {safeguard.score.toFixed(2)} / confidence {safeguard.confidence.toFixed(2)} / urgency {livedMomentMetaLabel(safeguard.urgency)}</code>
                         <code>{safeguard.summary}</code>
                       </li>
                     )) : <li>No safeguards are strongly in play yet.</li>}</ul>
@@ -5446,7 +5619,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   <div className="saved-state">
                     <ul>{livedMomentSnapshot.contactRhythmOptions.length ? livedMomentSnapshot.contactRhythmOptions.map((option) => (
                       <li key={option.level}>
-                        <strong>{formatStatus(option.level)}</strong>
+                        <strong>{explainabilityLabel(option.level)}</strong>
                         <code>score {option.score.toFixed(2)} / confidence {option.confidence.toFixed(2)}</code>
                         <code>{option.reason}</code>
                       </li>
@@ -5460,8 +5633,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     <ul>{livedMomentSnapshot.relationalBridges.length ? livedMomentSnapshot.relationalBridges.map((bridge) => (
                       <li key={`${bridge.categoryKey}-${bridge.title}`}>
                         <strong>{bridge.title}</strong>
-                        <code>{formatStatus(bridge.categoryKey)} / {formatStatus(bridge.bridgeKind)}</code>
-                        <code>score {bridge.score.toFixed(2)} / confidence {bridge.confidence.toFixed(2)} / {formatStatus(bridge.recentContactState)}</code>
+                        <code>{formatStatus(bridge.categoryKey)} / {livedMomentMetaLabel(bridge.bridgeKind)}</code>
+                        <code>score {bridge.score.toFixed(2)} / confidence {bridge.confidence.toFixed(2)} / {livedMomentMetaLabel(bridge.recentContactState)}</code>
                         <code>{bridge.reason}</code>
                       </li>
                     )) : <li>No fitting relational bridge is grounded enough yet.</li>}</ul>
@@ -5619,7 +5792,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                 <li><strong>Seeded events</strong><code>{simulationResult.seededEventCount}</code></li>
                 <li><strong>Promoted / suppressed</strong><code>{simulationResult.promotedCount} / {simulationResult.suppressedCount}</code></li>
                 <li><strong>Draft count</strong><code>{simulationResult.draftCount}</code></li>
-                {simulationResult.draftPreview ? <li><strong>Draft preview</strong><code>{simulationResult.draftPreview}</code></li> : null}
+                {simulationResult.draftPreview ? <li><strong>Draft preview</strong><code>{simulationDraftPreviewLabel(simulationResult.scenarioKey, simulationResult.draftPreview) ?? simulationResult.draftPreview}</code></li> : null}
               </ul>
             </div>
           ) : null}
@@ -5670,10 +5843,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
                 const autoDispatchAssessment = autoDispatchAssessmentForEvent(event.id, decisionSnapshot);
                 return (
                   <li key={event.id}>
-                    <strong>{formatStatus(event.outreachKind)}</strong>
+                    <strong>{outreachKindLabel(event.outreachKind)}</strong>
                     <code>{event.reasonSummary}</code>
                     <code>{event.messageText}</code>
                     <code>{autoDispatchAssessment.reason}</code>
+                    <code>{autoDispatchAssessment.basis}</code>
                     {metadata?.structuredDraft && typeof metadata.structuredDraft === "string" ? (
                       <code>Structured draft: {metadata.structuredDraft}</code>
                     ) : null}
@@ -5691,14 +5865,14 @@ async function playNorthStarReplyOverPeer(base64: string) {
             </ul>
             {lastDraftDispatch ? (
               <code>
-                Last send: {formatStatus(lastDraftDispatch.outreachEvent.outreachKind)} via {formatStatus(lastDraftDispatch.channel)}.
+                Last send: {outreachKindLabel(lastDraftDispatch.outreachEvent.outreachKind)} via {formatStatus(lastDraftDispatch.channel)}.
                 {" "}Payload: {lastDraftDispatch.dispatchedPayload}
               </code>
             ) : null}
             {lastAutoDispatch && !lastAutoDispatch.dispatched ? <code>{lastAutoDispatch.detail}</code> : null}
             {lastAutoDispatch?.heldOutreachEvent && lastAutoDispatch.eligibilityReason ? (
               <code>
-                Kept in queue: {formatStatus(lastAutoDispatch.heldOutreachEvent.outreachKind)}.
+                Kept in queue: {outreachKindLabel(lastAutoDispatch.heldOutreachEvent.outreachKind)}.
                 {" "}{lastAutoDispatch.eligibilityReason}
               </code>
             ) : null}
@@ -5729,7 +5903,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
             {callSessionSnapshot?.activeSession ? (
               <div className="saved-state">
                 <h3>Active call</h3>
-                <p className="memory-detail-lead">{callSessionSnapshot.activeSession.handoffKind}</p>
+                <p className="memory-detail-lead">{callHandoffLabel(callSessionSnapshot.activeSession.handoffKind)}</p>
                 <code>started {callSessionSnapshot.activeSession.startedAt ? formatDateTime(callSessionSnapshot.activeSession.startedAt) : "just now"}</code>
                 <label><span>Call notes</span><textarea rows={3} value={callSessionNotes} onChange={(event) => setCallSessionNotes(event.target.value)} placeholder="Anything the app should keep about the handoff or tone of this call..." /></label>
                 <label><span>Short call summary</span><textarea rows={4} value={callTranscriptSummary} onChange={(event) => setCallTranscriptSummary(event.target.value)} placeholder="A short grounded summary of what the call was about..." /></label>
@@ -5870,47 +6044,67 @@ async function playNorthStarReplyOverPeer(base64: string) {
                 {selectedDecisionExplainability ? (
                   <>
                     <dl className="facts">
-                      <div><dt>Pillar</dt><dd>{explainabilityLabel(selectedDecisionExplainability.pillar)}</dd></div>
-                      <div><dt>Moment read</dt><dd>{explainabilityLabel(selectedDecisionExplainability.primaryAssessment)}</dd></div>
-                      <div><dt>Signal</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedSignal)}</dd></div>
-                      <div><dt>Contact mode</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedContactMode)}</dd></div>
-                      <div><dt>Escalation path</dt><dd>{explainabilityLabel(selectedDecisionExplainability.escalationStage)}</dd></div>
-                      <div><dt>Decision context</dt><dd>{explainabilityLabel(selectedDecisionExplainability.kind)}</dd></div>
+                      {selectedDecisionExplainability.pillar ? <div><dt>Pillar</dt><dd>{explainabilityLabel(selectedDecisionExplainability.pillar)}</dd></div> : null}
+                      {selectedDecisionExplainability.primaryAssessment ? <div><dt>Moment read</dt><dd>{explainabilityLabel(selectedDecisionExplainability.primaryAssessment)}</dd></div> : null}
+                      {selectedDecisionExplainability.recommendedSignal ? <div><dt>Signal</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedSignal)}</dd></div> : null}
+                      {selectedDecisionExplainability.recommendedContactMode ? <div><dt>Contact mode</dt><dd>{explainabilityLabel(selectedDecisionExplainability.recommendedContactMode)}</dd></div> : null}
+                      {selectedDecisionExplainability.escalationStage ? <div><dt>Escalation path</dt><dd>{explainabilityLabel(selectedDecisionExplainability.escalationStage)}</dd></div> : null}
+                      {selectedDecisionExplainability.kind ? <div><dt>Decision context</dt><dd>{explainabilityLabel(selectedDecisionExplainability.kind)}</dd></div> : null}
                     </dl>
-                    <div className="saved-state">
-                      <h3>Why this happened</h3>
-                      {selectedDecisionExplainability.topOpportunity ? <code>Opportunity in play: {explainabilityLabel(selectedDecisionExplainability.topOpportunity)}</code> : null}
-                      {selectedDecisionExplainability.topSafeguard ? <code>Safeguard in play: {explainabilityLabel(selectedDecisionExplainability.topSafeguard)}</code> : null}
-                      {selectedDecisionExplainability.topSituationalSignal ? <code>Situational signal in play: {explainabilityLabel(selectedDecisionExplainability.topSituationalSignal)}</code> : null}
-                      {selectedDecisionExplainability.topRelationalBridge ? <code>Relational bridge in play: {selectedDecisionExplainability.topRelationalBridge}</code> : null}
-                      {selectedDecisionExplainability.recentContactSummary ? <code>{selectedDecisionExplainability.recentContactSummary}</code> : null}
-                      {selectedDecisionExplainability.adjustedConfidence != null ? (
-                        <code>
-                          adjusted confidence {selectedDecisionExplainability.adjustedConfidence.toFixed(2)}
-                          {selectedDecisionExplainability.threshold != null ? ` / threshold ${selectedDecisionExplainability.threshold.toFixed(2)}` : ""}
-                          {selectedDecisionExplainability.feedbackBias != null ? ` / feedback bias ${selectedDecisionExplainability.feedbackBias.toFixed(2)}` : ""}
-                          {selectedDecisionExplainability.livedMomentBias != null ? ` / lived-moment bias ${selectedDecisionExplainability.livedMomentBias.toFixed(2)}` : ""}
-                        </code>
-                      ) : null}
-                      {selectedDecisionExplainability.minutesSinceLastOutreach != null ? (
-                        <code>
-                          last outreach {selectedDecisionExplainability.minutesSinceLastOutreach} minutes ago
-                          {selectedDecisionExplainability.cooldownMinutes != null ? ` / cooldown ${selectedDecisionExplainability.cooldownMinutes} minutes` : ""}
-                        </code>
-                      ) : null}
-                    </div>
+                    {(selectedDecisionExplainability.topOpportunity
+                      || selectedDecisionExplainability.topSafeguard
+                      || selectedDecisionExplainability.topSituationalSignal
+                      || selectedDecisionExplainability.topRelationalBridge
+                      || selectedDecisionExplainability.recentContactSummary) ? (
+                      <div className="saved-state">
+                        <h3>Why this happened</h3>
+                        {selectedDecisionExplainability.topOpportunity ? <code>Opportunity in play: {explainabilityLabel(selectedDecisionExplainability.topOpportunity)}</code> : null}
+                        {selectedDecisionExplainability.topSafeguard ? <code>Safeguard in play: {explainabilityLabel(selectedDecisionExplainability.topSafeguard)}</code> : null}
+                        {selectedDecisionExplainability.topSituationalSignal ? <code>Situational signal in play: {explainabilityLabel(selectedDecisionExplainability.topSituationalSignal)}</code> : null}
+                        {selectedDecisionExplainability.topRelationalBridge ? <code>Relational bridge in play: {selectedDecisionExplainability.topRelationalBridge}</code> : null}
+                        {selectedDecisionExplainability.recentContactSummary ? <code>{selectedDecisionExplainability.recentContactSummary}</code> : null}
+                      </div>
+                    ) : null}
+                    {(selectedDecisionExplainability.adjustedConfidence != null || selectedDecisionExplainability.minutesSinceLastOutreach != null) ? (
+                      <div className="saved-state">
+                        <h3>Decision diagnostics</h3>
+                        {selectedDecisionExplainability.adjustedConfidence != null ? (
+                          <code>
+                            adjusted confidence {selectedDecisionExplainability.adjustedConfidence.toFixed(2)}
+                            {selectedDecisionExplainability.threshold != null ? ` / threshold ${selectedDecisionExplainability.threshold.toFixed(2)}` : ""}
+                            {selectedDecisionExplainability.feedbackBias != null ? ` / feedback bias ${selectedDecisionExplainability.feedbackBias.toFixed(2)}` : ""}
+                            {selectedDecisionExplainability.livedMomentBias != null ? ` / lived-moment bias ${selectedDecisionExplainability.livedMomentBias.toFixed(2)}` : ""}
+                          </code>
+                        ) : null}
+                        {selectedDecisionExplainability.minutesSinceLastOutreach != null ? (
+                          <code>
+                            last outreach {selectedDecisionExplainability.minutesSinceLastOutreach} minutes ago
+                            {selectedDecisionExplainability.cooldownMinutes != null ? ` / cooldown ${selectedDecisionExplainability.cooldownMinutes} minutes` : ""}
+                          </code>
+                        ) : null}
+                      </div>
+                    ) : null}
                   </>
                 ) : null}
-                <code>{prettyJson(selectedDecision.decisionMetadataJson)}</code>
                 {selectedDecisionOutreach ? (
                   <>
-                    <p className="memory-explanation"><strong>Created outreach:</strong> {selectedDecisionOutreach.outreachKind} / {selectedDecisionOutreach.responseState}</p>
+                    <p className="memory-explanation"><strong>Created outreach:</strong> {outreachKindLabel(selectedDecisionOutreach.outreachKind)} / {outreachStateLabel(selectedDecisionOutreach.responseState)}</p>
                     <code>{selectedDecisionOutreach.messageText}</code>
                     {selectedDecisionOutreachMetadata?.structuredDraft && typeof selectedDecisionOutreachMetadata.structuredDraft === "string" ? (
                       <code>Structured draft: {selectedDecisionOutreachMetadata.structuredDraft}</code>
                     ) : null}
+                    {selectedDecisionOutreachMetadata?.northStarDetail && typeof selectedDecisionOutreachMetadata.northStarDetail === "string" ? (
+                      <code>Delivery note: {selectedDecisionOutreachMetadata.northStarDetail}</code>
+                    ) : null}
+                    {selectedDecisionOutreachMetadata?.callOutcome && typeof selectedDecisionOutreachMetadata.callOutcome === "string" ? (
+                      <code>Call outcome: {outreachStateLabel(selectedDecisionOutreachMetadata.callOutcome)}</code>
+                    ) : null}
                   </>
                 ) : null}
+                <div className="saved-state">
+                  <h3>Raw decision trace</h3>
+                  <code>{prettyJson(selectedDecision.decisionMetadataJson)}</code>
+                </div>
               </div>
             ) : (
               <p>No decision selected yet.</p>
@@ -5984,9 +6178,10 @@ async function playNorthStarReplyOverPeer(base64: string) {
                         className={`memory-item-button ${selectedCallSession?.id === session.id ? "active" : ""}`}
                         onClick={() => setSelectedCallSessionId(session.id)}
                       >
-                        <strong>{session.handoffKind} / {session.outcome}</strong>
-                        <code>session {session.id} / {session.sessionState}</code>
-                        <code>{session.durationSeconds > 0 ? formatDuration(session.durationSeconds) : "not timed yet"}</code>
+                        <strong>{callHandoffLabel(session.handoffKind)} / {callOutcomeLabel(session.outcome)}</strong>
+                        <code>session {session.id} / {callSessionStateLabel(session.sessionState)}</code>
+                        <code>{durationLabel(session.durationSeconds)}</code>
+                        <code>{callFlowSummary(session)}</code>
                       </button>
                     </li>
                   )) : <li>No call sessions yet.</li>}
@@ -5997,11 +6192,13 @@ async function playNorthStarReplyOverPeer(base64: string) {
               <div className="panel-header"><h2>Selected call</h2><p>See what happened, what was kept, and what could later shape memory.</p></div>
               {selectedCallSession ? (
                 <div className="saved-state">
-                  <h3>{selectedCallSession.handoffKind}</h3>
-                  <p className="memory-detail-lead">{selectedCallSession.outcome}</p>
+                  <h3>{callHandoffLabel(selectedCallSession.handoffKind)}</h3>
+                  <p className="memory-detail-lead">{callOutcomeLabel(selectedCallSession.outcome)}</p>
                   <code>session {selectedCallSession.id} / started {selectedCallSession.startedAt ? formatDateTime(selectedCallSession.startedAt) : "unknown"}</code>
+                  <code>{callSessionStateLabel(selectedCallSession.sessionState)}</code>
                   {selectedCallSession.endedAt ? <code>ended {formatDateTime(selectedCallSession.endedAt)}</code> : null}
-                  <code>{selectedCallSession.durationSeconds > 0 ? formatDuration(selectedCallSession.durationSeconds) : "not timed yet"}</code>
+                  <code>{durationLabel(selectedCallSession.durationSeconds)}</code>
+                  <code>{callFlowSummary(selectedCallSession)}</code>
                   {selectedCallSession.notes ? (
                     <>
                       <p className="memory-explanation"><strong>Call notes</strong></p>
