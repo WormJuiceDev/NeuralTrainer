@@ -23,6 +23,7 @@ import {
   createReflection,
   createRule,
   autoDispatchEligibleOutreach,
+  createNearbyInterestFilter,
   createNorthStarSession,
   clearAllLocalData,
   clearVoiceAssets,
@@ -40,6 +41,7 @@ import {
   getMemorySystemSnapshot,
   getMvpRealityCheckSnapshot,
   getLivedMomentSnapshot,
+  getRealWorldPresenceSnapshot,
   getNorthStarRuntimeSnapshot,
   getNorthStarSnapshot,
   getNorthStarRtcConfig,
@@ -71,6 +73,7 @@ import {
   sendNorthStarCallRequest,
   sendNorthStarHeartbeat,
   sendNorthStarMessage,
+  requestNorthStarLocationPulse,
   setupLocalSpeech,
   startSpeechStream,
   startNorthStarAcceptedCall,
@@ -84,6 +87,7 @@ import {
   updateCompanionContextCategoryIcon,
   updateCompanionContextEntry,
   updateMemoryItem,
+  updateNearbyInterestFilter,
   updatePlace,
   updateRule,
   getSpeechStreamSnapshot,
@@ -112,6 +116,7 @@ import type {
   EndCallSessionInput,
   LivedMomentSnapshot,
   LocationEventInput,
+  NearbyInterestFilter,
   MemoryItem,
   MemoryGrowthSnapshot,
   MemorySystemSnapshot,
@@ -124,6 +129,7 @@ import type {
   NorthStarRuntimeSnapshot,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
+  RealWorldPresenceSnapshot,
   ReorderCompanionContextEntriesInput,
   SettingsEntry,
   SimulationRunResult,
@@ -133,6 +139,7 @@ import type {
   UpdateCompanionContextEntryInput,
   UpdateCompanionContextCategoryIconInput,
   UpdateMemoryItemInput,
+  UpdateNearbyInterestFilterInput,
   UpdatePlaceInput,
   UpdateRuleInput,
   VoiceSnapshot,
@@ -143,7 +150,7 @@ type TabId = "home" | "context" | "tectonics" | "settings";
 type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
 type ContextSectionId = string;
-type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment";
+type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment" | "world";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
 type ReviewSectionId = "places" | "rules" | "moments" | "calls";
 const defaultCallTranscriptCleanupPrompt = `You are cleaning up rough speech-to-text from a live phone call. Rewrite only what the speaker most likely meant to say in plain natural language. Do not answer the question. Do not add facts that were not implied. Be conservative. If you are not highly confident, keep the original wording close to the raw transcript. Do not replace one specific noun or topic with a different specific noun or topic unless the correction is extremely obvious.
@@ -1856,6 +1863,8 @@ function App() {
   const [passiveSnapshot, setPassiveSnapshot] = useState<PassiveContextSnapshot | null>(null);
   const [phaseThreeSnapshot, setPhaseThreeSnapshot] = useState<PhaseThreeSnapshot | null>(null);
   const [livedMomentSnapshot, setLivedMomentSnapshot] = useState<LivedMomentSnapshot | null>(null);
+  const [realWorldPresenceSnapshot, setRealWorldPresenceSnapshot] = useState<RealWorldPresenceSnapshot | null>(null);
+  const [nearbyInterestFilters, setNearbyInterestFilters] = useState<NearbyInterestFilter[]>([]);
   const [decisionSnapshot, setDecisionSnapshot] = useState<DecisionSnapshot | null>(null);
   const [northStarRuntimeSnapshot, setNorthStarRuntimeSnapshot] = useState<NorthStarRuntimeProjection | null>(null);
   const [northStarConnectionsSnapshot, setNorthStarConnectionsSnapshot] = useState<NorthStarConnectionsProjection | null>(null);
@@ -1889,6 +1898,9 @@ function App() {
   const [voiceSnapshot, setVoiceSnapshot] = useState<VoiceSnapshot | null>(null);
   const [voicePreview, setVoicePreview] = useState<VoiceSynthesisResult | null>(null);
   const [voicePreviewSrc, setVoicePreviewSrc] = useState<string | null>(null);
+  const [newNearbyFilterLabel, setNewNearbyFilterLabel] = useState("");
+  const [newNearbyFilterDescription, setNewNearbyFilterDescription] = useState("");
+  const [newNearbyFilterTags, setNewNearbyFilterTags] = useState("");
   const [callTurnResult, setCallTurnResult] = useState<CallTurnResult | null>(null);
   const [selectedCallTurns, setSelectedCallTurns] = useState<CallTurnRecord[]>([]);
   const [speechStream, setSpeechStream] = useState<SpeechStreamSnapshot | null>(null);
@@ -1907,7 +1919,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarPulse" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | "worldPresence" | "nearbyInterestFilter" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [lastDraftDispatch, setLastDraftDispatch] = useState<DraftedOutreachDispatchResult | null>(null);
@@ -1919,6 +1931,7 @@ function App() {
   const northStarRtcIceServersRef = useRef<RTCIceServer[] | null>(null);
   const missingAcceptedNorthStarPollsRef = useRef(0);
   const northStarAcceptedSessionStartCallIdRef = useRef<string | null>(null);
+  const staleAcceptedHandoffCleanupRef = useRef<number | null>(null);
   const northStarWebRtcPeerRef = useRef<RTCPeerConnection | null>(null);
   const northStarWebRtcChannelRef = useRef<RTCDataChannel | null>(null);
   const northStarWebRtcCallIdRef = useRef<string | null>(null);
@@ -2011,8 +2024,8 @@ function App() {
     companionHomeSnapshot?.categories.filter((section) => section.entries.length > 0).length
     ?? 0;
   const latestAcceptedNorthStarCall =
-    northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
-    ?? null;
+      northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
+      ?? null;
   const activeNorthStarSession =
     callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
     && callSessionSnapshot.activeSession.sessionState === "active"
@@ -3433,6 +3446,18 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function refreshPassiveSnapshot() { setPassiveSnapshot(await getPassiveContextSnapshot()); }
   async function refreshPhaseThreeSnapshot() { setPhaseThreeSnapshot(await getPhaseThreeSnapshot()); }
   async function refreshLivedMomentSnapshot() { setLivedMomentSnapshot(await getLivedMomentSnapshot()); }
+  async function refreshRealWorldPresenceSnapshot() {
+    const snapshot = await getRealWorldPresenceSnapshot();
+    setRealWorldPresenceSnapshot(snapshot);
+    setNearbyInterestFilters(snapshot.nearbyInterestFilters);
+  }
+  async function refreshRealWorldPresenceSnapshotSafe() {
+    try {
+      await refreshRealWorldPresenceSnapshot();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    }
+  }
   async function refreshCallSessionSnapshot() { setCallSessionSnapshot(await getCallSessionSnapshot()); }
   async function refreshDecisionSnapshot() { setDecisionSnapshot(await getDecisionSnapshot()); }
   async function refreshRealityCheckSnapshot() { setRealityCheckSnapshot(await getMvpRealityCheckSnapshot()); }
@@ -3440,10 +3465,50 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function refreshMemorySystemSnapshot() { setMemorySystemSnapshot(await getMemorySystemSnapshot()); }
 
   useEffect(() => {
+    if (!companionCategories.length) {
+      return;
+    }
+    const hasSelectedCategory = companionCategories.some((section) => section.category.key === contextSection);
+    if (!hasSelectedCategory) {
+      const fallbackCategoryKey = companionCategories[0]?.category.key;
+      if (fallbackCategoryKey) {
+        setContextSection(fallbackCategoryKey);
+        setCompanionContextForm((current) => ({
+          ...current,
+          categoryKey: fallbackCategoryKey,
+        }));
+      }
+    }
+  }, [companionCategories, contextSection]);
+
+  useEffect(() => {
+    const activeSession = callSessionSnapshot?.activeSession;
+    if (
+      !activeSession
+      || activeSession.handoffKind !== "accepted_handoff"
+      || activeSession.sessionState !== "active"
+      || busyPanel === "callEnd"
+    ) {
+      staleAcceptedHandoffCleanupRef.current = null;
+      return;
+    }
+    if (staleAcceptedHandoffCleanupRef.current === activeSession.id) {
+      return;
+    }
+    staleAcceptedHandoffCleanupRef.current = activeSession.id;
+    void handleEndCallSession("interrupted");
+  }, [
+    callSessionSnapshot?.activeSession?.id,
+    callSessionSnapshot?.activeSession?.handoffKind,
+    callSessionSnapshot?.activeSession?.sessionState,
+    busyPanel,
+  ]);
+
+  useEffect(() => {
     let active = true;
     async function bootstrap() {
       try {
-        const [loadedSettings, loadedDiagnostics, loadedCompanionContextSnapshot, loadedCompanionHomeSnapshot, loadedNorthStarSnapshot, loadedVoiceSnapshot, loadedSpeechStream, loadedSnapshot, loadedPassiveSnapshot, loadedPhaseThreeSnapshot, loadedLivedMomentSnapshot, loadedDecisionSnapshot, loadedCallSessionSnapshot, loadedRealityCheckSnapshot, loadedSimulationScenarios, loadedMemoryGrowthSnapshot, loadedMemorySystemSnapshot] = await Promise.all([
+        const results = await Promise.allSettled([
           loadSettings(),
           getDiagnostics(),
           getCompanionContextSnapshot(),
@@ -3463,26 +3528,85 @@ async function playNorthStarReplyOverPeer(base64: string) {
           getMemorySystemSnapshot(),
         ]);
         if (!active) return;
-        setSettings(withPromptDefaults(loadedSettings));
-        setDiagnostics(loadedDiagnostics);
-        setCompanionContextSnapshot(loadedCompanionContextSnapshot);
-        setCompanionHomeSnapshot(loadedCompanionHomeSnapshot);
-        commitNorthStarSnapshot(loadedNorthStarSnapshot);
-        setVoiceSnapshot(loadedVoiceSnapshot);
-        setSpeechStream(loadedSpeechStream);
-        setSnapshot(loadedSnapshot);
-        setPassiveSnapshot(loadedPassiveSnapshot);
-        setPhaseThreeSnapshot(loadedPhaseThreeSnapshot);
-        setLivedMomentSnapshot(loadedLivedMomentSnapshot);
-        setDecisionSnapshot(loadedDecisionSnapshot);
-        setCallSessionSnapshot(loadedCallSessionSnapshot);
-        setRealityCheckSnapshot(loadedRealityCheckSnapshot);
-        setSimulationScenarios(loadedSimulationScenarios);
-        setMemoryGrowthSnapshot(loadedMemoryGrowthSnapshot);
-        setMemorySystemSnapshot(loadedMemorySystemSnapshot);
-      } catch (caught) {
-        if (!active) return;
-        setError(caught instanceof Error ? caught.message : String(caught));
+
+        const firstError = results.find((result) => result.status === "rejected");
+        if (firstError?.status === "rejected") {
+          const reason = firstError.reason;
+          setError(reason instanceof Error ? reason.message : String(reason));
+        }
+
+        const [
+          loadedSettings,
+          loadedDiagnostics,
+          loadedCompanionContextSnapshot,
+          loadedCompanionHomeSnapshot,
+          loadedNorthStarSnapshot,
+          loadedVoiceSnapshot,
+          loadedSpeechStream,
+          loadedSnapshot,
+          loadedPassiveSnapshot,
+          loadedPhaseThreeSnapshot,
+          loadedLivedMomentSnapshot,
+          loadedDecisionSnapshot,
+          loadedCallSessionSnapshot,
+          loadedRealityCheckSnapshot,
+          loadedSimulationScenarios,
+          loadedMemoryGrowthSnapshot,
+          loadedMemorySystemSnapshot,
+        ] = results;
+
+        if (loadedSettings.status === "fulfilled") {
+          setSettings(withPromptDefaults(loadedSettings.value));
+        }
+        if (loadedDiagnostics.status === "fulfilled") {
+          setDiagnostics(loadedDiagnostics.value);
+        }
+        if (loadedCompanionContextSnapshot.status === "fulfilled") {
+          setCompanionContextSnapshot(loadedCompanionContextSnapshot.value);
+        }
+        if (loadedCompanionHomeSnapshot.status === "fulfilled") {
+          setCompanionHomeSnapshot(loadedCompanionHomeSnapshot.value);
+        }
+        if (loadedNorthStarSnapshot.status === "fulfilled") {
+          commitNorthStarSnapshot(loadedNorthStarSnapshot.value);
+        }
+        if (loadedVoiceSnapshot.status === "fulfilled") {
+          setVoiceSnapshot(loadedVoiceSnapshot.value);
+        }
+        if (loadedSpeechStream.status === "fulfilled") {
+          setSpeechStream(loadedSpeechStream.value);
+        }
+        if (loadedSnapshot.status === "fulfilled") {
+          setSnapshot(loadedSnapshot.value);
+        }
+        if (loadedPassiveSnapshot.status === "fulfilled") {
+          setPassiveSnapshot(loadedPassiveSnapshot.value);
+        }
+        if (loadedPhaseThreeSnapshot.status === "fulfilled") {
+          setPhaseThreeSnapshot(loadedPhaseThreeSnapshot.value);
+        }
+        if (loadedLivedMomentSnapshot.status === "fulfilled") {
+          setLivedMomentSnapshot(loadedLivedMomentSnapshot.value);
+        }
+        if (loadedDecisionSnapshot.status === "fulfilled") {
+          setDecisionSnapshot(loadedDecisionSnapshot.value);
+        }
+        if (loadedCallSessionSnapshot.status === "fulfilled") {
+          setCallSessionSnapshot(loadedCallSessionSnapshot.value);
+        }
+        if (loadedRealityCheckSnapshot.status === "fulfilled") {
+          setRealityCheckSnapshot(loadedRealityCheckSnapshot.value);
+        }
+        if (loadedSimulationScenarios.status === "fulfilled") {
+          setSimulationScenarios(loadedSimulationScenarios.value);
+        }
+        if (loadedMemoryGrowthSnapshot.status === "fulfilled") {
+          setMemoryGrowthSnapshot(loadedMemoryGrowthSnapshot.value);
+        }
+        if (loadedMemorySystemSnapshot.status === "fulfilled") {
+          setMemorySystemSnapshot(loadedMemorySystemSnapshot.value);
+        }
+        void refreshRealWorldPresenceSnapshotSafe();
       } finally {
         if (active) setLoading(false);
       }
@@ -3933,6 +4057,10 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
   }
 
+  async function persistCurrentSettings(nextSettings: AppSettings = settings) {
+    await saveSettings(nextSettings);
+  }
+
   function handleResetPromptField(key: PromptSettingKey) {
     setSettings((current) => ({ ...current, [key]: defaultSettings[key] }));
   }
@@ -3942,6 +4070,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await createNorthStarSession();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
@@ -3960,6 +4089,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await bindNorthStarDesktop();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       const loaded = await loadSettings();
@@ -3978,6 +4108,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       let snapshot = northStarSnapshotCacheRef.current;
       if (!snapshot?.sessionReady) {
         snapshot = await createNorthStarSession();
@@ -4005,6 +4136,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await sendNorthStarHeartbeat();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
@@ -4021,6 +4153,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await sendNorthStarMessage(northStarMessageText);
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarMessageText("");
@@ -4038,10 +4171,28 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await pullNorthStarLocationEvents();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await Promise.all([refreshDiagnostics(), refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDecisionSnapshot()]);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleNorthStarRequestLocationPulse() {
+    setBusyPanel("northStarPulse");
+    setError("");
+    setMessage("");
+    try {
+      await persistCurrentSettings();
+      const snapshot = await requestNorthStarLocationPulse();
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
+      setMessage(snapshot.detail);
+      await refreshDiagnostics();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4054,6 +4205,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       const snapshot = await sendNorthStarCallRequest(northStarCallNote);
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setNorthStarCallNote("");
@@ -4071,6 +4223,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setError("");
     setMessage("");
     try {
+      await persistCurrentSettings();
       if (!northStarReadyForCalls) {
         await handleNorthStarQuickLink();
       }
@@ -4163,7 +4316,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       await ingestLocationEvent(locationForm);
       setLocationForm((current) => ({ ...current, occurredAt: new Date().toISOString() }));
       setMessage("Location event ingested.");
-      await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshLivedMomentSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
+      await Promise.all([refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshLivedMomentSnapshot(), refreshRealWorldPresenceSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4174,11 +4327,68 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function handleRefreshLivedMoment() {
     setError("");
     setMessage("");
+    setBusyPanel("worldPresence");
     try {
-      await refreshLivedMomentSnapshot();
-      setMessage("Lived-moment interpretation refreshed.");
+      await Promise.all([refreshLivedMomentSnapshot(), refreshRealWorldPresenceSnapshot()]);
+      setMessage("Lived-moment and world-presence interpretation refreshed.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  function parseNearbyInterestTags(raw: string) {
+    return raw
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+  }
+
+  async function handleCreateNearbyInterestFilter(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+    setBusyPanel("nearbyInterestFilter");
+    try {
+      const filters = await createNearbyInterestFilter({
+        label: newNearbyFilterLabel.trim(),
+        description: newNearbyFilterDescription.trim(),
+        tags: parseNearbyInterestTags(newNearbyFilterTags),
+      });
+      setNearbyInterestFilters(filters);
+      await refreshRealWorldPresenceSnapshot();
+      setNewNearbyFilterLabel("");
+      setNewNearbyFilterDescription("");
+      setNewNearbyFilterTags("");
+      setMessage("Added a nearby-interest filter for world discovery.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleToggleNearbyInterestFilter(filter: NearbyInterestFilter) {
+    setError("");
+    setMessage("");
+    setBusyPanel("nearbyInterestFilter");
+    try {
+      const payload: UpdateNearbyInterestFilterInput = {
+        id: filter.id,
+        label: filter.label,
+        description: filter.description,
+        tags: filter.tags,
+        isEnabled: !filter.isEnabled,
+      };
+      const filters = await updateNearbyInterestFilter(payload);
+      setNearbyInterestFilters(filters);
+      await refreshRealWorldPresenceSnapshot();
+      setMessage(`${filter.label} is now ${filter.isEnabled ? "hidden from" : "included in"} nearby discovery.`);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
     }
   }
 
@@ -4476,7 +4686,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       ];
       setContextMemorySummary(summary);
       setMessage(`Context-to-memory pass complete. ${summary[0]}`);
-      await Promise.all([refreshDiagnostics(), refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot(), refreshLivedMomentSnapshot()]);
+      await Promise.all([refreshDiagnostics(), refreshCompanionContextSnapshot(), refreshCompanionHomeSnapshot(), refreshLivedMomentSnapshot(), refreshRealWorldPresenceSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4498,6 +4708,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshCompanionContextSnapshot(),
         refreshCompanionHomeSnapshot(),
         refreshLivedMomentSnapshot(),
+        refreshRealWorldPresenceSnapshot(),
       ]);
       setContextMemorySummary([
         `${nextSnapshot.overview.totalMemoryCount} interpreted memories tracked.`,
@@ -4535,7 +4746,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
       } else {
         setMessage("Memory item moved back into active memory.");
       }
-      await Promise.all([refreshSnapshot(), refreshDiagnostics(), refreshLivedMomentSnapshot()]);
+      await Promise.all([refreshSnapshot(), refreshDiagnostics(), refreshLivedMomentSnapshot(), refreshRealWorldPresenceSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -4694,6 +4905,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshLivedMomentSnapshot(),
+        refreshRealWorldPresenceSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshDiagnostics(),
@@ -4721,6 +4933,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshLivedMomentSnapshot(),
+        refreshRealWorldPresenceSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
@@ -4759,6 +4972,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
         refreshPassiveSnapshot(),
         refreshPhaseThreeSnapshot(),
         refreshLivedMomentSnapshot(),
+        refreshRealWorldPresenceSnapshot(),
         refreshDecisionSnapshot(),
         refreshCallSessionSnapshot(),
         refreshRealityCheckSnapshot(),
@@ -4884,30 +5098,31 @@ async function playNorthStarReplyOverPeer(base64: string) {
                               {busyPanel === "northStarImportReviews" ? "Importing..." : "Import call reviews"}
                             </button>
                           </div>
-                          <details className="advanced-block">
-                            <summary>Advanced North Star setup</summary>
-                            <div className="split">
-                              <label><span>North Star endpoint</span><input value={settings.northStarEndpoint} onChange={(event) => setSettings((current) => ({ ...current, northStarEndpoint: event.target.value }))} placeholder="https://northstar.your-domain.app" /></label>
-                              <label><span>North Star user handle</span><input value={settings.northStarUserHandle} onChange={(event) => setSettings((current) => ({ ...current, northStarUserHandle: event.target.value }))} placeholder="savvy" /></label>
-                            </div>
-                            <label><span>North Star display name</span><input value={settings.northStarDisplayName} onChange={(event) => setSettings((current) => ({ ...current, northStarDisplayName: event.target.value }))} placeholder="Savvy" /></label>
-                            <div className="split">
-                              <div><strong>Session token</strong><br />{northStarConnectionsSnapshot.sessionTokenMasked || "Not created yet"}</div>
-                              <div><strong>Device token</strong><br />{northStarConnectionsSnapshot.deviceTokenMasked || "Not bound yet"}</div>
-                            </div>
-                <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional outreach reason. Leave empty to use a seeded companion check-in." /></label>
-                            <label><span>Desktop companion message</span><textarea rows={3} value={northStarMessageText} onChange={(event) => setNorthStarMessageText(event.target.value)} placeholder="Send a message into the North Star companion thread..." /></label>
-                            <div className="button-row">
-                              <button type="button" onClick={handleCreateNorthStarSession} disabled={busyPanel === "northStarSession"}>{busyPanel === "northStarSession" ? "Creating session..." : "Create session"}</button>
-                              <button type="button" onClick={handleBindNorthStarDesktop} disabled={busyPanel === "northStarBind" || !settings.northStarSessionToken}>{busyPanel === "northStarBind" ? "Binding..." : "Bind desktop"}</button>
-                              <button type="button" onClick={handleNorthStarPullLocations} disabled={busyPanel === "northStarPull" || !settings.northStarDeviceToken}>{busyPanel === "northStarPull" ? "Pulling..." : "Pull location events"}</button>
-                              <button type="button" onClick={handleNorthStarMessage} disabled={busyPanel === "northStarMessage" || !settings.northStarDeviceToken || !northStarMessageText.trim()}>{busyPanel === "northStarMessage" ? "Sending..." : "Send companion message"}</button>
-                            </div>
-                          </details>
                         </>
                       ) : (
-                        <p>North Star desktop status has not been loaded yet.</p>
+                        <p>North Star desktop status could not be loaded, but recovery controls are still available below.</p>
                       )}
+                      <details className="advanced-block" open={!northStarConnectionsSnapshot}>
+                        <summary>Advanced North Star setup</summary>
+                        <div className="split">
+                          <label><span>North Star endpoint</span><input value={settings.northStarEndpoint} onChange={(event) => setSettings((current) => ({ ...current, northStarEndpoint: event.target.value }))} placeholder="https://northstar.your-domain.app" /></label>
+                          <label><span>North Star user handle</span><input value={settings.northStarUserHandle} onChange={(event) => setSettings((current) => ({ ...current, northStarUserHandle: event.target.value }))} placeholder="savvy" /></label>
+                        </div>
+                        <label><span>North Star display name</span><input value={settings.northStarDisplayName} onChange={(event) => setSettings((current) => ({ ...current, northStarDisplayName: event.target.value }))} placeholder="Savvy" /></label>
+                        <div className="split">
+                          <div><strong>Session token</strong><br />{northStarConnectionsSnapshot?.sessionTokenMasked || "Not created yet"}</div>
+                          <div><strong>Device token</strong><br />{northStarConnectionsSnapshot?.deviceTokenMasked || "Not bound yet"}</div>
+                        </div>
+                        <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional outreach reason. Leave empty to use a seeded companion check-in." /></label>
+                        <label><span>Desktop companion message</span><textarea rows={3} value={northStarMessageText} onChange={(event) => setNorthStarMessageText(event.target.value)} placeholder="Send a message into the North Star companion thread..." /></label>
+                        <div className="button-row">
+                          <button type="button" onClick={handleCreateNorthStarSession} disabled={busyPanel === "northStarSession"}>{busyPanel === "northStarSession" ? "Creating session..." : "Create session"}</button>
+                          <button type="button" onClick={handleBindNorthStarDesktop} disabled={busyPanel === "northStarBind" || !settings.northStarSessionToken}>{busyPanel === "northStarBind" ? "Binding..." : "Bind desktop"}</button>
+                          <button type="button" onClick={handleNorthStarPullLocations} disabled={busyPanel === "northStarPull" || !settings.northStarDeviceToken}>{busyPanel === "northStarPull" ? "Pulling..." : "Pull location events"}</button>
+                          <button type="button" onClick={handleNorthStarRequestLocationPulse} disabled={busyPanel === "northStarPulse" || !settings.northStarDeviceToken}>{busyPanel === "northStarPulse" ? "Requesting..." : "Request location pulse"}</button>
+                          <button type="button" onClick={handleNorthStarMessage} disabled={busyPanel === "northStarMessage" || !settings.northStarDeviceToken || !northStarMessageText.trim()}>{busyPanel === "northStarMessage" ? "Sending..." : "Send companion message"}</button>
+                        </div>
+                      </details>
                     </div>
                   <div className="split">
                     <label><span>LM Studio endpoint</span><input value={settings.lmStudioEndpoint} onChange={(event) => setSettings((current) => ({ ...current, lmStudioEndpoint: event.target.value }))} /></label>
@@ -5411,6 +5626,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "ingest", label: "Ingest" },
           { id: "timeline", label: "Timeline" },
           { id: "patterns", label: "Patterns" },
+          { id: "world", label: "World presence" },
           { id: "moment", label: "Lived moment" },
         ], passiveSection, (next) => setPassiveSection(next as PassiveSectionId))}
 
@@ -5490,6 +5706,138 @@ async function playNorthStarReplyOverPeer(base64: string) {
               </div>
             ) : <p>Loading patterns...</p>}
           </section>
+        ) : null}
+
+        {passiveSection === "world" ? (
+          <div className="content-stack">
+            <section className="panel">
+              <div className="panel-header">
+                <h2>World presence</h2>
+                <p>The first zero-cost outside-world layer grounded from the latest location pulse.</p>
+              </div>
+              <div className="actions">
+                <button type="button" onClick={() => void handleRefreshLivedMoment()} disabled={busyPanel === "worldPresence"}>
+                  {busyPanel === "worldPresence" ? "Refreshing..." : "Refresh world read"}
+                </button>
+              </div>
+              {realWorldPresenceSnapshot ? (
+                <>
+                  <dl className="facts">
+                    <div><dt>Location</dt><dd>{realWorldPresenceSnapshot.locationAvailable ? "available" : "waiting"}</dd></div>
+                    <div><dt>Timezone</dt><dd>{realWorldPresenceSnapshot.timezone}</dd></div>
+                    <div><dt>Weather</dt><dd>{realWorldPresenceSnapshot.weather?.weatherSummary ?? "not grounded yet"}</dd></div>
+                    <div><dt>Daylight</dt><dd>{livedMomentMetaLabel(realWorldPresenceSnapshot.daylight?.daylightState ?? "unknown")}</dd></div>
+                  </dl>
+                  <div className="saved-state">
+                    <h3>Current world read</h3>
+                    <p className="memory-detail-lead">{realWorldPresenceSnapshot.summary}</p>
+                    <code>{realWorldPresenceSnapshot.locationSummary}</code>
+                    <code>{realWorldPresenceSnapshot.warningSummary}</code>
+                  </div>
+                </>
+              ) : <p>Loading world-presence scaffolding...</p>}
+            </section>
+
+            {realWorldPresenceSnapshot ? (
+              <div className="grid two-up">
+                <section className="panel">
+                  <div className="panel-header"><h2>Conditions</h2><p>No-cost weather and daylight context shaping what may fit nearby.</p></div>
+                  <div className="saved-state">
+                    <ul>
+                      {realWorldPresenceSnapshot.weather ? (
+                        <li>
+                          <strong>{realWorldPresenceSnapshot.weather.weatherSummary}</strong>
+                          <code>{realWorldPresenceSnapshot.weather.summary}</code>
+                          <code>temperature {realWorldPresenceSnapshot.weather.temperatureCelsius?.toFixed(1) ?? "n/a"}C / feels like {realWorldPresenceSnapshot.weather.apparentTemperatureCelsius?.toFixed(1) ?? "n/a"}C</code>
+                          <code>wind {realWorldPresenceSnapshot.weather.windSpeedKph?.toFixed(1) ?? "n/a"} kph / precipitation chance {realWorldPresenceSnapshot.weather.precipitationProbabilityPercent?.toFixed(0) ?? "n/a"}%</code>
+                        </li>
+                      ) : <li>No weather context yet.</li>}
+                      {realWorldPresenceSnapshot.daylight ? (
+                        <li>
+                          <strong>{livedMomentMetaLabel(realWorldPresenceSnapshot.daylight.daylightState)}</strong>
+                          <code>{realWorldPresenceSnapshot.daylight.summary}</code>
+                          {realWorldPresenceSnapshot.daylight.minutesUntilTransition != null ? <code>{realWorldPresenceSnapshot.daylight.minutesUntilTransition} minutes until the next daylight transition</code> : null}
+                        </li>
+                      ) : <li>No daylight context yet.</li>}
+                    </ul>
+                  </div>
+                </section>
+
+                <section className="panel">
+                  <div className="panel-header"><h2>Source status</h2><p>The no-cost world sources the current slice is using or waiting on.</p></div>
+                  <div className="saved-state">
+                    <ul>{realWorldPresenceSnapshot.sourceStatuses.map((source) => (
+                      <li key={source.sourceKey}>
+                        <strong>{source.label}</strong>
+                        <code>{livedMomentMetaLabel(source.status)}</code>
+                        <code>{source.detail}</code>
+                        <code>checked {formatDateTime(source.checkedAt)}</code>
+                      </li>
+                    ))}</ul>
+                  </div>
+                </section>
+              </div>
+            ) : null}
+
+            {realWorldPresenceSnapshot ? (
+              <section className="panel">
+                <div className="panel-header"><h2>Nearby candidates</h2><p>The first real nearby openings gathered from zero-cost map and story sources.</p></div>
+                <div className="saved-state">
+                  <ul>{realWorldPresenceSnapshot.nearbyCandidates.length ? realWorldPresenceSnapshot.nearbyCandidates.map((candidate) => (
+                    <li key={`${candidate.source}-${candidate.title}`}>
+                      <strong>{candidate.title}</strong>
+                      <code>{formatStatus(candidate.categoryKey)} / {formatStatus(candidate.source)}</code>
+                      <code>score {candidate.score.toFixed(2)}{candidate.distanceMeters != null ? ` / ${Math.round(candidate.distanceMeters)}m away` : ""}</code>
+                      <code>{candidate.summary}</code>
+                      {candidate.tags.length ? <code>{candidate.tags.join(", ")}</code> : null}
+                    </li>
+                  )) : <li>No nearby candidates are grounded enough yet.</li>}</ul>
+                </div>
+              </section>
+            ) : null}
+
+            <div className="grid two-up">
+              <section className="panel">
+                <div className="panel-header"><h2>Nearby-interest filters</h2><p>The categories that decide what counts as worth surfacing while adventuring.</p></div>
+                <div className="saved-state">
+                  <ul>{nearbyInterestFilters.length ? nearbyInterestFilters.map((filter) => (
+                    <li key={filter.id}>
+                      <strong>{filter.label}</strong>
+                      <code>{filter.description}</code>
+                      <code>{filter.tags.join(", ") || "No tags yet."}</code>
+                      <code>{filter.isEnabled ? "Included in discovery" : "Hidden from discovery"}{filter.isUserDefined ? " / user-defined" : " / built-in"}</code>
+                      <button type="button" className="ghost" onClick={() => void handleToggleNearbyInterestFilter(filter)} disabled={busyPanel === "nearbyInterestFilter"}>
+                        {filter.isEnabled ? "Disable" : "Enable"}
+                      </button>
+                    </li>
+                  )) : <li>No nearby-interest filters yet.</li>}</ul>
+                </div>
+              </section>
+
+              <section className="panel">
+                <div className="panel-header"><h2>Add filter</h2><p>Expand what the companion should consider interesting nearby.</p></div>
+                <form className="editor" onSubmit={(event) => void handleCreateNearbyInterestFilter(event)}>
+                  <label>
+                    <span>Label</span>
+                    <input value={newNearbyFilterLabel} onChange={(event) => setNewNearbyFilterLabel(event.target.value)} placeholder="Hidden gardens" />
+                  </label>
+                  <label>
+                    <span>Description</span>
+                    <textarea rows={3} value={newNearbyFilterDescription} onChange={(event) => setNewNearbyFilterDescription(event.target.value)} placeholder="Quiet or unusual gardens, green courtyards, and secluded plant spaces." />
+                  </label>
+                  <label>
+                    <span>Tags</span>
+                    <input value={newNearbyFilterTags} onChange={(event) => setNewNearbyFilterTags(event.target.value)} placeholder="garden, courtyard, greenhouse" />
+                  </label>
+                  <div className="actions">
+                    <button type="submit" disabled={busyPanel === "nearbyInterestFilter" || !newNearbyFilterLabel.trim()}>
+                      {busyPanel === "nearbyInterestFilter" ? "Saving..." : "Add nearby-interest filter"}
+                    </button>
+                  </div>
+                </form>
+              </section>
+            </div>
+          </div>
         ) : null}
 
         {passiveSection === "moment" ? (

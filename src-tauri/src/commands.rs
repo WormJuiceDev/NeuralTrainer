@@ -5,14 +5,14 @@ use crate::{
   db,
   error::AppError,
   models::{
-    AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
+    AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreateNearbyInterestFilterInput, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSnapshot, CompanionHomeSnapshot, CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput,
     DecisionRunResult, DecisionSnapshot, DraftedOutreachAutoDispatchResult, DraftedOutreachDispatchResult, EndCallSessionInput, LocationEventInput, ManualReflection,
-    LivedMomentSnapshot, MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, SimulationRunInput, SimulationRunResult, SimulationScenario,
+    LivedMomentSnapshot, MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NearbyInterestFilter, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, RealWorldPresenceSnapshot, SimulationRunInput, SimulationRunResult, SimulationScenario,
     NorthStarRuntimeSnapshot, SimulationSuiteResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateCompanionContextEntryInput, UpdateMemoryItemInput,
-    UpdatePlaceInput, UpdateRuleInput,
+    UpdateNearbyInterestFilterInput, UpdatePlaceInput, UpdateRuleInput,
   },
   north_star,
   state::AppState,
@@ -254,6 +254,16 @@ pub fn send_north_star_call_request(
   let settings = db::load_settings(&state.db_path)?;
   let snapshot = north_star::send_call_request(&settings, &note)?;
   state.push_event("Sent a North Star call request from the desktop.");
+  Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn request_north_star_location_pulse(
+  state: State<'_, AppState>,
+) -> Result<NorthStarSnapshot, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let snapshot = north_star::request_location_pulse(&settings)?;
+  state.push_event("Requested a fresh North Star location pulse.");
   Ok(snapshot)
 }
 
@@ -1196,6 +1206,40 @@ pub fn get_lived_moment_snapshot(
 ) -> Result<LivedMomentSnapshot, AppError> {
   let settings = db::load_settings(&state.db_path)?;
   db::lived_moment_snapshot(&state.db_path, &settings.timezone)
+}
+
+#[tauri::command]
+pub fn get_real_world_presence_snapshot(
+  state: State<'_, AppState>,
+) -> Result<RealWorldPresenceSnapshot, AppError> {
+  db::get_real_world_presence_snapshot(&state.db_path)
+}
+
+#[tauri::command]
+pub fn list_nearby_interest_filters(
+  state: State<'_, AppState>,
+) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  db::list_nearby_interest_filters(&state.db_path)
+}
+
+#[tauri::command]
+pub fn create_nearby_interest_filter(
+  state: State<'_, AppState>,
+  payload: CreateNearbyInterestFilterInput,
+) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let filters = db::create_nearby_interest_filter(&state.db_path, &payload)?;
+  state.push_event(format!("Added nearby-interest filter '{}'.", payload.label));
+  Ok(filters)
+}
+
+#[tauri::command]
+pub fn update_nearby_interest_filter(
+  state: State<'_, AppState>,
+  payload: UpdateNearbyInterestFilterInput,
+) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let filters = db::update_nearby_interest_filter(&state.db_path, &payload)?;
+  state.push_event(format!("Updated nearby-interest filter '{}'.", payload.label));
+  Ok(filters)
 }
 
 #[tauri::command]

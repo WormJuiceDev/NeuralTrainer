@@ -638,6 +638,104 @@ pub struct LivedMomentSnapshot {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct WorldSignalSourceStatus {
+  pub source_key: String,
+  pub label: String,
+  pub status: String,
+  pub detail: String,
+  pub checked_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealWorldWeatherSnapshot {
+  pub temperature_celsius: Option<f64>,
+  pub apparent_temperature_celsius: Option<f64>,
+  pub weather_code: Option<i64>,
+  pub weather_summary: String,
+  pub wind_speed_kph: Option<f64>,
+  pub precipitation_probability_percent: Option<f64>,
+  pub precipitation_mm: Option<f64>,
+  pub is_day: Option<bool>,
+  pub caution_level: String,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealWorldDaylightSnapshot {
+  pub sunrise_at: Option<String>,
+  pub sunset_at: Option<String>,
+  pub daylight_state: String,
+  pub minutes_until_transition: Option<i64>,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbyInterestFilter {
+  pub id: i64,
+  pub category_key: String,
+  pub label: String,
+  pub description: String,
+  pub tags: Vec<String>,
+  pub is_enabled: bool,
+  pub display_order: i64,
+  pub is_user_defined: bool,
+  pub created_at: String,
+  pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NearbyDiscoveryCandidate {
+  pub title: String,
+  pub source: String,
+  pub category_key: String,
+  pub distance_meters: Option<f64>,
+  pub score: f64,
+  pub tags: Vec<String>,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateNearbyInterestFilterInput {
+  pub label: String,
+  pub description: String,
+  pub tags: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateNearbyInterestFilterInput {
+  pub id: i64,
+  pub label: String,
+  pub description: String,
+  pub tags: Vec<String>,
+  pub is_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RealWorldPresenceSnapshot {
+  pub captured_at: String,
+  pub timezone: String,
+  pub location_available: bool,
+  pub latitude: Option<f64>,
+  pub longitude: Option<f64>,
+  pub location_summary: String,
+  pub weather: Option<RealWorldWeatherSnapshot>,
+  pub daylight: Option<RealWorldDaylightSnapshot>,
+  pub warning_summary: String,
+  pub source_statuses: Vec<WorldSignalSourceStatus>,
+  pub nearby_interest_filters: Vec<NearbyInterestFilter>,
+  pub nearby_candidates: Vec<NearbyDiscoveryCandidate>,
+  pub summary: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OutreachEvent {
   pub id: i64,
   pub created_at: String,

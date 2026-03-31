@@ -23,6 +23,22 @@ type DesktopBinding = {
   location_capability: LocationCapability;
 };
 
+function sortDesktopBindings(bindings: DesktopBinding[]): DesktopBinding[] {
+  return [...bindings].sort((left, right) => {
+    const leftSeen = Date.parse(left.last_heartbeat_at ?? left.bound_at);
+    const rightSeen = Date.parse(right.last_heartbeat_at ?? right.bound_at);
+    if (rightSeen !== leftSeen) {
+      return rightSeen - leftSeen;
+    }
+    const leftBound = Date.parse(left.bound_at);
+    const rightBound = Date.parse(right.bound_at);
+    if (rightBound !== leftBound) {
+      return rightBound - leftBound;
+    }
+    return left.desktop_name.localeCompare(right.desktop_name);
+  });
+}
+
 type CompanionMessage = {
   message_id: string;
   user_handle: string;
@@ -118,6 +134,20 @@ type QueuedLocationEvent = {
   captured_at: string;
 };
 
+type LocationPulseRequest = {
+  pulse_id: string;
+  user_handle: string;
+  device_token: string;
+  requested_at: string;
+  completed_at: string | null;
+  status: "pending" | "fulfilled";
+};
+
+type BeforeInstallPromptEvent = Event & {
+  prompt: () => Promise<void>;
+  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
+};
+
 type CompanionEvent =
   | {
       kind: "desktop_bound";
@@ -150,6 +180,18 @@ type CompanionEvent =
   | {
       kind: "location_uploaded";
       event_id: string;
+      user_handle: string;
+      at: string;
+    }
+  | {
+      kind: "location_pulse_requested";
+      pulse_id: string;
+      user_handle: string;
+      at: string;
+    }
+  | {
+      kind: "location_pulse_fulfilled";
+      pulse_id: string;
       user_handle: string;
       at: string;
     }
@@ -205,7 +247,7 @@ const LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
 const LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
 const MOBILE_OUTBOUND_CALL_NOTE = "North Star is calling from your phone.";
 const LIVE_CALL_OPENING_TEXT = "Hi, you wanted to talk?";
-const NORTHSTAR_MOBILE_VERSION = "v61";
+const NORTHSTAR_MOBILE_VERSION = "v64";
 const MIN_SETUP_TONE_MS = 1500;
 const LIVE_TURN_DATA_CHANNEL_MAX_BASE64 = 180_000;
 
@@ -217,6 +259,11 @@ type AudioSettings = {
 
 type DebugSettings = {
   debugCall: boolean;
+};
+
+type PushDebugState = {
+  lastError: string | null;
+  lastAttemptAt: string | null;
 };
 
 const defaultAudioSettings: AudioSettings = {
@@ -406,18 +453,19 @@ function formatAvailability(value: boolean, positive = "Ready", negative = "Not 
   return value ? positive : negative;
 }
 
-function locationSummary(state: LocationCapability, watching: boolean, queuedEvents: number) {
+function locationSummary(state: LocationCapability, pendingPulses: number) {
   if (!state.location_supported) return "Location sharing is not ready on this phone yet.";
-  if (watching) return queuedEvents > 0 ? `Live sharing is on. ${queuedEvents} update${queuedEvents === 1 ? "" : "s"} waiting to sync.` : "Live sharing is on.";
   if (state.permission_state === "denied") return "Location sharing is blocked on this phone.";
+  if (pendingPulses > 0) return `NeuralTrainer has ${pendingPulses} location pulse${pendingPulses === 1 ? "" : "s"} waiting right now.`;
   if (state.last_location_at) return `Last location update ${formatDateTime(state.last_location_at)}.`;
-  return "Location sharing is available when you need it.";
+  return "Location is allowed and ready whenever NeuralTrainer asks for a pulse.";
 }
 
 function pushSummary(status: PushStatus | null, capability: PushCapability) {
   if (!capability.notificationSupported) return "Notifications are not available on this browser.";
   if (capability.permission !== "granted") return "Allow notifications so North Star can tap you on the shoulder.";
   if (!capability.serviceWorkerReady) return "The app is still getting notifications ready on this device.";
+  if (!status) return "North Star push status has not loaded yet.";
   if (!status?.push_supported) return "North Star push is still warming up on the server.";
   if ((status.registered_subscriptions ?? 0) === 0) return "This phone still needs to register for push.";
   return "North Star can wake this phone for new calls, messages, and updates.";
@@ -761,7 +809,12 @@ function App() {
     serviceWorkerReady: false,
   });
   const [pushStatus, setPushStatus] = useState<PushStatus | null>(null);
+  const [pushDebugState, setPushDebugState] = useState<PushDebugState>({
+    lastError: null,
+    lastAttemptAt: null,
+  });
   const [locationQueue, setLocationQueue] = useState<QueuedLocationEvent[]>([]);
+  const [locationPulseRequests, setLocationPulseRequests] = useState<LocationPulseRequest[]>([]);
   const [locationState, setLocationState] = useState<LocationCapability>({
     permission_state: "unknown",
     location_supported: false,
@@ -769,7 +822,13 @@ function App() {
     last_known_accuracy_meters: null,
     last_location_at: null,
   });
-  const [watchingLocation, setWatchingLocation] = useState(false);
+  const [installPromptEvent, setInstallPromptEvent] = useState<BeforeInstallPromptEvent | null>(null);
+  const [installedStandalone, setInstalledStandalone] = useState(() => {
+    if (typeof window === "undefined") return false;
+    const displayStandalone = typeof window.matchMedia === "function" && window.matchMedia("(display-mode: standalone)").matches;
+    const iosStandalone = typeof navigator !== "undefined" && "standalone" in navigator && Boolean((navigator as Navigator & { standalone?: boolean }).standalone);
+    return displayStandalone || iosStandalone;
+  });
   const [recordingTurn, setRecordingTurn] = useState(false);
   const [callLoopState, setCallLoopState] = useState<"idle" | "connecting" | "opening" | "listening" | "processing" | "speaking">("idle");
   const [callLoopMuted, setCallLoopMuted] = useState(false);
@@ -779,7 +838,7 @@ function App() {
   const [debugSettings, setDebugSettings] = useState<DebugSettings>(defaultDebugSettings);
   const [message, setMessage] = useState("North Star is ready to keep you and NeuralTrainer in sync.");
 
-  const watchIdRef = useRef<number | null>(null);
+  const locationPulseInFlightRef = useRef(false);
   const callTurnAudioChunksRef = useRef<Float32Array[]>([]);
   const callTurnStreamRef = useRef<MediaStream | null>(null);
   const callTurnAudioContextRef = useRef<AudioContext | null>(null);
@@ -1262,7 +1321,7 @@ function App() {
     if (!sessionToken) return;
 
     let cancelled = false;
-    void refreshAll();
+    void refreshAll().then(() => fulfillPendingLocationPulses({ silent: true, openedFromWake: false })).catch(() => undefined);
 
     const socket = new WebSocket(`${wsBase}/api/companion/events`);
     socket.onmessage = (event) => {
@@ -1281,6 +1340,11 @@ function App() {
           setView("chats");
           setSelectedCallId(parsed.call_id);
           setMessage(parsed.status === "accepted" ? "Call is connecting." : `Call ${CALL_STATUS_LABELS[parsed.status].toLowerCase()}.`);
+        } else if (parsed.kind === "location_pulse_requested") {
+          setView("settings");
+          setSettingsSection("location");
+          setMessage("NeuralTrainer asked North Star for a fresh location pulse.");
+          void fulfillPendingLocationPulses({ silent: false, openedFromWake: false });
         } else if (parsed.kind === "message_created" && parsed.source === "desktop") {
           setView("chats");
           setMessage("NeuralTrainer sent a new message.");
@@ -1298,6 +1362,30 @@ function App() {
   }, [sessionToken, wsBase, userHandle]);
 
   useEffect(() => {
+    if (!sessionToken) return;
+
+    const refreshPulseState = () => {
+      void refreshPendingLocationPulses({ autoFulfill: true, silent: true });
+    };
+
+    refreshPulseState();
+    const timer = window.setInterval(refreshPulseState, 8000);
+    const handleVisibility = () => {
+      if (document.visibilityState === "visible") {
+        refreshPulseState();
+      }
+    };
+    document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("focus", refreshPulseState);
+
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("focus", refreshPulseState);
+    };
+  }, [sessionToken, locationState.location_supported, locationState.permission_state]);
+
+  useEffect(() => {
     function applyDeepLink(navType: string | null, navId: string | null) {
       if (!navType || !navId) return;
       if (navType.toUpperCase() === "CALL") {
@@ -1307,6 +1395,10 @@ function App() {
       } else if (navType.toUpperCase() === "CHAT") {
         setView("chats");
         setMessage("Opened from a companion message.");
+      } else if (navType.toUpperCase() === "LOCATION_PULSE") {
+        setView("settings");
+        setSettingsSection("location");
+        setMessage("North Star opened to answer a location pulse.");
       }
     }
 
@@ -1316,6 +1408,8 @@ function App() {
     function onServiceWorkerMessage(event: MessageEvent) {
       if (event.data?.type === "DEEP_LINK") {
         applyDeepLink(event.data.navType ?? null, event.data.navId ?? null);
+      } else if (event.data?.type === "LOCATION_PULSE_REQUEST") {
+        void fulfillPendingLocationPulses({ silent: false, openedFromWake: true });
       }
     }
 
@@ -1324,7 +1418,23 @@ function App() {
   }, []);
 
   useEffect(() => {
-    return () => stopWatchingLocation();
+    function handleBeforeInstallPrompt(event: Event) {
+      event.preventDefault();
+      setInstallPromptEvent(event as BeforeInstallPromptEvent);
+    }
+
+    function handleInstalled() {
+      setInstalledStandalone(true);
+      setInstallPromptEvent(null);
+      setMessage("North Star is now installed on this phone.");
+    }
+
+    window.addEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+    window.addEventListener("appinstalled", handleInstalled);
+    return () => {
+      window.removeEventListener("beforeinstallprompt", handleBeforeInstallPrompt);
+      window.removeEventListener("appinstalled", handleInstalled);
+    };
   }, []);
 
   useEffect(() => {
@@ -2218,6 +2328,7 @@ function App() {
       refreshState(),
       refreshMessages(),
       refreshLocationEvents(),
+      refreshPendingLocationPulses(),
       refreshCallSessions(),
       refreshCallReviews(),
       refreshPushStatus(),
@@ -2231,7 +2342,7 @@ function App() {
       return;
     }
     const payload = (await response.json()) as { desktops: DesktopBinding[] };
-    setState(payload.desktops);
+    setState(sortDesktopBindings(payload.desktops));
   }
 
   async function refreshMessages() {
@@ -2246,6 +2357,26 @@ function App() {
     if (!response.ok) return;
     const payload = (await response.json()) as { events: LocationEvent[] };
     setLocationEvents(payload.events);
+  }
+
+  async function refreshPendingLocationPulses(options?: { autoFulfill?: boolean; silent?: boolean }) {
+    const response = await authedFetch("/api/companion/location-pulses", { method: "GET" });
+    if (!response.ok) return;
+    const payload = (await response.json()) as { requests: LocationPulseRequest[] };
+    setLocationPulseRequests(payload.requests);
+    if (
+      options?.autoFulfill
+      && payload.requests.length > 0
+      && !locationPulseInFlightRef.current
+      && locationState.location_supported
+      && locationState.permission_state === "granted"
+    ) {
+      void fulfillPendingLocationPulses({
+        silent: options.silent ?? true,
+        openedFromWake: false,
+        prefetchedRequests: payload.requests,
+      });
+    }
   }
 
   async function refreshCallSessions() {
@@ -2276,7 +2407,10 @@ function App() {
 
   async function refreshPushStatus() {
     const response = await authedFetch("/api/companion/push-subscriptions", { method: "GET" });
-    if (!response.ok) return;
+    if (!response.ok) {
+      setPushStatus(null);
+      return;
+    }
     const payload = (await response.json()) as PushStatus;
     setPushStatus(payload);
   }
@@ -2364,17 +2498,17 @@ function App() {
         setLocationState({
           permission_state: permissionState === "unknown" ? "granted" : permissionState,
           location_supported: true,
-          background_supported: false,
+          background_supported: installedStandalone,
           last_known_accuracy_meters: position.coords.accuracy,
           last_location_at: new Date().toISOString(),
         });
-        setMessage("Location sharing is available on this phone.");
+        setMessage("Location is allowed on this phone. NeuralTrainer can now ask for pulses.");
       },
       () => {
         setLocationState({
           permission_state: permissionState === "unknown" ? "denied" : permissionState,
           location_supported: true,
-          background_supported: false,
+          background_supported: installedStandalone,
           last_known_accuracy_meters: null,
           last_location_at: null,
         });
@@ -2594,6 +2728,26 @@ function App() {
     setMessage(`Notification permission is now ${formatPermission(permission)}.`);
   }
 
+  async function promptInstall() {
+    if (!installPromptEvent) {
+      if (installedStandalone) {
+        setMessage("North Star is already installed on this phone.");
+      } else {
+        setMessage("Chrome is not offering the install prompt yet on this device.");
+      }
+      return;
+    }
+
+    await installPromptEvent.prompt();
+    const choice = await installPromptEvent.userChoice.catch(() => null);
+    if (choice?.outcome === "accepted") {
+      setMessage("North Star install is underway.");
+    } else {
+      setMessage("North Star install was dismissed for now.");
+    }
+    setInstallPromptEvent(null);
+  }
+
   async function registerPushSubscription() {
     if (!sessionToken) {
       setMessage("Create a North Star session first.");
@@ -2611,49 +2765,80 @@ function App() {
       }
     }
 
-    const registration = await navigator.serviceWorker.ready;
-    const statusResponse = await authedFetch("/api/companion/push-subscriptions", { method: "GET" });
-    if (!statusResponse.ok) {
-      setMessage("North Star push status could not be loaded.");
-      return;
-    }
-    const status = (await statusResponse.json()) as PushStatus;
-    setPushStatus(status);
-
-    let subscription = await registration.pushManager.getSubscription();
-    if (!subscription) {
-      subscription = await registration.pushManager.subscribe({
-        userVisibleOnly: true,
-        applicationServerKey: urlBase64ToUint8Array(status.vapid_public_key),
-      });
-    }
-
-    const serialized = subscription.toJSON() as {
-      endpoint?: string;
-      keys?: { p256dh?: string; auth?: string };
-    };
-    if (!serialized.endpoint || !serialized.keys?.p256dh || !serialized.keys?.auth) {
-      setMessage("Push subscription was created, but the browser returned incomplete key material.");
-      return;
-    }
-
-    const response = await authedFetch("/api/companion/push-subscriptions", {
-      method: "POST",
-      body: JSON.stringify({
-        endpoint: serialized.endpoint,
-        keys: {
-          p256dh: serialized.keys.p256dh,
-          auth: serialized.keys.auth,
-        },
-      }),
+    setPushDebugState({
+      lastError: null,
+      lastAttemptAt: new Date().toISOString(),
     });
-    if (!response.ok) {
-      setMessage("North Star could not store this push subscription.");
-      return;
-    }
 
-    setMessage("This phone can now receive North Star wake notifications.");
-    await refreshPushStatus();
+    try {
+      const registration = await navigator.serviceWorker.ready;
+      const statusResponse = await authedFetch("/api/companion/push-subscriptions", { method: "GET" });
+      if (!statusResponse.ok) {
+        setPushStatus(null);
+        setPushDebugState({
+          lastError: "North Star push status could not be loaded from the server.",
+          lastAttemptAt: new Date().toISOString(),
+        });
+        setMessage("North Star push status could not be loaded.");
+        return;
+      }
+      const status = (await statusResponse.json()) as PushStatus;
+      setPushStatus(status);
+
+      let subscription = await registration.pushManager.getSubscription();
+      if (!subscription) {
+        subscription = await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey: urlBase64ToUint8Array(status.vapid_public_key),
+        });
+      }
+
+      const serialized = subscription.toJSON() as {
+        endpoint?: string;
+        keys?: { p256dh?: string; auth?: string };
+      };
+      if (!serialized.endpoint || !serialized.keys?.p256dh || !serialized.keys?.auth) {
+        setPushDebugState({
+          lastError: "Push subscription was created, but the browser returned incomplete key material.",
+          lastAttemptAt: new Date().toISOString(),
+        });
+        setMessage("Push subscription was created, but the browser returned incomplete key material.");
+        return;
+      }
+
+      const response = await authedFetch("/api/companion/push-subscriptions", {
+        method: "POST",
+        body: JSON.stringify({
+          endpoint: serialized.endpoint,
+          keys: {
+            p256dh: serialized.keys.p256dh,
+            auth: serialized.keys.auth,
+          },
+        }),
+      });
+      if (!response.ok) {
+        setPushDebugState({
+          lastError: "North Star could not store this push subscription.",
+          lastAttemptAt: new Date().toISOString(),
+        });
+        setMessage("North Star could not store this push subscription.");
+        return;
+      }
+
+      setPushDebugState({
+        lastError: null,
+        lastAttemptAt: new Date().toISOString(),
+      });
+      setMessage("This phone can now receive North Star wake notifications.");
+      await refreshPushStatus();
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setPushDebugState({
+        lastError: detail,
+        lastAttemptAt: new Date().toISOString(),
+      });
+      setMessage(`Push setup failed: ${detail}`);
+    }
   }
 
   function enqueueLocation(coords: GeolocationCoordinates, source: string) {
@@ -2672,13 +2857,27 @@ function App() {
       last_known_accuracy_meters: coords.accuracy,
       last_location_at: event.captured_at,
     }));
+    return event;
   }
 
-  async function flushLocationQueue() {
-    if (!sessionToken || locationQueue.length === 0) return;
+  async function completeLocationPulseRequests(pulseIds: string[]) {
+    for (const pulseId of pulseIds) {
+      const response = await authedFetch("/api/companion/location-pulses/complete", {
+        method: "POST",
+        body: JSON.stringify({ pulse_id: pulseId }),
+      });
+      if (!response.ok) {
+        break;
+      }
+    }
+  }
+
+  async function flushLocationQueue(queueOverride?: QueuedLocationEvent[]) {
+    const queue = queueOverride ?? locationQueue;
+    if (!sessionToken || queue.length === 0) return 0;
 
     let sent = 0;
-    for (const event of locationQueue) {
+    for (const event of queue) {
       const response = await authedFetch("/api/companion/location-events", {
         method: "POST",
         body: JSON.stringify({
@@ -2696,43 +2895,90 @@ function App() {
     }
 
     if (sent > 0) {
-      setLocationQueue((current) => current.slice(sent));
-      setMessage(`Synced ${sent} queued location update${sent === 1 ? "" : "s"} to North Star.`);
+      setLocationQueue(queue.slice(sent));
       await refreshLocationEvents();
     }
+
+    return sent;
   }
 
-  function startWatchingLocation() {
-    if (!("geolocation" in navigator)) {
-      setMessage("Geolocation is not available on this device.");
-      return;
-    }
-    if (watchIdRef.current !== null) {
-      setWatchingLocation(true);
-      return;
-    }
-
-    watchIdRef.current = navigator.geolocation.watchPosition(
-      (position) => {
-        enqueueLocation(position.coords, "mobile_watch");
-        setWatchingLocation(true);
-      },
-      () => {
-        setWatchingLocation(false);
-        setMessage("Live location sharing stopped because the phone could not keep reading location.");
-      },
-      { enableHighAccuracy: true, maximumAge: 10000, timeout: 10000 },
-    );
-
-    setMessage("Live location sharing is now running on this phone.");
+  async function getCurrentPosition() {
+    return await new Promise<GeolocationPosition>((resolve, reject) => {
+      if (!("geolocation" in navigator)) {
+        reject(new Error("Geolocation is not available on this device."));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        resolve,
+        reject,
+        { enableHighAccuracy: true, timeout: 7000, maximumAge: 0 },
+      );
+    });
   }
 
-  function stopWatchingLocation() {
-    if (watchIdRef.current !== null && "geolocation" in navigator) {
-      navigator.geolocation.clearWatch(watchIdRef.current);
-      watchIdRef.current = null;
+  async function captureAndUploadLocationPulse(
+    source: string,
+    pulseIds: string[],
+    options?: { silent?: boolean; completionMessage?: string },
+  ) {
+    try {
+      const position = await getCurrentPosition();
+      const event = enqueueLocation(position.coords, source);
+      const nextQueue = [...locationQueue.slice(-49), event];
+      setLocationQueue(nextQueue);
+      const sent = await flushLocationQueue(nextQueue);
+      if (sent > 0 && pulseIds.length > 0) {
+        await completeLocationPulseRequests(pulseIds);
+        await refreshPendingLocationPulses();
+      }
+      if (!options?.silent) {
+        setMessage(options?.completionMessage ?? "North Star sent a fresh location pulse.");
+      }
+      return sent > 0;
+    } catch {
+      if (!options?.silent) {
+        setMessage("North Star could not capture your location just then.");
+      }
+      return false;
     }
-    setWatchingLocation(false);
+  }
+
+  async function fulfillPendingLocationPulses(options?: {
+    silent?: boolean;
+    openedFromWake?: boolean;
+    prefetchedRequests?: LocationPulseRequest[];
+  }) {
+    if (!sessionToken || locationPulseInFlightRef.current) return;
+    let requests = options?.prefetchedRequests ?? [];
+    if (requests.length === 0) {
+      const response = await authedFetch("/api/companion/location-pulses", { method: "GET" });
+      if (!response.ok) return;
+      const payload = (await response.json()) as { requests: LocationPulseRequest[] };
+      requests = payload.requests;
+      setLocationPulseRequests(requests);
+    }
+    if (requests.length === 0) return;
+
+    locationPulseInFlightRef.current = true;
+    try {
+      const pulseIds = requests.map((entry) => entry.pulse_id);
+      const succeeded = await captureAndUploadLocationPulse(
+        "mobile_pulse",
+        pulseIds,
+        {
+          silent: options?.silent,
+          completionMessage: options?.openedFromWake
+            ? "North Star answered the background location pulse."
+            : "North Star answered the requested location pulse.",
+        },
+      );
+      if (!succeeded && !options?.silent) {
+        setView("settings");
+        setSettingsSection("location");
+      }
+    } finally {
+      locationPulseInFlightRef.current = false;
+    }
   }
 
   async function uploadLocationNow() {
@@ -2740,17 +2986,10 @@ function App() {
       setMessage("Geolocation is not available on this device.");
       return;
     }
-
-    navigator.geolocation.getCurrentPosition(
-      async (position) => {
-        enqueueLocation(position.coords, "mobile_manual");
-        await flushLocationQueue();
-      },
-      () => {
-      setMessage("North Star could not capture your location just then.");
-      },
-      { enableHighAccuracy: true, timeout: 7000, maximumAge: 0 },
-    );
+    await captureAndUploadLocationPulse("mobile_manual", [], {
+      silent: false,
+      completionMessage: "North Star sent a fresh test location pulse.",
+    });
   }
 
   function resetHandsFreeDetection() {
@@ -3090,13 +3329,14 @@ function App() {
       : "Fallback voice path";
   const locationReady = locationState.location_supported && locationState.permission_state !== "denied";
   const pushReady = Boolean(pushStatus?.push_supported && (pushStatus?.registered_subscriptions ?? 0) > 0);
+  const installReady = Boolean(installPromptEvent);
   const sessionReady = Boolean(sessionToken);
   const desktopReady = Boolean(deviceToken);
   const connectionSummary = sessionReady && desktopReady
     ? `Connected to ${mostRecentDesktop?.desktop_name || "your desktop"}`
     : "Finish linking this phone to your desktop companion";
   const desktopLocationState = mostRecentDesktop?.location_capability ?? locationState;
-  const locationHeadline = locationSummary(desktopLocationState, watchingLocation, locationQueue.length);
+  const locationHeadline = locationSummary(desktopLocationState, locationPulseRequests.length);
   const notificationsHeadline = pushSummary(pushStatus, pushCapability);
   const callScreenTitle =
     selectedCall?.status === "pending"
@@ -3665,6 +3905,7 @@ function App() {
   } else if (settingsSection === "desktop") {
     settingsContent = (
       <section className="settings-page">
+        <p className="helper-copy">Install North Star on this phone so Chrome can treat it like a real companion app and keep wake requests more dependable.</p>
         <label className="field">
           <span>Desktop name</span>
           <input value={desktopName} onChange={(event) => setDesktopName(event.target.value)} />
@@ -3678,10 +3919,17 @@ function App() {
             <dt>Last heartbeat</dt>
             <dd>{formatDateTime(mostRecentDesktop?.last_heartbeat_at ?? null)}</dd>
           </div>
+          <div>
+            <dt>Install</dt>
+            <dd>{installedStandalone ? "Installed" : installReady ? "Ready to install" : "Waiting on Chrome"}</dd>
+          </div>
         </div>
         <div className="composer-actions">
           <button onClick={bindDesktop}>Link desktop</button>
           <button className="secondary" onClick={sendHeartbeat}>Heartbeat</button>
+          <button className="secondary" onClick={promptInstall} disabled={!installPromptEvent && !installedStandalone}>
+            {installedStandalone ? "Installed" : "Install app"}
+          </button>
         </div>
       </section>
     );
@@ -3760,13 +4008,25 @@ function App() {
             <dt>Subscriptions</dt>
             <dd>{pushStatus?.registered_subscriptions ?? 0}</dd>
           </div>
+          <div>
+            <dt>Worker</dt>
+            <dd>{pushCapability.serviceWorkerReady ? "Ready" : "Not ready"}</dd>
+          </div>
         </div>
         <div className="composer-actions">
           <button onClick={requestNotificationPermission}>Allow notifications</button>
           <button className="secondary" onClick={registerPushSubscription} disabled={!sessionToken || !pushCapability.serviceWorkerReady}>
             Turn on push
           </button>
+          <button className="secondary" onClick={() => void refreshPushStatus()} disabled={!sessionToken}>
+            Refresh push status
+          </button>
         </div>
+        {pushDebugState.lastError ? (
+          <p className="helper-copy"><strong>Last push issue:</strong> {pushDebugState.lastError}</p>
+        ) : pushDebugState.lastAttemptAt ? (
+          <p className="helper-copy">Last push attempt: {formatDateTime(pushDebugState.lastAttemptAt)}</p>
+        ) : null}
       </section>
     );
   } else if (settingsSection === "location") {
@@ -3779,8 +4039,8 @@ function App() {
             <dd>{formatPermission(locationState.permission_state)}</dd>
           </div>
           <div>
-            <dt>Queue</dt>
-            <dd>{locationQueue.length} waiting</dd>
+            <dt>Pending pulses</dt>
+            <dd>{locationPulseRequests.length}</dd>
           </div>
           <div>
             <dt>Accuracy</dt>
@@ -3788,13 +4048,10 @@ function App() {
           </div>
         </div>
         <div className="composer-actions">
-          <button onClick={checkLocationCapability}>Check</button>
-          <button className="secondary" onClick={uploadLocationNow}>Send now</button>
-          <button className="secondary" onClick={watchingLocation ? stopWatchingLocation : startWatchingLocation}>
-            {watchingLocation ? "Stop live" : "Start live"}
-          </button>
-          <button className="secondary" onClick={flushLocationQueue} disabled={locationQueue.length === 0}>
-            Upload queue
+          <button onClick={checkLocationCapability}>Allow location</button>
+          <button className="secondary" onClick={uploadLocationNow}>Send test pulse</button>
+          <button className="secondary" onClick={() => void fulfillPendingLocationPulses({ silent: false, openedFromWake: false })} disabled={locationPulseRequests.length === 0}>
+            Answer waiting pulse
           </button>
         </div>
       </section>

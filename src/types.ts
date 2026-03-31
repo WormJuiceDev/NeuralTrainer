@@ -609,6 +609,88 @@ export type LivedMomentSnapshot = {
   summary: string;
 };
 
+export type WorldSignalSourceStatus = {
+  sourceKey: string;
+  label: string;
+  status: string;
+  detail: string;
+  checkedAt: string;
+};
+
+export type RealWorldWeatherSnapshot = {
+  temperatureCelsius: number | null;
+  apparentTemperatureCelsius: number | null;
+  weatherCode: number | null;
+  weatherSummary: string;
+  windSpeedKph: number | null;
+  precipitationProbabilityPercent: number | null;
+  precipitationMm: number | null;
+  isDay: boolean | null;
+  cautionLevel: string;
+  summary: string;
+};
+
+export type RealWorldDaylightSnapshot = {
+  sunriseAt: string | null;
+  sunsetAt: string | null;
+  daylightState: string;
+  minutesUntilTransition: number | null;
+  summary: string;
+};
+
+export type NearbyInterestFilter = {
+  id: number;
+  categoryKey: string;
+  label: string;
+  description: string;
+  tags: string[];
+  isEnabled: boolean;
+  displayOrder: number;
+  isUserDefined: boolean;
+  createdAt: string;
+  updatedAt: string;
+};
+
+export type NearbyDiscoveryCandidate = {
+  title: string;
+  source: string;
+  categoryKey: string;
+  distanceMeters: number | null;
+  score: number;
+  tags: string[];
+  summary: string;
+};
+
+export type CreateNearbyInterestFilterInput = {
+  label: string;
+  description: string;
+  tags: string[];
+};
+
+export type UpdateNearbyInterestFilterInput = {
+  id: number;
+  label: string;
+  description: string;
+  tags: string[];
+  isEnabled: boolean;
+};
+
+export type RealWorldPresenceSnapshot = {
+  capturedAt: string;
+  timezone: string;
+  locationAvailable: boolean;
+  latitude: number | null;
+  longitude: number | null;
+  locationSummary: string;
+  weather: RealWorldWeatherSnapshot | null;
+  daylight: RealWorldDaylightSnapshot | null;
+  warningSummary: string;
+  sourceStatuses: WorldSignalSourceStatus[];
+  nearbyInterestFilters: NearbyInterestFilter[];
+  nearbyCandidates: NearbyDiscoveryCandidate[];
+  summary: string;
+};
+
 export type OutreachEvent = {
   id: number;
   createdAt: string;

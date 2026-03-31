@@ -73,6 +73,7 @@ struct PersistedStore {
     desktops: HashMap<String, DesktopBinding>,
     messages: Vec<CompanionMessage>,
     location_events: Vec<LocationEvent>,
+    location_pulse_requests: Vec<LocationPulseRequest>,
     call_sessions: Vec<CompanionCallSession>,
     call_reviews: Vec<CallReviewRecord>,
     call_turns: Vec<CompanionCallTurn>,
@@ -154,6 +155,23 @@ struct LocationEvent {
     accuracy_meters: Option<f64>,
     source: String,
     captured_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct LocationPulseRequest {
+    pulse_id: Uuid,
+    user_handle: String,
+    device_token: String,
+    requested_at: DateTime<Utc>,
+    completed_at: Option<DateTime<Utc>>,
+    status: LocationPulseStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum LocationPulseStatus {
+    Pending,
+    Fulfilled,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -244,6 +262,16 @@ enum CompanionEvent {
     },
     LocationUploaded {
         event_id: Uuid,
+        user_handle: String,
+        at: DateTime<Utc>,
+    },
+    LocationPulseRequested {
+        pulse_id: Uuid,
+        user_handle: String,
+        at: DateTime<Utc>,
+    },
+    LocationPulseFulfilled {
+        pulse_id: Uuid,
         user_handle: String,
         at: DateTime<Utc>,
     },
@@ -374,6 +402,11 @@ struct LocationEventsResponse {
     events: Vec<LocationEvent>,
 }
 
+#[derive(Debug, Serialize)]
+struct LocationPulseResponse {
+    requests: Vec<LocationPulseRequest>,
+}
+
 #[derive(Debug, Deserialize)]
 struct UploadLocationRequest {
     latitude: f64,
@@ -386,6 +419,16 @@ struct UploadLocationRequest {
 struct DesktopCallRequest {
     device_token: String,
     note: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DesktopLocationPulseRequest {
+    device_token: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompleteLocationPulseRequest {
+    pulse_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -558,6 +601,9 @@ async fn main() {
         .route("/api/companion/messages/from-desktop", post(create_desktop_message))
         .route("/api/companion/location-events", get(list_location_events).post(upload_location_event))
         .route("/api/companion/location-events/desktop-pull", get(desktop_pull_location_events))
+        .route("/api/companion/location-pulses", get(list_pending_location_pulses))
+        .route("/api/companion/location-pulses/from-desktop", post(request_location_pulse_from_desktop))
+        .route("/api/companion/location-pulses/complete", post(complete_location_pulse))
         .route("/api/companion/call-sessions", get(list_call_sessions))
         .route("/api/companion/call-sessions/from-desktop", post(create_desktop_call_request))
         .route("/api/companion/call-sessions/from-mobile", post(create_mobile_call_request))
@@ -824,12 +870,20 @@ async fn companion_state(
     let session = require_session(&state, &headers).await?;
     let desktops = state.store.read().await;
     let requested_handle = query.user_handle.unwrap_or(session.user_handle);
-    let list = desktops
+    let mut list: Vec<DesktopBinding> = desktops
         .desktops
         .values()
         .filter(|desktop| desktop.user_handle == requested_handle)
         .cloned()
         .collect();
+    list.sort_by(|left, right| {
+        let left_seen = left.last_heartbeat_at.unwrap_or(left.bound_at);
+        let right_seen = right.last_heartbeat_at.unwrap_or(right.bound_at);
+        right_seen
+            .cmp(&left_seen)
+            .then_with(|| right.bound_at.cmp(&left.bound_at))
+            .then_with(|| left.desktop_name.cmp(&right.desktop_name))
+    });
 
     Ok(Json(CompanionStateResponse {
         desktops: list,
@@ -951,6 +1005,108 @@ async fn desktop_pull_location_events(
         .cloned()
         .collect();
     Ok(Json(LocationEventsResponse { events }))
+}
+
+async fn list_pending_location_pulses(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<LocationPulseResponse>, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let store = state.store.read().await;
+    let requests = store
+        .location_pulse_requests
+        .iter()
+        .filter(|pulse| pulse.user_handle == session.user_handle && pulse.status == LocationPulseStatus::Pending)
+        .cloned()
+        .collect();
+    Ok(Json(LocationPulseResponse { requests }))
+}
+
+async fn request_location_pulse_from_desktop(
+    State(state): State<AppState>,
+    Json(request): Json<DesktopLocationPulseRequest>,
+) -> Result<StatusCode, AppError> {
+    let pulse = {
+        let mut store = state.store.write().await;
+        let desktop = store
+            .desktops
+            .get(&request.device_token)
+            .ok_or_else(|| AppError::not_found("Unknown device token"))?
+            .clone();
+
+        let pulse = LocationPulseRequest {
+            pulse_id: Uuid::new_v4(),
+            user_handle: desktop.user_handle.clone(),
+            device_token: desktop.device_token.clone(),
+            requested_at: Utc::now(),
+            completed_at: None,
+            status: LocationPulseStatus::Pending,
+        };
+
+        store.location_pulse_requests.push(pulse.clone());
+        store
+            .location_pulse_requests
+            .sort_by_key(|saved| std::cmp::Reverse(saved.requested_at));
+        if store.location_pulse_requests.len() > 120 {
+            store.location_pulse_requests.truncate(120);
+        }
+        persist_store(&state.state_path, &store)?;
+        pulse
+    };
+
+    let _ = state.broadcaster.send(CompanionEvent::LocationPulseRequested {
+        pulse_id: pulse.pulse_id,
+        user_handle: pulse.user_handle.clone(),
+        at: pulse.requested_at,
+    });
+
+    let push_payload = serde_json::json!({
+        "title": "North Star wants a location pulse",
+        "body": "Opening a quick background pulse request from NeuralTrainer.",
+        "text": "Opening a quick background pulse request from NeuralTrainer.",
+        "type": "LOCATION_PULSE",
+        "id": pulse.pulse_id,
+        "pulseId": pulse.pulse_id,
+        "tag": "northstar-location-pulse",
+        "requireInteraction": false,
+        "url": "/?navType=LOCATION_PULSE"
+    })
+    .to_string();
+    send_notification_to_user(&pulse.user_handle, &push_payload, &state).await;
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn complete_location_pulse(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<CompleteLocationPulseRequest>,
+) -> Result<StatusCode, AppError> {
+    let session = require_session(&state, &headers).await?;
+    let pulse_id = Uuid::parse_str(request.pulse_id.trim())
+        .map_err(|_| AppError::internal("Pulse id is invalid."))?;
+    let completed_at = Utc::now();
+
+    {
+        let mut store = state.store.write().await;
+        let pulse = store
+            .location_pulse_requests
+            .iter_mut()
+            .find(|pulse| pulse.pulse_id == pulse_id && pulse.user_handle == session.user_handle)
+            .ok_or_else(|| AppError::not_found("Unknown location pulse"))?;
+
+        pulse.status = LocationPulseStatus::Fulfilled;
+        pulse.completed_at = Some(completed_at);
+        persist_store(&state.state_path, &store)?;
+    }
+
+    let _ = state.broadcaster.send(CompanionEvent::LocationPulseFulfilled {
+        pulse_id,
+        user_handle: session.user_handle,
+        at: completed_at,
+    });
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_call_sessions(

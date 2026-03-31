@@ -1,4 +1,4 @@
-self.__NORTHSTAR_SW_VERSION = "northstar-sw-v61";
+self.__NORTHSTAR_SW_VERSION = "northstar-sw-v64";
 
 self.addEventListener("install", () => {
   self.skipWaiting();
@@ -34,6 +34,8 @@ self.addEventListener("push", (event) => {
   let tag = "north-star-signal";
   let requireInteraction = false;
   let navData = null;
+  let pushType = null;
+  let pulseId = null;
 
   if (event.data) {
     const rawText = event.data.text();
@@ -43,6 +45,8 @@ self.addEventListener("push", (event) => {
       if (json.body) body = json.body;
       else if (json.text) body = json.text;
       if (json.tag) tag = json.tag;
+      if (json.type) pushType = json.type;
+      if (json.pulseId) pulseId = json.pulseId;
       if (typeof json.requireInteraction === "boolean") requireInteraction = json.requireInteraction;
       if (json.type && json.id) {
         navData = { type: json.type, id: json.id };
@@ -54,6 +58,34 @@ self.addEventListener("push", (event) => {
     } catch (_) {
       if (rawText && rawText.length > 0) body = rawText;
     }
+  }
+
+  if (pushType === "LOCATION_PULSE") {
+    event.waitUntil((async () => {
+      const clientList = await clients.matchAll({ type: "window", includeUncontrolled: true });
+      if (clientList.length > 0) {
+        await Promise.all(clientList.map((client) => client.postMessage({
+          type: "LOCATION_PULSE_REQUEST",
+          pulseId,
+        })));
+        return;
+      }
+
+      await self.registration.showNotification("North Star wants a location pulse", {
+        body: "Open North Star so it can answer a fresh location request from NeuralTrainer.",
+        icon: "/pwa-192x192.png",
+        badge: "/pwa-192x192.png",
+        tag: "northstar-location-pulse",
+        renotify: true,
+        requireInteraction: false,
+        vibrate: [80, 40, 80],
+        data: {
+          dateOfArrival: Date.now(),
+          nav: { type: "LOCATION_PULSE", id: pulseId },
+        },
+      });
+    })());
+    return;
   }
 
   event.waitUntil(

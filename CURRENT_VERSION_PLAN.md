@@ -1,33 +1,60 @@
 # Current Version Plan
 
-Status date: 2026-03-29
+Status date: 2026-03-30
 
 This file is the active implementation plan from here forward.
 
-The previous detector-and-tectonics phase is now materially complete enough to move on.
+The lived-moment delivery phase is now materially complete enough to move on.
 
 ## Aim
 
 Move from:
 
-- a companion that can interpret memory and detect life movement
+- a companion that can interpret lived moments and act through messages or calls
 
 to:
 
-- a companion that can use what it knows to act meaningfully inside lived moments
+- a companion that can participate in the real world around the user without paid dependencies
 
-This phase is about turning life awareness into timely, useful, restrained action.
+This phase is about giving the companion enough zero-cost world awareness to:
 
-The goal is not therapy, emotional handholding, or dashboard behavior.
+- notice what is nearby
+- notice what is changing outside the user
+- suggest genuinely interesting nearby openings
+- surface real cautions and warnings when the world calls for them
+- do so through a cleaner phone experience that behaves like an installable companion app instead of a developer-operated surface
+
+The goal is not tourism spam, map clutter, or generic recommendation behavior.
 
 The goal is:
 
-- enriching lived moments while they are happening
-- surfacing opportunities before they vanish
-- helping orient the user inside changing life phases
-- bridging the user back toward the right people when needed
-- warning or escalating when reality calls for it
-- doing all of this with intelligent pacing
+- grounded nearby discovery while adventuring
+- useful weather-aware guidance
+- official-warning awareness where feasible
+- background-ready phone companionship
+- pull-based location awareness that feels invisible and low-friction
+- all of it at zero recurring cost
+
+## Hard Constraint For This Phase
+
+Every new real-world input added in this phase must be usable with no paid dependency.
+
+This means:
+
+- no paid map APIs
+- no paid weather APIs
+- no paid place-discovery APIs
+- no paid alerting providers
+- no usage-based commercial services
+
+If a source only works for paid production usage, it does not qualify for this phase.
+
+Allowed direction:
+
+- open data
+- public feeds
+- official no-cost APIs
+- careful use of public infrastructure with caching and restraint
 
 ## Baseline We Are Starting From
 
@@ -35,321 +62,330 @@ Already true:
 
 - `NeuralTrainer` is the local Windows companion runtime and brain
 - `North Star` is the phone/web/server companion surface
+- the companion can classify moments, opportunities, safeguards, relational bridges, and contact rhythm
+- the companion can stay silent, draft messages, dispatch messages, and hold live calls for manual review
 - live calls work in both directions
 - realtime phone-to-desktop speech streaming works
 - live reply streaming works
-- manual companion context exists as a dedicated source of truth
-- interpreted memory exists
-- detectors exist and accumulate movement across multiple evidence sources
-- memory evolution exists
-- declared truth and observed truth are both modeled
-- divergence, cross-source coherence, and temporal phase movement are modeled
-- the user can inspect tectonic movement in the UI
-- seeded testing paths exist for support, contradiction, and accumulated movement
+- push notifications exist on `North Star`
+- phone location can already be sent from `North Star` to `NeuralTrainer`
+- user-facing message and call surfaces are now materially coherent enough for first-pass use
 
-So this plan starts after the internal memory-and-tectonics layer has become real enough to trust.
+So this plan starts after the internal lived-moment and delivery layer has become real enough to trust.
 
 ## Core Design Rule
 
-The companion should not act because one event happened.
+The companion should not merely know where the user is.
 
-It should act because:
+It should be able to ask:
 
-- it knows something about the user
-- it notices the kind of moment the user is in
-- it can judge whether the moment calls for silence, suggestion, orientation, warning, or escalation
+- what is actually around the user right now?
+- what conditions are active around them right now?
+- is any of this worth surfacing?
+- is this a moment for enrichment, caution, rerouting, or silence?
 
 That means:
 
-- memory informs behavior
-- detectors shape timing and confidence
-- real-world context matters
-- pacing matters
-- intervention should feel earned
+- location is not enough on its own
+- the outside world must be modeled explicitly
+- nearby suggestions should be filterable and user-shaped
+- warnings should come from real public signals where possible
+- phone behavior should feel passive and permission-based, not manually operated
+
+## Product Direction For This Phase
+
+This phase has two major tracks that must land together.
+
+### Track 1: Zero-Cost Real-World Presence
+
+The companion should become able to combine the user's current place and movement with free real-world inputs such as:
+
+- nearby points of interest
+- nearby natural and cultural features
+- local weather
+- short-horizon weather change
+- daylight state
+- air quality
+- official public warning signals where available
+
+This is the layer that lets the companion say useful things like:
+
+- there is something genuinely interesting nearby
+- rain is likely soon, so this route may stop feeling good
+- daylight is running out
+- a real warning applies to this area
+
+### Track 2: North Star As A Background Companion App
+
+`North Star` should behave more like an installable companion app and less like a user-operated web control panel.
+
+This means:
+
+- it should be installable from Chrome on Android as a proper PWA
+- the user should grant location permission once rather than manage continuous sharing manually
+- after permission is granted and the desktop is linked, `NeuralTrainer` should be able to request a location pulse when needed
+- `North Star` should remain reachable in the background as much as the platform allows for push, call signaling, and location pulse response
+
+The desired model is:
+
+- user grants permission
+- companion asks when it needs a pulse
+- phone responds
+- user does not babysit live location mode
 
 ## Pillar Directions For This Phase
 
-These are not optional alternatives.
+### Pillar 1: Nearby Discovery Worth Suggesting
 
-They are the pillars of the phase.
-
-### Pillar 1: Lived Moment Enrichment
-
-The companion should notice when a moment has become unusually alive, open, meaningful, or exploratory and help deepen it while it is still happening.
+The companion should be able to notice nearby places that may actually be worth surfacing while the user is out in the world.
 
 This means it should become capable of:
 
-- noticing when the user is outside normal rhythm
-- recognizing when a moment may hold unusual possibility
-- surfacing nearby or timely opportunities that could enrich the moment
-- making suggestions that widen the moment without hijacking it
+- querying nearby real-world candidates from zero-cost sources
+- distinguishing ordinary businesses from genuinely interesting places
+- favoring places that fit wandering, exploration, and meaningful discovery
+- letting the user define and expand what kinds of places count as interesting
 
 Core question:
 
-- how can this moment become more alive, meaningful, fortunate, or memorable if the companion notices the right thing in time?
+- what is near the user right now that may genuinely be worth noticing?
 
-### Pillar 2: Situational Safeguarding
+### Pillar 2: Practical World Awareness
 
-The companion should notice when the user may need warning, caution, or escalation because of the world around them.
+The companion should be able to notice world conditions that materially affect whether something is advisable, enjoyable, or worth adjusting.
 
 This means it should become capable of:
 
-- monitoring relevant external conditions
-- judging whether those conditions matter to this user, in this place, at this time
-- choosing whether to stay silent, send a message, or escalate to a call
-- being protective without becoming alarmist
+- reading current weather and short-horizon change
+- noticing wind, rain, cold, heat, poor air quality, and fading daylight
+- shaping suggestions according to those conditions
+- withholding or redirecting suggestions when the world makes them less fitting
 
 Core question:
 
-- is something happening around the user that they may need to know now?
+- what is happening in the surrounding conditions that changes what makes sense right now?
 
-### Pillar 3: Relational Bridging
+### Pillar 3: Public Warning Awareness
 
-The companion should notice when the user may need human contact and help bridge them back toward the right people.
-
-This does not mean replacing human relationship.
-
-It means helping restore connection when the moment calls for it.
+The companion should be able to react when real public warning signals matter to the user's current area.
 
 This means it should become capable of:
 
-- knowing who matters in the user's life
-- noticing when a certain kind of contact may help
-- suggesting the right person at the right time
-- helping the user make that move gently if needed
+- ingesting no-cost official or quasi-official warning feeds where available
+- matching warning geography to the user's context
+- distinguishing caution-worthy warnings from ignore-worthy noise
+- warning without becoming theatrical or alarmist
 
 Core question:
 
-- who or what kind of human contact might actually help right now?
+- is there a real public warning affecting this area that the user should know now?
 
-### Pillar 4: Phase Navigation
+### Pillar 4: User-Shaped Discovery Filters
 
-The companion should notice when life is entering a threshold, drift, rupture, opening, return, or new phase and help orient the user inside it.
+The companion should not hardcode one permanent definition of what counts as interesting.
+
+The user should be able to expand and tune discovery filters inside `NeuralTrainer`.
 
 This means it should become capable of:
 
-- recognizing that a week or period is different from normal
-- distinguishing wobble from sustained phase change
-- speaking in ways that help the user orient without overconcluding
-- letting timing, tone, and intervention type depend on the phase the user appears to be in
+- showing the current nearby-interest categories
+- allowing categories to be enabled, disabled, reordered, or expanded
+- allowing the user to add new tags or filter families over time
+- using those filters in the real-world discovery scoring pipeline
 
 Core question:
 
-- what kind of phase is this, and what kind of companionship does that phase need?
+- what kinds of nearby things does this user actually want surfaced?
 
-### Pillar 5: Opportunity Guidance
+### Pillar 5: Background Companion Reachability
 
-The companion should notice openings that are easy to miss and surface them while they are still real.
+`North Star` should feel installable, reachable, and low-friction enough that the desktop can rely on it as a living companion surface.
 
 This means it should become capable of:
 
-- seeing small windows of possibility
-- noticing practical, social, place-based, and emotional openings
-- making suggestions while they are still actionable
-- helping the user notice what might matter now rather than too late
+- presenting as an installable PWA on Android Chrome
+- preserving service worker and notification behavior cleanly
+- replacing the current user-facing live location controls with a permission-and-pulse model
+- supporting desktop-requested location pulses within platform limits
 
 Core question:
 
-- what is possible right now that might matter if noticed in time?
-
-### Underlying Regulator: Contact Rhythm Intelligence
-
-All pillar behavior should be governed by contact rhythm intelligence.
-
-This is the layer that decides:
-
-- whether to stay silent
-- whether to send a light message
-- whether to ask permission
-- whether to suggest
-- whether to orient
-- whether to warn
-- whether to escalate to a call
-
-This is not a standalone pillar.
-
-It is the pacing and escalation system that makes all the others feel right.
-
-Core question:
-
-- what level of contact is appropriate for this moment?
+- can the phone remain available enough in the background that the companion can quietly do what it needs?
 
 ## Current Version Goals
 
-### Goal 1: Real-World Moment Interpretation
+### Goal 1: Real-World Signal Layer
 
-Build the first layer that combines:
+Build the first backend layer for zero-cost external signals using sources such as:
 
-- memory
-- detector movement
-- passive context
-- location and timing
-- external world signals
+- OpenStreetMap Overpass
+- OpenStreetMap Nominatim used sparingly and with cache
+- Wikipedia Geosearch
+- Open-Meteo
+- MeteoAlarm
+- KNMI open data where it adds value
+- sunrise/sunset data
 
-into a judgment about what kind of moment the user is currently in.
+This should produce normalized external signals such as:
 
-This should produce internal moment assessments such as:
+- nearby interesting place candidates
+- weather state
+- weather shift
+- daylight state
+- air-quality caution
+- public warning candidates
 
-- ordinary
-- exploratory
-- open
-- vulnerable
-- urgent
-- protective
-- connective
-- opportunity-rich
-- transition-heavy
+### Goal 2: Nearby Discovery Ranking
 
-These are not final truths.
+Build the first nearby discovery pipeline that can:
 
-They are action-shaping readings.
+- gather nearby candidates
+- filter them against user-interest categories
+- rank them by relevance, novelty, context, and conditions
+- surface only the strongest suggestions
 
-### Goal 2: Actionable Opportunity and Safeguard Detection
+The system should become capable of producing suggestion-ready signals such as:
 
-Build the first system that can notice:
+- nearby worthwhile place
+- nearby scenic opening
+- nearby cultural point
+- nearby nature opening
+- nearby curiosity worth a short detour
 
-- meaningful nearby opportunities
-- relevant world-state risks
-- context-sensitive openings
-- time-sensitive warnings
+### Goal 3: Weather And Condition Shaping
 
-without hardcoding one-off product behaviors.
+Build the first practical world-conditioning layer that can:
 
-The system should become capable of producing actionable moment signals such as:
+- adjust nearby suggestions for weather and daylight
+- create caution signals from conditions
+- suppress poor-fit opportunities
+- reroute a suggestion toward something more suitable
 
-- enrich this moment
-- surface this opening
-- warn now
-- stay quiet
-- watch for escalation
+### Goal 4: Warning And Safety Matching
 
-### Goal 3: Relational Recommendation Layer
+Build the first warning pipeline that can:
 
-Build the first system that can infer when human contact may matter and which contact may fit the moment.
+- ingest public warning signals
+- match them to current user area
+- rate urgency and relevance
+- choose between silence, caution, warning message, or stronger escalation
 
-This should use:
+### Goal 5: North Star Installability And Pull-Based Location
 
-- relational memory
-- recent movement
-- current phase
-- contact history
+Rework the phone-side model so:
 
-to shape gentle, grounded bridging behavior.
+- `North Star` is installable from Chrome on Android
+- the user grants location permission once
+- the desktop can request a location pulse when needed
+- the user no longer has to manually run live location mode
+- the phone remains ready for push, call signaling, and pulse response in the background as much as platform behavior allows
 
-### Goal 4: Contact Rhythm and Escalation Engine
+This goal must also become ultra user friendly after the first functional pass.
 
-Build the decision layer that chooses:
+That means:
 
-- silence
-- lightweight message
-- soft suggestion
-- stronger suggestion
-- warning message
-- follow-up
-- call escalation
+- the user should not need to understand sessions, bindings, subscriptions, or setup sequencing
+- location pulses should auto-refresh and auto-answer whenever permissions and push are already in place
+- the phone should not need manual refreshes to discover pending pulse requests
+- setup failures should explain themselves plainly instead of reading like developer/operator states
+- the product should feel like a companion app, not a debugging console
 
-This should be sensitive to:
+### Goal 6: User-Editable Discovery Preferences
 
-- urgency
-- confidence
-- user rhythm
-- recent contact load
-- current phase
-- protective boundaries
+Expose nearby-interest filtering in `NeuralTrainer` so the user can:
 
-### Goal 5: North Star Delivery as Lived Intervention
-
-Use `North Star` as the action surface for moment-aware behavior.
-
-That means the system should become able to:
-
-- send useful, timely messages
-- escalate to calls when appropriate
-- carry relevant context into those messages or calls
-- make interventions feel situational rather than generic
-
-The important thing is not just sending something.
-
-It is sending the right kind of contact at the right time.
+- inspect the current discovery categories
+- enable or disable them
+- expand them over time
+- shape what counts as interesting nearby
 
 ## System Capabilities Needed In This Phase
 
 This phase should introduce or deepen:
 
-- moment classification from multiple signals
-- external-world lookups relevant to place, timing, and safety
-- opportunity scoring
-- safeguard scoring
-- relational bridging scoring
-- contact rhythm scoring
-- escalation thresholds
-- memory-informed action selection
-- message generation shaped by moment type
-- call escalation shaped by urgency and silence/failure to respond
+- zero-cost external data source adapters
+- caching and freshness rules for world signals
+- nearby point-of-interest querying
+- nearby point-of-interest filtering by category
+- user-editable nearby-interest category management
+- world-signal normalization
+- weather interpretation
+- warning interpretation
+- distance and walkability heuristics
+- suggestion suppression under poor conditions
+- desktop-requested location pulse flow
+- installable PWA readiness on `North Star`
+- background-friendly phone signaling behavior
 
 ## Suggested Working Order
 
 ### Step 1
 
-Build moment interpretation that combines:
+Build the real-world signal scaffolding:
 
-- memory
-- detectors
-- passive context
-- current location/time
-- recent phase movement
-
-into action-shaping moment states.
+- source adapters
+- normalized world-signal models
+- cache tables and freshness policy
+- initial Open-Meteo and daylight integration
 
 ### Step 2
 
-Build the first opportunity and safeguard pipeline that can score:
+Build nearby discovery from zero-cost sources:
 
-- enrichable moments
-- actionable openings
-- urgent warnings
-
-using external context where relevant.
+- Overpass querying
+- Wikipedia Geosearch enrichment
+- category filtering
+- first ranking pass
 
 ### Step 3
 
-Build relational bridging recommendations from:
+Expose user-editable discovery filters in `NeuralTrainer`:
 
-- relational memory
-- recent strain or isolation
-- current life phase
-- known meaningful people
+- visible categories
+- enable/disable
+- expansion path for more filters
+- scoring integration
 
 ### Step 4
 
-Build contact rhythm intelligence and escalation logic so the companion can decide:
+Build warning and condition shaping:
 
-- silence
-- message
-- suggestion
-- warning
-- call
+- MeteoAlarm and related warning ingestion
+- Dutch-relevant warning handling
+- weather-conditioned suggestion shaping
+- caution and warning action signals
 
 ### Step 5
 
-Expose enough of this in the product so the user can understand:
+Rework `North Star` location and installability:
 
-- what kind of moment the system thinks this is
-- why it acted or stayed silent
-- what pillar was in play
-- what escalation logic led to the behavior
+- installable PWA behavior from Chrome on Android
+- permission-based location model
+- desktop-triggered location pulse flow
+- removal of user-managed continuous location controls from the main experience
+
+### Step 6
+
+Use the new world-awareness layer inside the companion experience:
+
+- nearby suggestion generation
+- weather-aware reranking
+- caution/warning delivery through `North Star`
+- call escalation only where truly justified
 
 ## Completion Condition For This Phase
 
 This phase is complete when:
 
-- the companion can classify lived moments in actionable ways
-- the companion can surface meaningful opportunities while they are still live
-- the companion can issue relevant warnings when the situation calls for it
-- the companion can suggest human reconnection when the moment calls for it
-- the companion can pace itself through silence, message, and call escalation intelligently
-- `North Star` becomes a real lived-moment intervention surface rather than only a conversation surface
-- the user can feel that the system helps them live moments better, safer, or more fully while they are happening
+- the companion can ingest zero-cost real-world signals reliably enough to use them
+- the companion can surface nearby interesting places that are filterable and user-shaped
+- the companion can adjust suggestions based on weather, daylight, and other practical conditions
+- the companion can react to public warning signals where feasible
+- `North Star` is installable from Chrome on Android
+- location sharing becomes permission-based and pulse-based rather than a manually toggled continuous mode
+- the user can feel that the companion knows not just their inner life and movement, but something real about the world immediately around them
+
+And after the first functional pass is proven, the next cleanup pass must make the onboarding and pulse flow radically simpler so a normal user is not forced into developer-like recovery steps.
 
 ## Update Rule
 

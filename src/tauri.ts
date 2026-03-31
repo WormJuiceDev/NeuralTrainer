@@ -22,6 +22,7 @@ import type {
   DraftedOutreachDispatchResult,
   LocationEventInput,
   LivedMomentSnapshot,
+  NearbyInterestFilter,
   ManualReflection,
   MemoryGrowthSnapshot,
   MemorySystemSnapshot,
@@ -31,6 +32,7 @@ import type {
   NorthStarRtcIceServer,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
+  RealWorldPresenceSnapshot,
   SimulationRunInput,
   SimulationRunResult,
   SimulationScenario,
@@ -55,8 +57,10 @@ import type {
   UpdateCompanionContextEntryInput,
   UpdateCompanionContextCategoryIconInput,
   UpdateMemoryItemInput,
+  UpdateNearbyInterestFilterInput,
   UpdatePlaceInput,
   UpdateRuleInput,
+  CreateNearbyInterestFilterInput,
 } from "./types";
 
 export const loadSettings = () => invoke<AppSettings>("load_settings");
@@ -113,6 +117,9 @@ export const sendNorthStarMessage = (text: string) =>
 
 export const sendNorthStarCallRequest = (note: string) =>
   invoke<NorthStarSnapshot>("send_north_star_call_request", { note });
+
+export const requestNorthStarLocationPulse = () =>
+  invoke<NorthStarSnapshot>("request_north_star_location_pulse");
 
 export const dispatchDraftedOutreach = (outreachEventId: number) =>
   invoke<DraftedOutreachDispatchResult>("dispatch_drafted_outreach", { outreachEventId });
@@ -272,6 +279,18 @@ export const getPhaseThreeSnapshot = () =>
 
 export const getLivedMomentSnapshot = () =>
   invoke<LivedMomentSnapshot>("get_lived_moment_snapshot");
+
+export const getRealWorldPresenceSnapshot = () =>
+  invoke<RealWorldPresenceSnapshot>("get_real_world_presence_snapshot");
+
+export const listNearbyInterestFilters = () =>
+  invoke<NearbyInterestFilter[]>("list_nearby_interest_filters");
+
+export const createNearbyInterestFilter = (payload: CreateNearbyInterestFilterInput) =>
+  invoke<NearbyInterestFilter[]>("create_nearby_interest_filter", { payload });
+
+export const updateNearbyInterestFilter = (payload: UpdateNearbyInterestFilterInput) =>
+  invoke<NearbyInterestFilter[]>("update_nearby_interest_filter", { payload });
 
 export const runMessageDecisions = () =>
   invoke<DecisionRunResult>("run_message_decisions");

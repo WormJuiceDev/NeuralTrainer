@@ -4,32 +4,37 @@ use std::{
   path::PathBuf,
 };
 
-use chrono::{DateTime, Datelike, Duration, NaiveTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveTime, TimeZone, Timelike, Utc};
 use chrono_tz::Tz;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
+use serde::Deserialize;
 use serde_json::json;
 
 use crate::{
   error::AppError,
   models::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DecisionRunResult,
+    CreateNearbyInterestFilterInput,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSection, CompanionContextSnapshot, CompanionHomeSnapshot,
     CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput, UpdateCompanionContextEntryInput,
     DetectorRecord, InterpretedMemoryItem, MemoryEvolutionState, MemorySystemCount, MemorySystemOverview, MemorySystemSnapshot, TectonicTimelineSnapshot,
     DecisionSnapshot, DiagnosticStatus, EndCallSessionInput, InboundMessage, InferredSleepWindow,
     LivedMomentAssessment, LivedMomentContactRhythmOption, LivedMomentDetectorPressure, LivedMomentMemoryInfluence, LivedMomentOpportunity, LivedMomentRelationalBridge, LivedMomentSafeguard, LivedMomentSignal, LivedMomentSituationalSignal, LivedMomentSnapshot,
+    NearbyDiscoveryCandidate, NearbyInterestFilter,
     LocationEventInput, ManualReflection, MemoryOverview, MomentDecision, OutreachEvent,
     MemoryGrowthSnapshot, MemoryItem, OutreachFeedback, PassiveContextSnapshot, PhaseOneSnapshot, PhaseThreeSnapshot, Place,
     NorthStarCallReview,
     PlaceVisit, ProtectedRule, RawLocationEvent, ReflectionKindCount,
+    RealWorldDaylightSnapshot, RealWorldPresenceSnapshot, RealWorldWeatherSnapshot,
     RepeatedPlaceSummary, RealityCheckItem, RhythmBaselineEntry, SavedMoment, SettingsEntry,
     SimulationRunInput, SimulationRunResult, SimulationScenario, SimulationSuiteCheck,
     SimulationSuiteResult, StartCallSessionInput, SubmitFeedbackInput, UpdateMemoryItemInput,
-    UpdatePlaceInput, UpdateRuleInput, MvpRealityCheckSnapshot,
+    UpdateNearbyInterestFilterInput, UpdatePlaceInput, UpdateRuleInput, MvpRealityCheckSnapshot,
+    WorldSignalSourceStatus,
   },
 };
 
-pub const SCHEMA_VERSION: i64 = 18;
+pub const SCHEMA_VERSION: i64 = 19;
 
 const COMPANION_CONTEXT_CATEGORY_DEFS: [(&str, &str, &str, &str); 11] = [
     ("friends", "Friends", "The people you lean toward, miss, trust, or feel alive around.", "users"),
@@ -44,6 +49,80 @@ const COMPANION_CONTEXT_CATEGORY_DEFS: [(&str, &str, &str, &str); 11] = [
     ("life_principles", "Life Principles", "Values, lines you do not want to cross, and truths you try to live by.", "compass"),
     ("music", "Music", "Artists, sounds, moods, or songs that carry identity, memory, and feeling.", "music"),
   ];
+
+const NEARBY_INTEREST_FILTER_DEFS: [(&str, &str, &str, &[&str]); 8] = [
+  ("viewpoints", "Viewpoints", "Lookouts, towers, and places that might open the landscape up.", &["viewpoint", "tower", "observation"]),
+  ("nature", "Nature", "Parks, woods, waterfronts, and natural places worth slowing down for.", &["park", "garden", "wood", "forest", "nature_reserve", "beach", "waterfall"]),
+  ("heritage", "Heritage", "Historic or cultural places with local weight or memory.", &["castle", "fort", "memorial", "archaeological_site", "monument", "heritage"]),
+  ("museums", "Museums", "Museums and public cultural spaces.", &["museum", "gallery", "exhibition"]),
+  ("sacred_places", "Sacred Places", "Churches, chapels, temples, and quiet places with atmosphere.", &["church", "chapel", "temple", "synagogue", "mosque"]),
+  ("public_art", "Public Art", "Murals, sculptures, and art in the open.", &["artwork", "sculpture", "mural"]),
+  ("trails", "Trails", "Trails, scenic paths, and walking-oriented openings.", &["trail", "path", "route", "hiking"]),
+  ("curiosities", "Curiosities", "Unusual local details that may make wandering feel alive.", &["ruins", "windmill", "lighthouse", "bridge", "cave"]),
+];
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OpenMeteoCurrentWeatherResponse {
+  current: Option<OpenMeteoCurrentBlock>,
+  hourly: Option<OpenMeteoHourlyBlock>,
+  daily: Option<OpenMeteoDailyBlock>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OpenMeteoCurrentBlock {
+  temperature_2m: Option<f64>,
+  apparent_temperature: Option<f64>,
+  weather_code: Option<i64>,
+  wind_speed_10m: Option<f64>,
+  precipitation: Option<f64>,
+  is_day: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OpenMeteoHourlyBlock {
+  precipitation_probability: Option<Vec<Option<f64>>>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OpenMeteoDailyBlock {
+  sunrise: Option<Vec<String>>,
+  sunset: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OverpassResponse {
+  elements: Vec<OverpassElement>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OverpassElement {
+  tags: Option<HashMap<String, String>>,
+  lat: Option<f64>,
+  lon: Option<f64>,
+  center: Option<OverpassCenter>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct OverpassCenter {
+  lat: f64,
+  lon: f64,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct WikipediaGeoSearchResponse {
+  query: Option<WikipediaGeoSearchQuery>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct WikipediaGeoSearchQuery {
+  geosearch: Vec<WikipediaGeoSearchItem>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize)]
+struct WikipediaGeoSearchItem {
+  title: String,
+  dist: Option<f64>,
+}
 
 pub fn init_storage() -> Result<(PathBuf, PathBuf, String), AppError> {
   let base_dir = dirs::data_local_dir().ok_or(AppError::MissingAppDataDir)?;
@@ -352,6 +431,633 @@ pub fn diagnostics(
     last_initialized_at: last_initialized_at.to_string(),
     recent_events,
   })
+}
+
+fn slugify_nearby_interest_label(label: &str) -> String {
+  let base = slugify_companion_context_label(label);
+  if base.is_empty() { "custom_interest".into() } else { base }
+}
+
+fn weather_code_summary(weather_code: Option<i64>) -> &'static str {
+  match weather_code.unwrap_or(-1) {
+    0 => "Clear",
+    1 | 2 => "Partly cloudy",
+    3 => "Overcast",
+    45 | 48 => "Fog",
+    51 | 53 | 55 | 56 | 57 => "Drizzle",
+    61 | 63 | 65 | 66 | 67 => "Rain",
+    71 | 73 | 75 | 77 => "Snow",
+    80 | 81 | 82 => "Showers",
+    95 | 96 | 99 => "Thunderstorm",
+    _ => "Unknown conditions",
+  }
+}
+
+fn weather_caution_level(
+  precipitation_probability: Option<f64>,
+  wind_speed_kph: Option<f64>,
+  weather_code: Option<i64>,
+) -> &'static str {
+  let rainy = precipitation_probability.unwrap_or(0.0) >= 60.0
+    || matches!(weather_code.unwrap_or(-1), 61 | 63 | 65 | 80 | 81 | 82 | 95 | 96 | 99);
+  let windy = wind_speed_kph.unwrap_or(0.0) >= 35.0;
+  if rainy || windy {
+    "caution"
+  } else {
+    "clear"
+  }
+}
+
+fn daylight_state_for(now: DateTime<Tz>, sunrise_at: Option<DateTime<Tz>>, sunset_at: Option<DateTime<Tz>>) -> (String, Option<i64>) {
+  match (sunrise_at, sunset_at) {
+    (Some(sunrise), Some(sunset)) => {
+      if now < sunrise {
+        ("before_sunrise".into(), Some((sunrise - now).num_minutes()))
+      } else if now < sunset {
+        ("daylight".into(), Some((sunset - now).num_minutes()))
+      } else {
+        ("after_sunset".into(), None)
+      }
+    }
+    _ => ("unknown".into(), None),
+  }
+}
+
+fn parse_datetime_in_timezone(value: &str, timezone: Tz) -> Option<DateTime<Tz>> {
+  DateTime::parse_from_rfc3339(value)
+    .map(|parsed| parsed.with_timezone(&timezone))
+    .ok()
+    .or_else(|| chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M").ok().and_then(|naive| timezone.from_local_datetime(&naive).single()))
+}
+
+fn load_external_signal_cache(
+  connection: &Connection,
+  cache_key: &str,
+) -> Result<Option<(String, String)>, AppError> {
+  connection.query_row(
+    "SELECT payload_json, fetched_at FROM external_signal_cache WHERE cache_key = ?1",
+    params![cache_key],
+    |row| Ok((row.get(0)?, row.get(1)?)),
+  ).optional().map_err(AppError::from)
+}
+
+fn store_external_signal_cache(
+  connection: &Connection,
+  cache_key: &str,
+  source_key: &str,
+  payload_json: &str,
+) -> Result<(), AppError> {
+  let now = Utc::now().to_rfc3339();
+  connection.execute(
+    r#"
+      INSERT INTO external_signal_cache (cache_key, source_key, payload_json, fetched_at, expires_at)
+      VALUES (?1, ?2, ?3, ?4, ?5)
+      ON CONFLICT(cache_key) DO UPDATE SET
+        source_key = excluded.source_key,
+        payload_json = excluded.payload_json,
+        fetched_at = excluded.fetched_at,
+        expires_at = excluded.expires_at
+    "#,
+    params![cache_key, source_key, payload_json, now, now],
+  )?;
+  Ok(())
+}
+
+fn latest_raw_location_event(connection: &Connection) -> Result<Option<RawLocationEvent>, AppError> {
+  connection.query_row(
+    r#"
+      SELECT id, occurred_at, latitude, longitude, accuracy_meters, speed_mps, movement_state, source, created_at
+      FROM raw_location_events
+      ORDER BY occurred_at DESC, id DESC
+      LIMIT 1
+    "#,
+    [],
+    |row| Ok(RawLocationEvent {
+      id: row.get(0)?,
+      occurred_at: row.get(1)?,
+      latitude: row.get(2)?,
+      longitude: row.get(3)?,
+      accuracy_meters: row.get(4)?,
+      speed_mps: row.get(5)?,
+      movement_state: row.get(6)?,
+      source: row.get(7)?,
+      created_at: row.get(8)?,
+    }),
+  ).optional().map_err(AppError::from)
+}
+
+fn list_nearby_interest_filters_with_connection(connection: &Connection) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let mut statement = connection.prepare(
+    r#"
+      SELECT
+        id, category_key, label, description, tags_json, is_enabled, display_order,
+        is_user_defined, created_at, updated_at
+      FROM nearby_interest_filters
+      ORDER BY display_order ASC, label COLLATE NOCASE ASC, id ASC
+    "#,
+  )?;
+
+  let rows = statement.query_map([], |row| {
+    let tags_json: String = row.get(4)?;
+    Ok(NearbyInterestFilter {
+      id: row.get(0)?,
+      category_key: row.get(1)?,
+      label: row.get(2)?,
+      description: row.get(3)?,
+      tags: serde_json::from_str(&tags_json).unwrap_or_default(),
+      is_enabled: row.get::<_, i64>(5)? != 0,
+      display_order: row.get(6)?,
+      is_user_defined: row.get::<_, i64>(7)? != 0,
+      created_at: row.get(8)?,
+      updated_at: row.get(9)?,
+    })
+  })?;
+
+  rows.collect::<Result<Vec<_>, _>>().map_err(AppError::from)
+}
+
+fn fetch_open_meteo_snapshot(
+  latitude: f64,
+  longitude: f64,
+) -> Result<OpenMeteoCurrentWeatherResponse, AppError> {
+  let client = reqwest::blocking::Client::new();
+  let response = client
+    .get("https://api.open-meteo.com/v1/forecast")
+    .query(&[
+      ("latitude", latitude.to_string()),
+      ("longitude", longitude.to_string()),
+      ("current", "temperature_2m,apparent_temperature,weather_code,wind_speed_10m,precipitation,is_day".into()),
+      ("hourly", "precipitation_probability".into()),
+      ("daily", "sunrise,sunset".into()),
+      ("forecast_days", "1".into()),
+      ("timezone", "auto".into()),
+    ])
+    .send()?
+    .error_for_status()?;
+  Ok(response.json()?)
+}
+
+fn fetch_overpass_candidates(
+  latitude: f64,
+  longitude: f64,
+  radius_meters: i64,
+) -> Result<OverpassResponse, AppError> {
+  let query = format!(
+    r#"[out:json][timeout:20];
+(
+  node(around:{radius_meters},{latitude},{longitude})[tourism];
+  way(around:{radius_meters},{latitude},{longitude})[tourism];
+  relation(around:{radius_meters},{latitude},{longitude})[tourism];
+  node(around:{radius_meters},{latitude},{longitude})[historic];
+  way(around:{radius_meters},{latitude},{longitude})[historic];
+  relation(around:{radius_meters},{latitude},{longitude})[historic];
+  node(around:{radius_meters},{latitude},{longitude})[leisure];
+  way(around:{radius_meters},{latitude},{longitude})[leisure];
+  relation(around:{radius_meters},{latitude},{longitude})[leisure];
+  node(around:{radius_meters},{latitude},{longitude})[natural];
+  way(around:{radius_meters},{latitude},{longitude})[natural];
+  relation(around:{radius_meters},{latitude},{longitude})[natural];
+  node(around:{radius_meters},{latitude},{longitude})[amenity];
+  way(around:{radius_meters},{latitude},{longitude})[amenity];
+  relation(around:{radius_meters},{latitude},{longitude})[amenity];
+  node(around:{radius_meters},{latitude},{longitude})[man_made];
+  way(around:{radius_meters},{latitude},{longitude})[man_made];
+  relation(around:{radius_meters},{latitude},{longitude})[man_made];
+);
+out center tags qt;"#
+  );
+  let client = reqwest::blocking::Client::new();
+  let response = client
+    .post("https://overpass-api.de/api/interpreter")
+    .header("Content-Type", "text/plain")
+    .body(query)
+    .send()?
+    .error_for_status()?;
+  Ok(response.json()?)
+}
+
+fn fetch_wikipedia_geosearch(
+  latitude: f64,
+  longitude: f64,
+) -> Result<WikipediaGeoSearchResponse, AppError> {
+  let client = reqwest::blocking::Client::new();
+  let response = client
+    .get("https://en.wikipedia.org/w/api.php")
+    .query(&[
+      ("action", "query"),
+      ("format", "json"),
+      ("list", "geosearch"),
+      ("gscoord", &format!("{latitude}|{longitude}")),
+      ("gsradius", "5000"),
+      ("gslimit", "10"),
+    ])
+    .send()?
+    .error_for_status()?;
+  Ok(response.json()?)
+}
+
+fn haversine_distance_meters(latitude_a: f64, longitude_a: f64, latitude_b: f64, longitude_b: f64) -> f64 {
+  let earth_radius_m = 6_371_000.0;
+  let lat_a = latitude_a.to_radians();
+  let lat_b = latitude_b.to_radians();
+  let delta_lat = (latitude_b - latitude_a).to_radians();
+  let delta_lon = (longitude_b - longitude_a).to_radians();
+  let a = (delta_lat / 2.0).sin().powi(2)
+    + lat_a.cos() * lat_b.cos() * (delta_lon / 2.0).sin().powi(2);
+  let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
+  earth_radius_m * c
+}
+
+fn overpass_element_coords(element: &OverpassElement) -> Option<(f64, f64)> {
+  match (element.lat, element.lon, element.center.as_ref()) {
+    (Some(lat), Some(lon), _) => Some((lat, lon)),
+    (_, _, Some(center)) => Some((center.lat, center.lon)),
+    _ => None,
+  }
+}
+
+fn nearby_filter_match_score(filter: &NearbyInterestFilter, tags: &HashMap<String, String>) -> f64 {
+  let mut score = 0.0;
+  for tag in &filter.tags {
+    let needle = tag.to_ascii_lowercase();
+    if tags.iter().any(|(key, value)| key.eq_ignore_ascii_case(&needle) || value.eq_ignore_ascii_case(&needle) || value.to_ascii_lowercase().contains(&needle)) {
+      score += 1.0;
+    }
+  }
+  score
+}
+
+fn summarize_overpass_candidate(tags: &HashMap<String, String>, distance_meters: Option<f64>) -> String {
+  let primary = tags.get("tourism")
+    .or_else(|| tags.get("historic"))
+    .or_else(|| tags.get("leisure"))
+    .or_else(|| tags.get("natural"))
+    .or_else(|| tags.get("amenity"))
+    .or_else(|| tags.get("man_made"))
+    .cloned()
+    .unwrap_or_else(|| "place".into());
+  match distance_meters {
+    Some(distance) => format!("A nearby {primary} about {} meters away.", distance.round() as i64),
+    None => format!("A nearby {primary} worth considering."),
+  }
+}
+
+fn rank_nearby_candidates(
+  latitude: f64,
+  longitude: f64,
+  filters: &[NearbyInterestFilter],
+  overpass: &OverpassResponse,
+  wikipedia: &WikipediaGeoSearchResponse,
+  weather: Option<&RealWorldWeatherSnapshot>,
+  daylight: Option<&RealWorldDaylightSnapshot>,
+) -> Vec<NearbyDiscoveryCandidate> {
+  let mut candidates = Vec::new();
+
+  for element in &overpass.elements {
+    let Some(tags) = element.tags.as_ref() else { continue; };
+    let Some(title) = tags.get("name").cloned() else { continue; };
+    let best_filter = filters
+      .iter()
+      .filter(|filter| filter.is_enabled)
+      .map(|filter| (filter, nearby_filter_match_score(filter, tags)))
+      .filter(|(_, score)| *score > 0.0)
+      .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let Some((filter, tag_score)) = best_filter else { continue; };
+    let distance_meters = overpass_element_coords(element)
+      .map(|(lat, lon)| haversine_distance_meters(latitude, longitude, lat, lon));
+    let distance_score = match distance_meters {
+      Some(distance) if distance <= 300.0 => 1.0,
+      Some(distance) if distance <= 800.0 => 0.8,
+      Some(distance) if distance <= 1600.0 => 0.55,
+      Some(distance) if distance <= 2600.0 => 0.35,
+      Some(_) => 0.15,
+      None => 0.25,
+    };
+    let wiki_bonus = if wikipedia
+      .query
+      .as_ref()
+      .is_some_and(|query| query.geosearch.iter().any(|item| item.title.eq_ignore_ascii_case(&title)))
+    {
+      0.2
+    } else {
+      0.0
+    };
+    let weather_penalty = if weather.is_some_and(|snapshot| snapshot.caution_level == "caution") { 0.08 } else { 0.0 };
+    let darkness_penalty = if daylight.is_some_and(|snapshot| snapshot.daylight_state == "after_sunset") { 0.08 } else { 0.0 };
+    let score = (0.35 + (tag_score * 0.18) + distance_score + wiki_bonus - weather_penalty - darkness_penalty).clamp(0.0, 2.0);
+
+    let mut tag_lines = tags
+      .iter()
+      .filter_map(|(key, value)| {
+        if ["tourism", "historic", "leisure", "natural", "amenity", "man_made"].contains(&key.as_str()) {
+          Some(format!("{key}:{value}"))
+        } else {
+          None
+        }
+      })
+      .collect::<Vec<_>>();
+    tag_lines.sort();
+
+    candidates.push(NearbyDiscoveryCandidate {
+      title,
+      source: if wiki_bonus > 0.0 { "openstreetmap+wikipedia".into() } else { "openstreetmap".into() },
+      category_key: filter.category_key.clone(),
+      distance_meters,
+      score,
+      tags: tag_lines,
+      summary: summarize_overpass_candidate(tags, distance_meters),
+    });
+  }
+
+  if let Some(query) = wikipedia.query.as_ref() {
+    for item in &query.geosearch {
+      if candidates.iter().any(|candidate| candidate.title.eq_ignore_ascii_case(&item.title)) {
+        continue;
+      }
+      candidates.push(NearbyDiscoveryCandidate {
+        title: item.title.clone(),
+        source: "wikipedia".into(),
+        category_key: "curiosities".into(),
+        distance_meters: item.dist,
+        score: 0.45,
+        tags: vec!["wikipedia".into()],
+        summary: match item.dist {
+          Some(distance) => format!("A nearby place with a known story about {} meters away.", distance.round() as i64),
+          None => "A nearby place with a known story.".into(),
+        },
+      });
+    }
+  }
+
+  candidates.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+  candidates.truncate(8);
+  candidates
+}
+
+pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPresenceSnapshot, AppError> {
+  let connection = Connection::open(db_path)?;
+  let settings = load_settings(db_path)?;
+  let timezone: Tz = settings.timezone.parse().unwrap_or(chrono_tz::UTC);
+  let captured_at = Utc::now().to_rfc3339();
+  let filters = list_nearby_interest_filters_with_connection(&connection)?;
+  let latest_location = latest_raw_location_event(&connection)?;
+
+  let Some(location) = latest_location else {
+    return Ok(RealWorldPresenceSnapshot {
+      captured_at: captured_at.clone(),
+      timezone: settings.timezone,
+      location_available: false,
+      latitude: None,
+      longitude: None,
+      location_summary: "No recent location pulse is available yet.".into(),
+      weather: None,
+      daylight: None,
+      warning_summary: "No public warning sources are wired into this first slice yet.".into(),
+      source_statuses: vec![
+        WorldSignalSourceStatus {
+          source_key: "open_meteo".into(),
+          label: "Open-Meteo".into(),
+          status: "waiting_for_location".into(),
+          detail: "Waiting for a location pulse before weather can be grounded.".into(),
+          checked_at: captured_at.clone(),
+        },
+      ],
+      nearby_interest_filters: filters,
+      nearby_candidates: Vec::new(),
+      summary: "The world-awareness layer is ready, but it needs a recent location pulse first.".into(),
+    });
+  };
+
+  let cache_key = format!("open_meteo:{:.3}:{:.3}", location.latitude, location.longitude);
+  let fetched = fetch_open_meteo_snapshot(location.latitude, location.longitude)
+    .and_then(|payload| {
+      let payload_json = serde_json::to_string(&payload)?;
+      store_external_signal_cache(&connection, &cache_key, "open_meteo", &payload_json)?;
+      Ok((payload, false))
+    })
+    .or_else(|_| {
+      load_external_signal_cache(&connection, &cache_key)?
+        .and_then(|(payload_json, _)| serde_json::from_str::<OpenMeteoCurrentWeatherResponse>(&payload_json).ok().map(|payload| (payload, true)))
+        .ok_or_else(|| AppError::Message("Open-Meteo weather could not be loaded and no cached value was available.".into()))
+    });
+
+  let (weather_payload, from_cache) = fetched?;
+  let current = weather_payload.current;
+  let hourly_probability = weather_payload
+    .hourly
+    .and_then(|hourly| hourly.precipitation_probability)
+    .and_then(|values| values.into_iter().flatten().next());
+  let daily = weather_payload.daily;
+  let sunrise_at = daily
+    .as_ref()
+    .and_then(|block| block.sunrise.as_ref())
+    .and_then(|values| values.first())
+    .and_then(|value| parse_datetime_in_timezone(value, timezone));
+  let sunset_at = daily
+    .as_ref()
+    .and_then(|block| block.sunset.as_ref())
+    .and_then(|values| values.first())
+    .and_then(|value| parse_datetime_in_timezone(value, timezone));
+  let local_now = Utc::now().with_timezone(&timezone);
+  let (daylight_state, minutes_until_transition) = daylight_state_for(local_now, sunrise_at, sunset_at);
+
+  let weather = current.as_ref().map(|block| {
+    let summary = weather_code_summary(block.weather_code).to_string();
+    let caution_level = weather_caution_level(hourly_probability, block.wind_speed_10m, block.weather_code).to_string();
+    RealWorldWeatherSnapshot {
+      temperature_celsius: block.temperature_2m,
+      apparent_temperature_celsius: block.apparent_temperature,
+      weather_code: block.weather_code,
+      weather_summary: summary.clone(),
+      wind_speed_kph: block.wind_speed_10m,
+      precipitation_probability_percent: hourly_probability,
+      precipitation_mm: block.precipitation,
+      is_day: block.is_day.map(|value| value != 0),
+      caution_level: caution_level.clone(),
+      summary: if caution_level == "caution" {
+        format!("{summary}. Conditions look active enough to shape suggestions carefully.")
+      } else {
+        format!("{summary}. Conditions look calm enough for ordinary nearby suggestions.")
+      },
+    }
+  });
+
+  let daylight = Some(RealWorldDaylightSnapshot {
+    sunrise_at: sunrise_at.map(|value| value.to_rfc3339()),
+    sunset_at: sunset_at.map(|value| value.to_rfc3339()),
+    daylight_state: daylight_state.clone(),
+    minutes_until_transition,
+    summary: match daylight_state.as_str() {
+      "before_sunrise" => "It is still before sunrise at the current location.".into(),
+      "daylight" => match minutes_until_transition {
+        Some(minutes) => format!("There are about {minutes} minutes of daylight left."),
+        None => "It is daylight right now.".into(),
+      },
+      "after_sunset" => "Sunset has already passed at the current location.".into(),
+      _ => "Daylight state could not be grounded yet.".into(),
+    },
+  });
+
+  let overpass_cache_key = format!("overpass:{:.3}:{:.3}", location.latitude, location.longitude);
+  let wikipedia_cache_key = format!("wikipedia:{:.3}:{:.3}", location.latitude, location.longitude);
+
+  let overpass_result = fetch_overpass_candidates(location.latitude, location.longitude, 2500)
+    .and_then(|payload| {
+      let payload_json = serde_json::to_string(&payload)?;
+      store_external_signal_cache(&connection, &overpass_cache_key, "overpass", &payload_json)?;
+      Ok((payload, false))
+    })
+    .or_else(|_| {
+      load_external_signal_cache(&connection, &overpass_cache_key)?
+        .and_then(|(payload_json, _)| serde_json::from_str::<OverpassResponse>(&payload_json).ok().map(|payload| (payload, true)))
+        .ok_or_else(|| AppError::Message("Overpass nearby discovery could not be loaded and no cached value was available.".into()))
+    });
+
+  let wikipedia_result = fetch_wikipedia_geosearch(location.latitude, location.longitude)
+    .and_then(|payload| {
+      let payload_json = serde_json::to_string(&payload)?;
+      store_external_signal_cache(&connection, &wikipedia_cache_key, "wikipedia", &payload_json)?;
+      Ok((payload, false))
+    })
+    .or_else(|_| {
+      load_external_signal_cache(&connection, &wikipedia_cache_key)?
+        .and_then(|(payload_json, _)| serde_json::from_str::<WikipediaGeoSearchResponse>(&payload_json).ok().map(|payload| (payload, true)))
+        .ok_or_else(|| AppError::Message("Wikipedia geosearch could not be loaded and no cached value was available.".into()))
+    });
+
+  let (overpass_payload, overpass_from_cache) = overpass_result?;
+  let (wikipedia_payload, wikipedia_from_cache) = wikipedia_result?;
+  let nearby_candidates = rank_nearby_candidates(
+    location.latitude,
+    location.longitude,
+    &filters,
+    &overpass_payload,
+    &wikipedia_payload,
+    weather.as_ref(),
+    daylight.as_ref(),
+  );
+
+  let checked_at = Utc::now().to_rfc3339();
+  Ok(RealWorldPresenceSnapshot {
+    captured_at,
+    timezone: settings.timezone,
+    location_available: true,
+    latitude: Some(location.latitude),
+    longitude: Some(location.longitude),
+    location_summary: format!(
+      "Grounded from the latest location pulse at {:.4}, {:.4}.",
+      location.latitude, location.longitude
+    ),
+    weather,
+    daylight,
+    warning_summary: "Warning feeds are planned in this phase, but this first slice is only grounding weather and daylight.".into(),
+    source_statuses: vec![
+      WorldSignalSourceStatus {
+        source_key: "open_meteo".into(),
+        label: "Open-Meteo".into(),
+        status: if from_cache { "cached" } else { "live" }.into(),
+        detail: if from_cache {
+          "Using a cached no-cost weather snapshot because a fresh pull was unavailable.".into()
+        } else {
+          "Live no-cost weather and daylight data is available.".into()
+        },
+        checked_at,
+      },
+      WorldSignalSourceStatus {
+        source_key: "overpass".into(),
+        label: "OpenStreetMap nearby".into(),
+        status: if overpass_from_cache { "cached" } else { "live" }.into(),
+        detail: if overpass_from_cache {
+          "Using cached nearby-place discovery because a fresh pull was unavailable.".into()
+        } else {
+          "Live nearby place candidates were loaded from zero-cost OpenStreetMap data.".into()
+        },
+        checked_at: Utc::now().to_rfc3339(),
+      },
+      WorldSignalSourceStatus {
+        source_key: "wikipedia".into(),
+        label: "Wikipedia nearby".into(),
+        status: if wikipedia_from_cache { "cached" } else { "live" }.into(),
+        detail: if wikipedia_from_cache {
+          "Using cached nearby story candidates because a fresh pull was unavailable.".into()
+        } else {
+          "Live nearby story candidates were loaded from zero-cost Wikipedia geosearch.".into()
+        },
+        checked_at: Utc::now().to_rfc3339(),
+      },
+      WorldSignalSourceStatus {
+        source_key: "warning_feeds".into(),
+        label: "Warning feeds".into(),
+        status: "planned".into(),
+        detail: "Official warning ingestion is part of the next implementation slice.".into(),
+        checked_at: Utc::now().to_rfc3339(),
+      },
+    ],
+    nearby_interest_filters: filters,
+    nearby_candidates,
+    summary: "The first world-awareness slice is now grounding weather, daylight, and nearby discovery from the current location pulse.".into(),
+  })
+}
+
+pub fn list_nearby_interest_filters(db_path: &PathBuf) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let connection = Connection::open(db_path)?;
+  list_nearby_interest_filters_with_connection(&connection)
+}
+
+pub fn create_nearby_interest_filter(
+  db_path: &PathBuf,
+  payload: &CreateNearbyInterestFilterInput,
+) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let connection = Connection::open(db_path)?;
+  let timestamp = Utc::now().to_rfc3339();
+  let next_order: i64 = connection.query_row(
+    "SELECT COALESCE(MAX(display_order), -1) + 1 FROM nearby_interest_filters",
+    [],
+    |row| row.get(0),
+  )?;
+  let category_key = slugify_nearby_interest_label(&payload.label);
+  connection.execute(
+    r#"
+      INSERT INTO nearby_interest_filters (
+        category_key, label, description, tags_json, is_enabled, display_order,
+        is_user_defined, created_at, updated_at
+      ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 1, ?6, ?7)
+    "#,
+    params![
+      category_key,
+      payload.label.trim(),
+      payload.description.trim(),
+      serde_json::to_string(&payload.tags)?,
+      next_order,
+      timestamp,
+      timestamp,
+    ],
+  )?;
+  list_nearby_interest_filters_with_connection(&connection)
+}
+
+pub fn update_nearby_interest_filter(
+  db_path: &PathBuf,
+  payload: &UpdateNearbyInterestFilterInput,
+) -> Result<Vec<NearbyInterestFilter>, AppError> {
+  let connection = Connection::open(db_path)?;
+  connection.execute(
+    r#"
+      UPDATE nearby_interest_filters
+      SET label = ?2, description = ?3, tags_json = ?4, is_enabled = ?5, updated_at = ?6
+      WHERE id = ?1
+    "#,
+    params![
+      payload.id,
+      payload.label.trim(),
+      payload.description.trim(),
+      serde_json::to_string(&payload.tags)?,
+      if payload.is_enabled { 1 } else { 0 },
+      Utc::now().to_rfc3339(),
+    ],
+  )?;
+  list_nearby_interest_filters_with_connection(&connection)
 }
 
 fn slugify_companion_context_label(label: &str) -> String {
@@ -5122,7 +5828,26 @@ fn clear_tables(transaction: &Transaction<'_>, tables: &[&str]) -> Result<(), Ap
   Ok(())
 }
 
+fn create_safety_backup(db_path: &PathBuf, reason: &str) -> Result<PathBuf, AppError> {
+  if !db_path.exists() {
+    return Ok(db_path.clone());
+  }
+  let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+  let safe_reason = reason
+    .chars()
+    .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '-' })
+    .collect::<String>();
+  let backup_name = format!("neural_trainer.backup-{}-{}.sqlite", timestamp, safe_reason);
+  let backup_path = db_path
+    .parent()
+    .unwrap_or_else(|| std::path::Path::new("."))
+    .join(backup_name);
+  fs::copy(db_path, &backup_path)?;
+  Ok(backup_path)
+}
+
 fn reset_all_non_settings_data(db_path: &PathBuf) -> Result<(), AppError> {
+  let _ = create_safety_backup(db_path, "simulation-reset")?;
   let mut connection = Connection::open(db_path)?;
   let transaction = connection.transaction()?;
   clear_tables(
@@ -5146,21 +5871,18 @@ fn reset_all_non_settings_data(db_path: &PathBuf) -> Result<(), AppError> {
       "manual_reflections",
       "rules",
       "places",
-      "companion_context_entries",
-      "companion_context_category_state",
-      "companion_context_categories",
     ],
   )?;
   transaction.execute(
     "DELETE FROM settings WHERE key = 'mvp_reality_check_seeded_at'",
     [],
   )?;
-  seed_companion_context_categories(&transaction)?;
   transaction.commit()?;
   Ok(())
 }
 
 pub fn reset_runtime_data(db_path: &PathBuf) -> Result<(), AppError> {
+  let _ = create_safety_backup(db_path, "runtime-reset")?;
   let mut connection = Connection::open(db_path)?;
   let transaction = connection.transaction()?;
   clear_tables(
@@ -5305,6 +6027,7 @@ pub fn end_call_session(
 }
 
 pub fn clear_all_local_data(db_path: &PathBuf) -> Result<(), AppError> {
+  let _ = create_safety_backup(db_path, "clear-all-local-data")?;
   let mut connection = Connection::open(db_path)?;
   let transaction = connection.transaction()?;
   for table in [
@@ -6293,6 +7016,27 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
         is_visible INTEGER NOT NULL DEFAULT 1,
         updated_at TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS nearby_interest_filters (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        category_key TEXT NOT NULL UNIQUE,
+        label TEXT NOT NULL,
+        description TEXT NOT NULL DEFAULT '',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        is_enabled INTEGER NOT NULL DEFAULT 1,
+        display_order INTEGER NOT NULL DEFAULT 0,
+        is_user_defined INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS external_signal_cache (
+        cache_key TEXT PRIMARY KEY,
+        source_key TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        fetched_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
     "#,
   )?;
 
@@ -6447,6 +7191,7 @@ fn apply_schema(connection: &Connection) -> Result<(), AppError> {
   }
 
   seed_companion_context_categories(connection)?;
+  seed_nearby_interest_filters(connection)?;
 
   Ok(())
 }
@@ -6484,6 +7229,35 @@ fn seed_companion_context_categories(connection: &Connection) -> Result<(), AppE
     )?;
   }
 
+  Ok(())
+}
+
+fn seed_nearby_interest_filters(connection: &Connection) -> Result<(), AppError> {
+  for (index, (key, label, description, tags)) in NEARBY_INTEREST_FILTER_DEFS.iter().enumerate() {
+    let timestamp = Utc::now().to_rfc3339();
+    connection.execute(
+      r#"
+        INSERT INTO nearby_interest_filters (
+          category_key, label, description, tags_json, is_enabled, display_order,
+          is_user_defined, created_at, updated_at
+        ) VALUES (?1, ?2, ?3, ?4, 1, ?5, 0, ?6, ?7)
+        ON CONFLICT(category_key) DO UPDATE SET
+          label = excluded.label,
+          description = excluded.description,
+          display_order = excluded.display_order,
+          updated_at = excluded.updated_at
+      "#,
+      params![
+        key,
+        label,
+        description,
+        serde_json::to_string(tags)?,
+        index as i64,
+        timestamp,
+        timestamp,
+      ],
+    )?;
+  }
   Ok(())
 }
 
@@ -12578,6 +13352,49 @@ mod tests {
     assert!(memory_snapshot.tectonic_timeline.is_empty());
     assert!(passive_snapshot.raw_events.is_empty());
     assert!(passive_snapshot.visits.is_empty());
+  }
+
+  #[test]
+  fn simulation_reset_keeps_manual_context_and_creates_backup() {
+    let db_path = test_db_path();
+    init_test_db(&db_path);
+
+    create_companion_context_entry(
+      &db_path,
+      &CreateCompanionContextEntryInput {
+        category_key: "friends".into(),
+        title: "Mara".into(),
+        body: "A close friend who matters.".into(),
+        tags: vec!["important".into()],
+        notes: String::new(),
+      },
+    )
+    .expect("create companion context entry");
+
+    let backup_before = db_path
+      .parent()
+      .expect("db parent")
+      .read_dir()
+      .expect("read dir")
+      .filter_map(Result::ok)
+      .filter(|entry| entry.file_name().to_string_lossy().contains("simulation-reset"))
+      .count();
+
+    reset_all_non_settings_data(&db_path).expect("simulation reset");
+
+    let companion_snapshot = companion_context_snapshot(&db_path).expect("companion context snapshot");
+    assert_eq!(companion_snapshot.categories.iter().map(|section| section.entries.len()).sum::<usize>(), 1);
+
+    let backup_after = db_path
+      .parent()
+      .expect("db parent")
+      .read_dir()
+      .expect("read dir")
+      .filter_map(Result::ok)
+      .filter(|entry| entry.file_name().to_string_lossy().contains("simulation-reset"))
+      .count();
+
+    assert!(backup_after > backup_before);
   }
 
   #[test]

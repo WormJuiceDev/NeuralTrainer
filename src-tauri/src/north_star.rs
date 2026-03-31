@@ -197,6 +197,11 @@ struct DesktopCallRequest {
 }
 
 #[derive(Debug, Serialize)]
+struct DesktopLocationPulseRequest {
+  device_token: String,
+}
+
+#[derive(Debug, Serialize)]
 struct CallResponseRequest {
   call_id: String,
   action: String,
@@ -559,6 +564,24 @@ pub fn pull_location_events(
   };
 
   fetch_snapshot(settings, Some(detail))
+}
+
+pub fn request_location_pulse(
+  settings: &AppSettings,
+) -> Result<NorthStarSnapshot, AppError> {
+  if settings.north_star_device_token.trim().is_empty() {
+    return Err(AppError::Message("Bind the desktop to North Star first.".into()));
+  }
+
+  client()
+    .post(format!("{}/api/companion/location-pulses/from-desktop", endpoint(settings)?))
+    .json(&DesktopLocationPulseRequest {
+      device_token: settings.north_star_device_token.clone(),
+    })
+    .send()?
+    .error_for_status()?;
+
+  fetch_snapshot(settings, Some("Asked North Star for a fresh location pulse.".into()))
 }
 
 pub fn fetch_snapshot(
