@@ -643,6 +643,10 @@ fn fetch_wikipedia_geosearch(
   let client = reqwest::blocking::Client::new();
   let response = client
     .get("https://en.wikipedia.org/w/api.php")
+    .header(
+      reqwest::header::USER_AGENT,
+      "NeuralTrainer/1.0 (desktop world presence lookup; https://northstar.youworld.app)",
+    )
     .query(&[
       ("action", "query"),
       ("format", "json"),
@@ -918,16 +922,17 @@ pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPr
     .and_then(|payload| {
       let payload_json = serde_json::to_string(&payload)?;
       store_external_signal_cache(&connection, &wikipedia_cache_key, "wikipedia", &payload_json)?;
-      Ok((payload, false))
+      Ok((payload, false, false))
     })
     .or_else(|_| {
       load_external_signal_cache(&connection, &wikipedia_cache_key)?
-        .and_then(|(payload_json, _)| serde_json::from_str::<WikipediaGeoSearchResponse>(&payload_json).ok().map(|payload| (payload, true)))
-        .ok_or_else(|| AppError::Message("Wikipedia geosearch could not be loaded and no cached value was available.".into()))
+        .and_then(|(payload_json, _)| serde_json::from_str::<WikipediaGeoSearchResponse>(&payload_json).ok().map(|payload| (payload, true, false)))
+        .or_else(|| Some((WikipediaGeoSearchResponse { query: None }, false, true)))
+        .ok_or_else(|| AppError::Message("Wikipedia geosearch fallback could not be prepared.".into()))
     });
 
   let (overpass_payload, overpass_from_cache) = overpass_result?;
-  let (wikipedia_payload, wikipedia_from_cache) = wikipedia_result?;
+  let (wikipedia_payload, wikipedia_from_cache, wikipedia_unavailable) = wikipedia_result?;
   let nearby_candidates = rank_nearby_candidates(
     location.latitude,
     location.longitude,
@@ -978,8 +983,16 @@ pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPr
       WorldSignalSourceStatus {
         source_key: "wikipedia".into(),
         label: "Wikipedia nearby".into(),
-        status: if wikipedia_from_cache { "cached" } else { "live" }.into(),
-        detail: if wikipedia_from_cache {
+        status: if wikipedia_unavailable {
+          "unavailable".into()
+        } else if wikipedia_from_cache {
+          "cached".into()
+        } else {
+          "live".into()
+        },
+        detail: if wikipedia_unavailable {
+          "Wikipedia nearby story candidates were unavailable, so nearby discovery continued without that source this time.".into()
+        } else if wikipedia_from_cache {
           "Using cached nearby story candidates because a fresh pull was unavailable.".into()
         } else {
           "Live nearby story candidates were loaded from zero-cost Wikipedia geosearch.".into()
