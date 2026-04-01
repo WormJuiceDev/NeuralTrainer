@@ -1,18 +1,22 @@
 <resources>
     <string name="app_name">North Star Android</string>
-    <string name="native_version_label">Native version v1-native-dev8</string>
+    <string name="native_version_label">Native version v1-native-dev9</string>
     <string name="companion_tab">Companion</string>
     <string name="calls_tab">Calls</string>
     <string name="connection_tab">Connection</string>
+    <string name="call_short">Call</string>
+    <string name="connection_short">Link</string>
     <string name="companion_heading">Companion thread</string>
     <string name="companion_copy">Messages from NeuralTrainer land here like a real phone thread.</string>
     <string name="chat_placeholder">Waiting for the companion thread to load.</string>
     <string name="message_hint">Send a message to NeuralTrainer…</string>
     <string name="send_message">Send message</string>
+    <string name="send_short">Send</string>
     <string name="refresh_companion">Refresh thread</string>
     <string name="calls_heading">Calls</string>
     <string name="calls_copy">See active North Star calls and answer or end them from the phone.</string>
     <string name="calls_placeholder">Waiting for calls.</string>
+    <string name="connection_heading">Connection</string>
     <string name="call_neuraltrainer">Call NeuralTrainer</string>
     <string name="refresh_calls">Refresh calls</string>
     <string name="call_transport_note">Call requests and status are native here now. Full live in-call audio transport is the next Android slice.</string>
@@ -30,6 +34,11 @@
     <string name="refresh_status">Refresh status</string>
     <string name="check_connection">Check connection</string>
     <string name="refresh_connection">Refresh connection</string>
+    <string name="accept_call">Accept</string>
+    <string name="decline_call">Decline</string>
+    <string name="end_call">End</string>
+    <string name="call_overlay_title">NeuralTrainer</string>
+    <string name="call_overlay_status">Incoming call</string>
     <string name="status_waiting">Status: waiting for pairing</string>
     <string name="detail_waiting">Scan the NeuralTrainer QR code or fill the pairing fields, then enable background sync so North Star can answer location pulses automatically.</string>
     <string name="onboarding_copy">Scan the QR code shown in NeuralTrainer. North Star will use that pairing and keep background location replies running automatically.</string>

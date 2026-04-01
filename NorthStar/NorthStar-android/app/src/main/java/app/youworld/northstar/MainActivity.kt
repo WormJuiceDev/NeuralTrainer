@@ -3,15 +3,22 @@ package app.youworld.northstar
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.view.Gravity
 import android.view.View
 import android.widget.Button
+import android.widget.LinearLayout
+import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.view.children
 import androidx.lifecycle.lifecycleScope
 import app.youworld.northstar.databinding.ActivityMainBinding
 import kotlinx.coroutines.Dispatchers
@@ -36,12 +43,13 @@ class MainActivity : AppCompatActivity() {
   private var autoRefreshJob: Job? = null
   private var messages: List<CompanionMessage> = emptyList()
   private var calls: List<CompanionCallSession> = emptyList()
+  private var linkedDesktopName: String = ""
 
   private val locationPermissionLauncher =
     registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-      renderStatus("Location permissions updated.", detailSummary())
       syncPermissionAction()
       maybeAutoFinishSetup()
+      refreshConnectionStatus()
     }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -55,6 +63,7 @@ class MainActivity : AppCompatActivity() {
     wireActions()
     maybeResumeBackgroundSync()
     setSection(Section.COMPANION)
+    syncTopbar()
     syncPermissionAction()
     syncConnectionControls(linked = store.deviceToken().isNotBlank())
     renderStatus("North Star is waking up.", detailSummary())
@@ -85,13 +94,17 @@ class MainActivity : AppCompatActivity() {
     binding.companionTabButton.setOnClickListener { setSection(Section.COMPANION) }
     binding.callsTabButton.setOnClickListener { setSection(Section.CALLS) }
     binding.connectionTabButton.setOnClickListener { setSection(Section.CONNECTION) }
+    binding.topbarCallButton.setOnClickListener { startCallFromPhone() }
+    binding.topbarMenuButton.setOnClickListener { setSection(Section.CONNECTION) }
     binding.sendMessageButton.setOnClickListener { sendMessage() }
-    binding.refreshCompanionButton.setOnClickListener { refreshCompanion() }
     binding.startCallButton.setOnClickListener { startCallFromPhone() }
-    binding.refreshCallsButton.setOnClickListener { refreshCalls() }
+    binding.refreshCallsButton.setOnClickListener { refreshCalls(silent = false) }
     binding.pairButton.setOnClickListener { pairPhone() }
     binding.locationPermissionButton.setOnClickListener { requestLocationPermissions() }
     binding.refreshButton.setOnClickListener { refreshAll() }
+    binding.callAcceptButton.setOnClickListener { activeOverlayCall()?.let { respondToCall(it.callId, "accept") } }
+    binding.callDeclineButton.setOnClickListener { activeOverlayCall()?.let { respondToCall(it.callId, "decline") } }
+    binding.callEndButton.setOnClickListener { activeOverlayCall()?.let { respondToCall(it.callId, "end") } }
   }
 
   private fun hydrateInputs() {
@@ -132,11 +145,16 @@ class MainActivity : AppCompatActivity() {
       binding.desktopNameInput.setText(desktopName)
       store.setDesktopName(desktopName)
     }
+    syncTopbar()
+
     if (pairCode.isNotBlank()) {
       store.setPendingQrPairing(true)
       setSection(Section.CONNECTION)
       syncConnectionControls(linked = false)
-      renderStatus("Pairing details received from QR.", "North Star picked up your desktop details. Allow location once and setup can finish itself.")
+      renderStatus(
+        "Pairing details received from QR.",
+        "North Star picked up your desktop details. Allow location once and setup can finish itself.",
+      )
       maybeAutoFinishSetup()
     }
   }
@@ -194,6 +212,7 @@ class MainActivity : AppCompatActivity() {
           api.heartbeat(apiBase, deviceToken, currentCapability())
           api.state(apiBase, session.sessionToken, session.userHandle)
         }
+        linkedDesktopName = desktops.firstOrNull()?.desktopName.orEmpty()
         store.setPendingQrPairing(false)
         store.setBackgroundSyncEnabled(true)
         PulseForegroundService.start(this@MainActivity)
@@ -202,11 +221,12 @@ class MainActivity : AppCompatActivity() {
         renderStatus(
           if (currentCapability().backgroundSupported) "This phone is now linked." else "This phone is linked. One more step remains.",
           if (currentCapability().backgroundSupported) {
-            "Linked to ${desktops.firstOrNull()?.desktopName ?: desktopName}. Messages, calls, and background location replies can now use this shared link."
+            "Linked to ${linkedDesktopName.ifBlank { desktopName }}. Messages, calls, and background location replies can now use this shared link."
           } else {
-            "Linked to ${desktops.firstOrNull()?.desktopName ?: desktopName}. Enable always-on location in Android settings so NeuralTrainer can request location while North Star stays in the background."
+            "Linked to ${linkedDesktopName.ifBlank { desktopName }}. Enable always-on location in Android settings so NeuralTrainer can request location while North Star stays in the background."
           },
         )
+        syncTopbar()
         refreshAll()
       } catch (caught: Exception) {
         renderStatus("Pairing failed.", caught.message ?: "The native phone pairing flow could not finish.")
@@ -217,18 +237,20 @@ class MainActivity : AppCompatActivity() {
   }
 
   private fun refreshAll() {
-    refreshConnection()
+    refreshConnectionStatus()
     refreshCompanion(silent = true)
     refreshCalls(silent = true)
   }
 
-  private fun refreshConnection() {
+  private fun refreshConnectionStatus() {
     saveDraftInputs()
     val sessionToken = store.sessionToken().trim()
     val apiBase = store.apiBase().trim().trimEnd('/')
     val userHandle = store.userHandle().trim()
     if (sessionToken.isBlank() || apiBase.isBlank() || userHandle.isBlank()) {
+      linkedDesktopName = ""
       syncConnectionControls(linked = false)
+      syncTopbar()
       renderStatus("Status: waiting for pairing", detailSummary())
       return
     }
@@ -236,13 +258,14 @@ class MainActivity : AppCompatActivity() {
     lifecycleScope.launch {
       try {
         val desktops = withContext(Dispatchers.IO) { api.state(apiBase, sessionToken, userHandle) }
-        val primaryDesktop = desktops.firstOrNull()
-        syncConnectionControls(linked = primaryDesktop != null)
+        linkedDesktopName = desktops.firstOrNull()?.desktopName.orEmpty()
+        syncConnectionControls(linked = desktops.isNotEmpty())
         syncPermissionAction()
+        syncTopbar()
         if (!store.pendingQrPairing()) {
           renderStatus(
-            if (primaryDesktop != null) "${primaryDesktop.desktopName} is linked." else "No linked desktop found.",
-            detailSummary(primaryDesktop?.desktopName ?: store.desktopName()),
+            if (desktops.isNotEmpty()) "${linkedDesktopName.ifBlank { "NeuralTrainer" }} is linked." else "No linked desktop found.",
+            detailSummary(linkedDesktopName.ifBlank { store.desktopName() }),
           )
         }
       } catch (caught: Exception) {
@@ -251,10 +274,11 @@ class MainActivity : AppCompatActivity() {
     }
   }
 
-  private fun refreshCompanion(silent: Boolean = false) {
+  private fun refreshCompanion(silent: Boolean) {
     val sessionToken = store.sessionToken().trim()
     val apiBase = store.apiBase().trim().trimEnd('/')
     if (sessionToken.isBlank() || apiBase.isBlank()) {
+      messages = emptyList()
       renderMessages()
       return
     }
@@ -267,18 +291,18 @@ class MainActivity : AppCompatActivity() {
           renderStatus("Companion thread refreshed.", "North Star pulled the latest messages from NeuralTrainer.")
         }
       } catch (caught: Exception) {
-        if (!silent) {
-          renderStatus("Companion thread could not refresh.", caught.message ?: "Unknown thread error.")
-        }
+        if (!silent) renderStatus("Companion thread could not refresh.", caught.message ?: "Unknown thread error.")
       }
     }
   }
 
-  private fun refreshCalls(silent: Boolean = false) {
+  private fun refreshCalls(silent: Boolean) {
     val sessionToken = store.sessionToken().trim()
     val apiBase = store.apiBase().trim().trimEnd('/')
     if (sessionToken.isBlank() || apiBase.isBlank()) {
+      calls = emptyList()
       renderCalls()
+      renderCallOverlay()
       return
     }
 
@@ -286,13 +310,12 @@ class MainActivity : AppCompatActivity() {
       try {
         calls = withContext(Dispatchers.IO) { api.callSessions(apiBase, sessionToken) }
         renderCalls()
+        renderCallOverlay()
         if (!silent && activeSection == Section.CALLS) {
           renderStatus("Calls refreshed.", "North Star checked for new or updated calls.")
         }
       } catch (caught: Exception) {
-        if (!silent) {
-          renderStatus("Calls could not refresh.", caught.message ?: "Unknown call refresh error.")
-        }
+        if (!silent) renderStatus("Calls could not refresh.", caught.message ?: "Unknown call refresh error.")
       }
     }
   }
@@ -406,7 +429,7 @@ class MainActivity : AppCompatActivity() {
     )
   }
 
-  private fun detailSummary(connectedDesktopName: String = store.desktopName()): String {
+  private fun detailSummary(connectedDesktopName: String = linkedDesktopName.ifBlank { store.desktopName() }): String {
     val capability = currentCapability()
     val permissionSummary = if (capability.permissionState == "granted") "allowed" else "still needed"
     val backgroundSummary = when {
@@ -431,85 +454,248 @@ class MainActivity : AppCompatActivity() {
     val pending = store.pendingQrPairing()
     binding.pairButton.visibility = if (pending || !linked) View.VISIBLE else View.GONE
     binding.pairButton.text = if (linked) getString(R.string.reconnect_phone) else getString(R.string.finish_setup)
-    binding.refreshButton.text = getString(R.string.refresh_connection)
   }
 
-  private fun renderMessages() {
-    binding.chatThreadText.text = if (messages.isEmpty()) {
-      getString(R.string.chat_placeholder)
-    } else {
-      messages.takeLast(12).joinToString("\n\n") { message ->
-        val speaker = if (message.source == "desktop") "NeuralTrainer" else "You"
-        "$speaker\n${message.text.trim()}"
-      }
+  private fun syncTopbar() {
+    val name = linkedDesktopName.ifBlank { store.displayName().ifBlank { "North Star" } }
+    binding.topbarTitle.text = if (activeSection == Section.COMPANION) name else when (activeSection) {
+      Section.CALLS -> getString(R.string.calls_heading)
+      Section.CONNECTION -> getString(R.string.connection_heading)
+      else -> name
     }
+    binding.topbarSubtitle.text = when (activeSection) {
+      Section.COMPANION -> if (store.deviceToken().isNotBlank()) "North Star and NeuralTrainer are staying in touch." else getString(R.string.onboarding_copy)
+      Section.CALLS -> getString(R.string.calls_copy)
+      Section.CONNECTION -> detailSummary()
+    }
+    binding.topbarAvatar.text = (name.firstOrNull()?.uppercase() ?: "N").toString()
+    binding.topbarCallButton.visibility = if (activeSection == Section.CONNECTION) View.GONE else View.VISIBLE
   }
-
-  private fun renderCalls() {
-    val sortedCalls = calls.sortedByDescending { it.requestedAt }
-    binding.callSummaryText.text = if (sortedCalls.isEmpty()) {
-      getString(R.string.calls_placeholder)
-    } else {
-      sortedCalls.take(8).joinToString("\n\n") { call ->
-        buildString {
-          append(call.desktopName.ifBlank { "NeuralTrainer" })
-          append('\n')
-          append(call.status.replaceFirstChar { it.uppercase() })
-          if (call.note.isNotBlank()) {
-            append('\n')
-            append(call.note.trim())
-          }
-        }
-      }
-    }
-
-    binding.callActionsContainer.removeAllViews()
-    val actionableCalls = sortedCalls.filter { it.status == "pending" || it.status == "accepted" }
-    for (call in actionableCalls) {
-      val primaryAction = when (call.status) {
-        "pending" -> "accept"
-        "accepted" -> "end"
-        else -> null
-      } ?: continue
-
-      val primaryLabel = if (primaryAction == "accept") "Accept ${call.desktopName}" else "End ${call.desktopName}"
-      binding.callActionsContainer.addView(actionButton(primaryLabel) { respondToCall(call.callId, primaryAction) })
-
-      if (call.status == "pending") {
-        binding.callActionsContainer.addView(actionButton("Decline ${call.desktopName}") { respondToCall(call.callId, "decline") })
-        binding.callActionsContainer.addView(actionButton("Missed ${call.desktopName}") { respondToCall(call.callId, "missed") })
-      }
-    }
-  }
-
-  private fun actionButton(label: String, onClick: () -> Unit): Button =
-    Button(this).apply {
-      text = label
-      setOnClickListener { onClick() }
-    }
 
   private fun setSection(section: Section) {
     activeSection = section
     binding.companionSection.visibility = if (section == Section.COMPANION) View.VISIBLE else View.GONE
     binding.callsSection.visibility = if (section == Section.CALLS) View.VISIBLE else View.GONE
     binding.connectionSection.visibility = if (section == Section.CONNECTION) View.VISIBLE else View.GONE
-    binding.onboardingText.text = when (section) {
-      Section.COMPANION -> getString(R.string.companion_copy)
-      Section.CALLS -> getString(R.string.calls_copy)
-      Section.CONNECTION -> getString(R.string.onboarding_copy)
+    updateTabStyles()
+    syncTopbar()
+  }
+
+  private fun updateTabStyles() {
+    styleTab(binding.companionTabButton, activeSection == Section.COMPANION)
+    styleTab(binding.callsTabButton, activeSection == Section.CALLS)
+    styleTab(binding.connectionTabButton, activeSection == Section.CONNECTION)
+  }
+
+  private fun styleTab(button: Button, active: Boolean) {
+    button.setBackgroundColor(Color.parseColor(if (active) "#202C33" else "#111B21"))
+    button.setTextColor(Color.parseColor("#E9EDEF"))
+  }
+
+  private fun renderMessages() {
+    val container = binding.messageThreadContainer
+    container.removeAllViews()
+
+    if (messages.isEmpty()) {
+      container.addView(
+        messageBubble(
+          text = getString(R.string.chat_placeholder),
+          incoming = true,
+          secondary = "",
+        ),
+      )
+    } else {
+      val dayChip = TextView(this).apply {
+        text = "Today"
+        setTextColor(Color.parseColor("#AEBAC1"))
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        background = roundedDrawable("#1F2C34")
+        gravity = Gravity.CENTER
+      }
+      val chipParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        gravity = Gravity.CENTER_HORIZONTAL
+        bottomMargin = dp(12)
+      }
+      container.addView(dayChip, chipParams)
+
+      messages.takeLast(24).forEach { message ->
+        container.addView(
+          messageBubble(
+            text = message.text.trim().ifBlank { "..." },
+            incoming = message.source == "desktop",
+            secondary = if (message.source == "desktop") "NeuralTrainer" else "You",
+          ),
+        )
+      }
+    }
+
+    binding.messageThreadScroll.post { binding.messageThreadScroll.fullScroll(View.FOCUS_DOWN) }
+  }
+
+  private fun messageBubble(text: String, incoming: Boolean, secondary: String): View {
+    val bubble = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL
+      background = roundedDrawable(if (incoming) "#202C33" else "#005C4B")
+      setPadding(dp(14), dp(12), dp(14), dp(12))
+    }
+    val speaker = TextView(this).apply {
+      this.text = secondary
+      setTextColor(Color.parseColor("#AEBAC1"))
+      textSize = 12f
+    }
+    val body = TextView(this).apply {
+      this.text = text
+      setTextColor(Color.parseColor("#E9EDEF"))
+      textSize = 15f
+    }
+    bubble.addView(speaker)
+    bubble.addView(body)
+
+    return bubble.apply {
+      val params = LinearLayout.LayoutParams((resources.displayMetrics.widthPixels * 0.82f).toInt(), LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        gravity = if (incoming) Gravity.START else Gravity.END
+        bottomMargin = dp(10)
+      }
+      layoutParams = params
     }
   }
+
+  private fun renderCalls() {
+    val container = binding.callCardContainer
+    container.removeAllViews()
+
+    if (calls.isEmpty()) {
+      container.addView(callCard("No calls yet", "North Star call requests will appear here.", emptyList()))
+      return
+    }
+
+    calls.sortedByDescending { it.requestedAt }.take(8).forEach { call ->
+      val actions = mutableListOf<Pair<String, () -> Unit>>()
+      when (call.status) {
+        "pending" -> {
+          actions += "Accept" to { respondToCall(call.callId, "accept") }
+          actions += "Decline" to { respondToCall(call.callId, "decline") }
+          actions += "Missed" to { respondToCall(call.callId, "missed") }
+        }
+        "accepted" -> actions += "End call" to { respondToCall(call.callId, "end") }
+      }
+      container.addView(
+        callCard(
+          title = call.desktopName.ifBlank { "NeuralTrainer" },
+          body = buildString {
+            append(call.status.replaceFirstChar { it.uppercase() })
+            if (call.note.isNotBlank()) {
+              append("\n")
+              append(call.note.trim())
+            }
+          },
+          actions = actions,
+        ),
+      )
+    }
+  }
+
+  private fun callCard(title: String, body: String, actions: List<Pair<String, () -> Unit>>): View {
+    val card = LinearLayout(this).apply {
+      orientation = LinearLayout.VERTICAL
+      background = strokedDrawable("#182229", "#22313A")
+      setPadding(dp(16), dp(14), dp(16), dp(14))
+    }
+    val heading = TextView(this).apply {
+      text = title
+      setTextColor(Color.parseColor("#E9EDEF"))
+      textSize = 17f
+      setTypeface(typeface, Typeface.BOLD)
+    }
+    val detail = TextView(this).apply {
+      text = body
+      setTextColor(Color.parseColor("#AEBAC1"))
+      textSize = 14f
+    }
+    card.addView(heading)
+    card.addView(detail)
+    if (actions.isNotEmpty()) {
+      val row = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.START
+      }
+      actions.forEachIndexed { index, (label, click) ->
+        val button = Button(this).apply {
+          text = label
+          setOnClickListener { click() }
+        }
+        val params = LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+          topMargin = dp(12)
+          if (index > 0) marginStart = dp(8)
+        }
+        row.addView(button, params)
+      }
+      card.addView(row)
+    }
+    return card.apply {
+      layoutParams = LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+        bottomMargin = dp(12)
+      }
+    }
+  }
+
+  private fun renderCallOverlay() {
+    val call = activeOverlayCall()
+    if (call == null) {
+      binding.callOverlay.visibility = View.GONE
+      return
+    }
+
+    binding.callOverlay.visibility = View.VISIBLE
+    binding.callOverlayTitle.text = call.desktopName.ifBlank { "NeuralTrainer" }
+    binding.callOverlayAvatar.text = (call.desktopName.firstOrNull()?.uppercase() ?: "N").toString()
+    binding.callOverlayStatus.text = when (call.status) {
+      "pending" -> "Incoming call"
+      "accepted" -> "Call is live"
+      "ended" -> "Call ended"
+      "declined" -> "Call declined"
+      "missed" -> "Call missed"
+      else -> call.status.replaceFirstChar { it.uppercase() }
+    }
+    binding.callOverlayNote.text = when (call.status) {
+      "accepted" -> "North Star call transport is being ported into native Android now. The live phone-call shell is preserved here while the WebRTC voice path is brought over."
+      else -> call.note.trim().ifBlank { "NeuralTrainer wants to talk for a moment." }
+    }
+    binding.callAcceptButton.visibility = if (call.status == "pending") View.VISIBLE else View.GONE
+    binding.callDeclineButton.visibility = if (call.status == "pending") View.VISIBLE else View.GONE
+    binding.callEndButton.visibility = if (call.status == "accepted") View.VISIBLE else View.GONE
+  }
+
+  private fun activeOverlayCall(): CompanionCallSession? =
+    calls.firstOrNull { it.status == "pending" } ?: calls.firstOrNull { it.status == "accepted" }
 
   private fun startAutoRefresh() {
     autoRefreshJob?.cancel()
     autoRefreshJob = lifecycleScope.launch {
       while (isActive) {
-        delay(10_000)
+        delay(8000)
         refreshCompanion(silent = true)
         refreshCalls(silent = true)
       }
     }
   }
+
+  private fun roundedDrawable(fillColor: String): GradientDrawable =
+    GradientDrawable().apply {
+      shape = GradientDrawable.RECTANGLE
+      cornerRadius = dp(14).toFloat()
+      setColor(Color.parseColor(fillColor))
+    }
+
+  private fun strokedDrawable(fillColor: String, strokeColor: String): GradientDrawable =
+    GradientDrawable().apply {
+      shape = GradientDrawable.RECTANGLE
+      cornerRadius = dp(16).toFloat()
+      setColor(Color.parseColor(fillColor))
+      setStroke(dp(1), Color.parseColor(strokeColor))
+    }
+
+  private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
   private fun renderStatus(status: String, detail: String) {
     binding.statusText.text = status
