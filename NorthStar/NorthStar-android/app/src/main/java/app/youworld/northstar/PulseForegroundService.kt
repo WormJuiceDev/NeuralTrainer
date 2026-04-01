@@ -99,14 +99,16 @@ class PulseForegroundService : Service() {
   }
 
   private fun currentCapability(): LocationCapabilityPayload {
+    val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    val locationGranted = coarseGranted || fineGranted
     val backgroundGranted =
       Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
     return LocationCapabilityPayload(
-      permissionState = if (fineGranted) "granted" else "denied",
-      locationSupported = fineGranted,
-      backgroundSupported = fineGranted && backgroundGranted,
+      permissionState = if (locationGranted) "granted" else "denied",
+      locationSupported = locationGranted,
+      backgroundSupported = locationGranted && backgroundGranted,
       lastKnownAccuracyMeters = null,
       lastLocationAt = Instant.now().toString(),
     )

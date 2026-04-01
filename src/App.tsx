@@ -571,12 +571,13 @@ function buildNorthStarPairingUrl(endpoint: string, code: string, userHandle: st
     return "";
   }
   const params = new URLSearchParams({
+    endpoint: trimmedEndpoint,
     pairCode: code.trim(),
     userHandle: userHandle.trim(),
     displayName: displayName.trim(),
     desktopName: desktopName.trim(),
   });
-  return `${trimmedEndpoint}/pair/${encodeURIComponent(code.trim())}?${params.toString()}`;
+  return `northstar://pair/${encodeURIComponent(code.trim())}?${params.toString()}`;
 }
 
 function deriveNorthStarDisplayName(userHandle: string) {
@@ -4434,10 +4435,24 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       await persistCurrentSettings();
-      const snapshot = await requestNorthStarLocationPulse();
+      const baselineEventCount = northStarConnectionsSnapshot?.locationEventCount ?? 0;
+      let snapshot = await requestNorthStarLocationPulse();
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await refreshDiagnostics();
+
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        await new Promise((resolve) => window.setTimeout(resolve, 5000));
+        snapshot = await pullNorthStarLocationEvents();
+        commitNorthStarSnapshot(snapshot, { forceConnections: true });
+        if (snapshot.locationEvents.length > baselineEventCount) {
+          setMessage(snapshot.detail);
+          await Promise.all([refreshDiagnostics(), refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDecisionSnapshot()]);
+          return;
+        }
+      }
+
+      setMessage("Location pulse was sent, but no fresh phone location arrived yet.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {

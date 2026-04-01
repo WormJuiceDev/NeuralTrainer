@@ -44,6 +44,47 @@ class NorthStarApi {
     return parseStateResponse(response.body)
   }
 
+  fun messages(apiBase: String, sessionToken: String): List<CompanionMessage> {
+    val response = request("GET", "$apiBase/api/companion/messages", sessionToken, null)
+    if (!response.ok) error("North Star messages could not be loaded.")
+    return parseMessagesResponse(response.body)
+  }
+
+  fun sendMessage(apiBase: String, sessionToken: String, text: String) {
+    val payload = JSONObject().put("text", text)
+    val response = request("POST", "$apiBase/api/companion/messages", sessionToken, payload.toString())
+    if (!response.ok) error("North Star message send failed.")
+  }
+
+  fun callSessions(apiBase: String, sessionToken: String): List<CompanionCallSession> {
+    val response = request("GET", "$apiBase/api/companion/call-sessions", sessionToken, null)
+    if (!response.ok) error("North Star calls could not be loaded.")
+    return parseCallSessionsResponse(response.body)
+  }
+
+  fun startCallFromPhone(apiBase: String, sessionToken: String, note: String): CompanionCallSession {
+    val payload = JSONObject().put("note", note)
+    val response = request("POST", "$apiBase/api/companion/call-sessions/from-mobile", sessionToken, payload.toString())
+    val json = JSONObject(response.body)
+    if (!response.ok) error(json.optString("error", "North Star could not start the call."))
+    return CompanionCallSession(
+      callId = json.getString("call_id"),
+      desktopName = json.getString("desktop_name"),
+      requestedAt = json.getString("requested_at"),
+      respondedAt = json.optString("responded_at").ifBlank { null },
+      status = json.getString("status"),
+      note = json.optString("note"),
+    )
+  }
+
+  fun respondToCall(apiBase: String, sessionToken: String, callId: String, action: String) {
+    val payload = JSONObject()
+      .put("call_id", callId)
+      .put("action", action)
+    val response = request("POST", "$apiBase/api/companion/call-sessions/respond", sessionToken, payload.toString())
+    if (!response.ok) error("North Star call action failed.")
+  }
+
   fun pendingPulses(apiBase: String, sessionToken: String): List<LocationPulseRequest> {
     val response = request("GET", "$apiBase/api/companion/location-pulses", sessionToken, null)
     if (!response.ok) error("Pending pulse check failed.")
@@ -76,7 +117,7 @@ class NorthStarApi {
       readTimeout = 15_000
       doInput = true
       if (!sessionToken.isNullOrBlank()) {
-        setRequestProperty("Authorization", "Bearer $sessionToken")
+        setRequestProperty("x-northstar-session", sessionToken)
       }
       if (body != null) doOutput = true
     }

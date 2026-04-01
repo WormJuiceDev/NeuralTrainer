@@ -27,4 +27,7 @@ class SettingsStore(context: Context) {
 
   fun backgroundSyncEnabled(): Boolean = prefs.getBoolean("background_sync_enabled", false)
   fun setBackgroundSyncEnabled(value: Boolean) = prefs.edit().putBoolean("background_sync_enabled", value).apply()
+
+  fun pendingQrPairing(): Boolean = prefs.getBoolean("pending_qr_pairing", false)
+  fun setPendingQrPairing(value: Boolean) = prefs.edit().putBoolean("pending_qr_pairing", value).apply()
 }

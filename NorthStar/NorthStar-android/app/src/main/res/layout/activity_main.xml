@@ -27,65 +27,233 @@
             android:id="@+id/onboardingText"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="20dp"
+            android:layout_marginTop="16dp"
             android:text="@string/onboarding_copy" />
 
-        <EditText
-            android:id="@+id/apiBaseInput"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="https://northstar.youworld.app"
-            android:inputType="textUri"
-            android:singleLine="true"
-            android:visibility="gone" />
-
-        <EditText
-            android:id="@+id/userHandleInput"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="savvy"
-            android:inputType="textNoSuggestions"
-            android:singleLine="true"
-            android:visibility="gone" />
-
-        <EditText
-            android:id="@+id/displayNameInput"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="Savvy"
-            android:inputType="textPersonName"
-            android:singleLine="true"
-            android:visibility="gone" />
-
-        <EditText
-            android:id="@+id/desktopNameInput"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:hint="DESKTOP-RONNY"
-            android:inputType="textNoSuggestions"
-            android:singleLine="true"
-            android:visibility="gone" />
-
-        <Button
-            android:id="@+id/pairButton"
+        <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:text="@string/finish_setup" />
+            android:orientation="horizontal">
 
-        <Button
-            android:id="@+id/locationPermissionButton"
+            <Button
+                android:id="@+id/companionTabButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="@string/companion_tab" />
+
+            <Button
+                android:id="@+id/callsTabButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/calls_tab" />
+
+            <Button
+                android:id="@+id/connectionTabButton"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_marginStart="8dp"
+                android:layout_weight="1"
+                android:text="@string/connection_tab" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/companionSection"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/allow_location" />
+            android:layout_marginTop="20dp"
+            android:orientation="vertical">
 
-        <Button
-            android:id="@+id/refreshButton"
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/companion_heading"
+                android:textAppearance="@android:style/TextAppearance.Material.Medium" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/companion_copy" />
+
+            <TextView
+                android:id="@+id/chatThreadText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="#10253b"
+                android:minHeight="180dp"
+                android:padding="16dp"
+                android:text="@string/chat_placeholder" />
+
+            <EditText
+                android:id="@+id/messageDraftInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:gravity="top|start"
+                android:hint="@string/message_hint"
+                android:inputType="textMultiLine|textCapSentences"
+                android:minLines="3" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/sendMessageButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/send_message" />
+
+                <Button
+                    android:id="@+id/refreshCompanionButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/refresh_companion" />
+            </LinearLayout>
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/callsSection"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/check_connection" />
+            android:layout_marginTop="20dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="@string/calls_heading"
+                android:textAppearance="@android:style/TextAppearance.Material.Medium" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:text="@string/calls_copy" />
+
+            <TextView
+                android:id="@+id/callSummaryText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="#10253b"
+                android:minHeight="120dp"
+                android:padding="16dp"
+                android:text="@string/calls_placeholder" />
+
+            <LinearLayout
+                android:id="@+id/callActionsContainer"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="vertical" />
+
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:orientation="horizontal">
+
+                <Button
+                    android:id="@+id/startCallButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="@string/call_neuraltrainer" />
+
+                <Button
+                    android:id="@+id/refreshCallsButton"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_marginStart="8dp"
+                    android:layout_weight="1"
+                    android:text="@string/refresh_calls" />
+            </LinearLayout>
+
+            <TextView
+                android:id="@+id/callTransportNoteText"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/call_transport_note" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:id="@+id/connectionSection"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="20dp"
+            android:orientation="vertical"
+            android:visibility="gone">
+
+            <EditText
+                android:id="@+id/apiBaseInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="https://northstar.youworld.app"
+                android:inputType="textUri"
+                android:singleLine="true"
+                android:visibility="gone" />
+
+            <EditText
+                android:id="@+id/userHandleInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="savvy"
+                android:inputType="textNoSuggestions"
+                android:singleLine="true"
+                android:visibility="gone" />
+
+            <EditText
+                android:id="@+id/displayNameInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="Savvy"
+                android:inputType="textPersonName"
+                android:singleLine="true"
+                android:visibility="gone" />
+
+            <EditText
+                android:id="@+id/desktopNameInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:hint="DESKTOP-RONNY"
+                android:inputType="textNoSuggestions"
+                android:singleLine="true"
+                android:visibility="gone" />
+
+            <Button
+                android:id="@+id/pairButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:text="@string/finish_setup" />
+
+            <Button
+                android:id="@+id/locationPermissionButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/allow_location" />
+
+            <Button
+                android:id="@+id/refreshButton"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="12dp"
+                android:text="@string/check_connection" />
+        </LinearLayout>
 
         <TextView
             android:id="@+id/statusText"

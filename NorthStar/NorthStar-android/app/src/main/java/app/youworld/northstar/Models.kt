@@ -30,6 +30,22 @@ data class DesktopBinding(
   val status: String,
 )
 
+data class CompanionMessage(
+  val messageId: String,
+  val source: String,
+  val text: String,
+  val createdAt: String,
+)
+
+data class CompanionCallSession(
+  val callId: String,
+  val desktopName: String,
+  val requestedAt: String,
+  val respondedAt: String?,
+  val status: String,
+  val note: String,
+)
+
 data class LocationPulseRequest(
   val pulseId: String,
 )
@@ -59,6 +75,44 @@ fun parsePulseResponse(json: String): List<LocationPulseRequest> {
       val item = requests.optJSONObject(index) ?: continue
       val pulseId = item.optString("pulse_id")
       if (pulseId.isNotBlank()) add(LocationPulseRequest(pulseId))
+    }
+  }
+}
+
+fun parseMessagesResponse(json: String): List<CompanionMessage> {
+  val root = JSONObject(json)
+  val messages = root.optJSONArray("messages") ?: JSONArray()
+  return buildList {
+    for (index in 0 until messages.length()) {
+      val item = messages.optJSONObject(index) ?: continue
+      add(
+        CompanionMessage(
+          messageId = item.optString("message_id"),
+          source = item.optString("source"),
+          text = item.optString("text"),
+          createdAt = item.optString("created_at"),
+        ),
+      )
+    }
+  }
+}
+
+fun parseCallSessionsResponse(json: String): List<CompanionCallSession> {
+  val root = JSONObject(json)
+  val calls = root.optJSONArray("calls") ?: JSONArray()
+  return buildList {
+    for (index in 0 until calls.length()) {
+      val item = calls.optJSONObject(index) ?: continue
+      add(
+        CompanionCallSession(
+          callId = item.optString("call_id"),
+          desktopName = item.optString("desktop_name"),
+          requestedAt = item.optString("requested_at"),
+          respondedAt = item.optString("responded_at").ifBlank { null },
+          status = item.optString("status"),
+          note = item.optString("note"),
+        ),
+      )
     }
   }
 }
