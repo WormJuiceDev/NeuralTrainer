@@ -19,10 +19,12 @@ class MainActivity : AppCompatActivity() {
   private lateinit var binding: ActivityMainBinding
   private lateinit var store: SettingsStore
   private val api = NorthStarApi()
+  private var pairingSeedReady = false
 
   private val locationPermissionLauncher =
     registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
       renderStatus("Location permissions updated.", detailSummary())
+      maybeAutoFinishSetup()
     }
 
   override fun onCreate(savedInstanceState: Bundle?) {
@@ -34,6 +36,7 @@ class MainActivity : AppCompatActivity() {
     hydrateInputs()
     applyDeepLink(intent?.data)
     wireActions()
+    maybeResumeBackgroundSync()
     renderStatus("Status: waiting for pairing", detailSummary())
     refreshState()
   }
@@ -63,25 +66,40 @@ class MainActivity : AppCompatActivity() {
     if (userHandle.isNotBlank()) binding.userHandleInput.setText(userHandle)
     if (displayName.isNotBlank()) binding.displayNameInput.setText(displayName)
     if (desktopName.isNotBlank()) binding.desktopNameInput.setText(desktopName)
+    if (userHandle.isNotBlank()) store.setUserHandle(userHandle)
+    if (displayName.isNotBlank()) store.setDisplayName(displayName)
+    if (desktopName.isNotBlank()) store.setDesktopName(desktopName)
     if (pairCode.isNotBlank()) {
+      pairingSeedReady = true
+      binding.pairButton.text = getString(R.string.finish_setup)
       renderStatus("Pairing details received from QR.", "Tap Pair this phone to finish the native connection.")
+      maybeAutoFinishSetup()
     }
   }
 
   private fun wireActions() {
     binding.pairButton.setOnClickListener { pairPhone() }
     binding.locationPermissionButton.setOnClickListener { requestLocationPermissions() }
-    binding.backgroundButton.setOnClickListener {
-      PulseForegroundService.start(this)
-      store.setBackgroundSyncEnabled(true)
-      renderStatus("Automatic background sync started.", detailSummary())
-    }
-    binding.stopBackgroundButton.setOnClickListener {
-      PulseForegroundService.stop(this)
-      store.setBackgroundSyncEnabled(false)
-      renderStatus("Automatic background sync stopped.", detailSummary())
-    }
     binding.refreshButton.setOnClickListener { refreshState() }
+  }
+
+  private fun maybeResumeBackgroundSync() {
+    if (store.backgroundSyncEnabled() && store.sessionToken().isNotBlank() && store.deviceToken().isNotBlank()) {
+      PulseForegroundService.start(this)
+    }
+  }
+
+  private fun maybeAutoFinishSetup() {
+    if (!pairingSeedReady) return
+    val capability = currentCapability()
+    if (capability.permissionState == "granted") {
+      pairPhone()
+    } else {
+      renderStatus(
+        "Allow location to finish setup.",
+        "North Star already has the desktop pairing details from the QR code. Allow location once and setup will finish.",
+      )
+    }
   }
 
   private fun saveDraftInputs() {
@@ -117,8 +135,11 @@ class MainActivity : AppCompatActivity() {
         }
         renderStatus(
           "This phone is now linked.",
-          "Linked to ${desktops.firstOrNull()?.desktopName ?: desktopName}. Turn on automatic background sync so NeuralTrainer can request location without bringing North Star to the front.",
+          "Linked to ${desktops.firstOrNull()?.desktopName ?: desktopName}. North Star will now keep automatic background sync running for location replies.",
         )
+        pairingSeedReady = false
+        store.setBackgroundSyncEnabled(true)
+        PulseForegroundService.start(this@MainActivity)
       } catch (caught: Exception) {
         renderStatus("Pairing failed.", caught.message ?: "The native phone pairing flow could not finish.")
       }
@@ -143,6 +164,7 @@ class MainActivity : AppCompatActivity() {
           if (primaryDesktop != null) "${primaryDesktop.desktopName} is linked." else "No linked desktop found.",
           detailSummary(primaryDesktop?.desktopName ?: store.desktopName()),
         )
+        binding.pairButton.text = if (primaryDesktop != null) "Reconnect this phone" else getString(R.string.finish_setup)
       } catch (caught: Exception) {
         renderStatus("North Star status could not be refreshed.", caught.message ?: "Unknown native status error.")
       }

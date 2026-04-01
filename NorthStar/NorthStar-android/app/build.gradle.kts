@@ -11,8 +11,8 @@ android {
     applicationId = "app.youworld.northstar"
     minSdk = 29
     targetSdk = 35
-    versionCode = 1
-    versionName = "v1-native-dev1"
+    versionCode = 2
+    versionName = "v1-native-dev2"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }

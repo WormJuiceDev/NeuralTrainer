@@ -24,10 +24,11 @@
             android:text="@string/native_version_label" />
 
         <TextView
-            android:layout_width="wrap_content"
+            android:id="@+id/onboardingText"
+            android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:text="@string/server_endpoint_label" />
+            android:text="@string/onboarding_copy" />
 
         <EditText
             android:id="@+id/apiBaseInput"
@@ -35,13 +36,8 @@
             android:layout_height="wrap_content"
             android:hint="https://northstar.youworld.app"
             android:inputType="textUri"
-            android:singleLine="true" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/user_handle_label" />
+            android:singleLine="true"
+            android:visibility="gone" />
 
         <EditText
             android:id="@+id/userHandleInput"
@@ -49,13 +45,8 @@
             android:layout_height="wrap_content"
             android:hint="savvy"
             android:inputType="textNoSuggestions"
-            android:singleLine="true" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/display_name_label" />
+            android:singleLine="true"
+            android:visibility="gone" />
 
         <EditText
             android:id="@+id/displayNameInput"
@@ -63,13 +54,8 @@
             android:layout_height="wrap_content"
             android:hint="Savvy"
             android:inputType="textPersonName"
-            android:singleLine="true" />
-
-        <TextView
-            android:layout_width="wrap_content"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/desktop_name_label" />
+            android:singleLine="true"
+            android:visibility="gone" />
 
         <EditText
             android:id="@+id/desktopNameInput"
@@ -77,14 +63,15 @@
             android:layout_height="wrap_content"
             android:hint="DESKTOP-RONNY"
             android:inputType="textNoSuggestions"
-            android:singleLine="true" />
+            android:singleLine="true"
+            android:visibility="gone" />
 
         <Button
             android:id="@+id/pairButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="20dp"
-            android:text="@string/pair_phone" />
+            android:text="@string/finish_setup" />
 
         <Button
             android:id="@+id/locationPermissionButton"
@@ -94,25 +81,11 @@
             android:text="@string/allow_location" />
 
         <Button
-            android:id="@+id/backgroundButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/start_background_sync" />
-
-        <Button
-            android:id="@+id/stopBackgroundButton"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="12dp"
-            android:text="@string/stop_background_sync" />
-
-        <Button
             android:id="@+id/refreshButton"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"
-            android:text="@string/refresh_status" />
+            android:text="@string/check_connection" />
 
         <TextView
             android:id="@+id/statusText"

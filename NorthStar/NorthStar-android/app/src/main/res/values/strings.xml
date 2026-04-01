@@ -1,17 +1,20 @@
 <resources>
     <string name="app_name">North Star Android</string>
-    <string name="native_version_label">Native version v1-native-dev1</string>
+    <string name="native_version_label">Native version v1-native-dev2</string>
     <string name="server_endpoint_label">North Star endpoint</string>
     <string name="user_handle_label">User handle</string>
     <string name="display_name_label">Display name</string>
     <string name="desktop_name_label">Desktop name</string>
     <string name="pair_phone">Pair this phone</string>
+    <string name="finish_setup">Finish setup</string>
     <string name="allow_location">Allow location</string>
     <string name="start_background_sync">Start automatic background sync</string>
     <string name="stop_background_sync">Stop background sync</string>
     <string name="refresh_status">Refresh status</string>
+    <string name="check_connection">Check connection</string>
     <string name="status_waiting">Status: waiting for pairing</string>
     <string name="detail_waiting">Scan the NeuralTrainer QR code or fill the pairing fields, then enable background sync so North Star can answer location pulses automatically.</string>
+    <string name="onboarding_copy">Scan the QR code shown in NeuralTrainer. North Star will use that pairing and keep background location replies running automatically.</string>
     <string name="background_notification_title">North Star background sync</string>
     <string name="background_notification_text">Watching for NeuralTrainer location pulse requests.</string>
 </resources>
