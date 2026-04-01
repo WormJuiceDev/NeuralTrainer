@@ -50,6 +50,7 @@ pub fn run() {
       commands::get_north_star_runtime_snapshot,
       commands::create_north_star_session,
       commands::bind_north_star_desktop,
+      commands::create_north_star_pairing_code,
       commands::send_north_star_heartbeat,
       commands::send_north_star_message,
       commands::send_north_star_call_request,

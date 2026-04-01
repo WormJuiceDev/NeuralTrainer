@@ -98,6 +98,16 @@ pub struct NorthStarDesktopBinding {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NorthStarPairingCode {
+  pub code: String,
+  pub user_handle: String,
+  pub display_name: String,
+  pub desktop_name: String,
+  pub expires_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NorthStarMessage {
   pub message_id: String,
   pub user_handle: String,

@@ -13,6 +13,7 @@ import {
   Users,
   UtensilsCrossed,
 } from "lucide-react";
+import QRCode from "qrcode";
 import humanoidFigure from "../Designs/Humanoid.png";
 import {
   archiveCompanionContextEntry,
@@ -22,6 +23,7 @@ import {
   createPlace,
   createReflection,
   createRule,
+  createNorthStarPairingCode,
   autoDispatchEligibleOutreach,
   createNearbyInterestFilter,
   createNorthStarSession,
@@ -124,6 +126,7 @@ import type {
   PhaseOneSnapshot,
   PhaseThreeSnapshot,
   MvpRealityCheckSnapshot,
+  NorthStarPairingCode,
   NorthStarSnapshot,
   NorthStarRtcIceServer,
   NorthStarRuntimeSnapshot,
@@ -147,7 +150,7 @@ import type {
 } from "./types";
 
 type TabId = "home" | "context" | "tectonics" | "settings";
-type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
+type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "location" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
 type ContextSectionId = string;
 type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment" | "world";
@@ -339,10 +342,20 @@ type NorthStarConnectionsProjection = {
   userHandle: string;
   sessionTokenMasked: string;
   deviceTokenMasked: string;
+  desktops: NorthStarSnapshot["desktops"];
   desktopCount: number;
   messageCount: number;
   locationEventCount: number;
   callReviewCount: number;
+};
+
+type NorthStarConnectionHealth = {
+  label: string;
+  headline: string;
+  guidance: string;
+  actionLabel: string;
+  busyLabel: string;
+  canCall: boolean;
 };
 
 const defaultNorthStarLiveDiagnostics: NorthStarLiveDiagnostics = {
@@ -393,6 +406,12 @@ function buildNorthStarCallSessionsSignature(callSessions: NorthStarSnapshot["ca
     .join("|");
 }
 
+function buildNorthStarDesktopBindingsSignature(desktops: NorthStarSnapshot["desktops"]) {
+  return desktops
+    .map((desktop) => `${desktop.desktopId}:${desktop.deviceToken}:${desktop.status}:${desktop.lastHeartbeatAt ?? ""}:${desktop.userHandle}`)
+    .join("|");
+}
+
 function projectNorthStarRuntimeSnapshot(snapshot: NorthStarSnapshot): NorthStarRuntimeProjection {
   return {
     configured: snapshot.configured,
@@ -424,6 +443,7 @@ function projectNorthStarConnectionsSnapshot(snapshot: NorthStarSnapshot): North
     userHandle: snapshot.userHandle,
     sessionTokenMasked: snapshot.sessionTokenMasked,
     deviceTokenMasked: snapshot.deviceTokenMasked,
+    desktops: snapshot.desktops,
     desktopCount: snapshot.desktops.length,
     messageCount: snapshot.messages.length,
     locationEventCount: snapshot.locationEvents.length,
@@ -455,11 +475,116 @@ function sameNorthStarConnectionsProjection(a: NorthStarConnectionsProjection | 
     && a.userHandle === b.userHandle
     && a.sessionTokenMasked === b.sessionTokenMasked
     && a.deviceTokenMasked === b.deviceTokenMasked
+    && buildNorthStarDesktopBindingsSignature(a.desktops) === buildNorthStarDesktopBindingsSignature(b.desktops)
     && a.desktopCount === b.desktopCount
     && a.messageCount === b.messageCount
     && a.locationEventCount === b.locationEventCount
     && a.callReviewCount === b.callReviewCount
   );
+}
+
+function getNorthStarConnectionHealth(
+  snapshot: NorthStarConnectionsProjection | null,
+  savedDeviceToken: string,
+): NorthStarConnectionHealth {
+  if (!snapshot) {
+    return {
+      label: "Checking",
+      headline: "Checking the phone connection status.",
+      guidance: "If this does not settle, use Connect North Star once and the desktop will rebuild the link.",
+      actionLabel: "Connect North Star",
+      busyLabel: "Connecting...",
+      canCall: false,
+    };
+  }
+
+  if (!snapshot.configured) {
+    return {
+      label: "Needs setup",
+      headline: "Add your North Star address and companion identity first.",
+      guidance: "Use the same North Star user handle on the phone and the desktop so they stay in the same shared state.",
+      actionLabel: "Connect North Star",
+      busyLabel: "Connecting...",
+      canCall: false,
+    };
+  }
+
+  if (!snapshot.sessionReady) {
+    return {
+      label: "Needs session",
+      headline: "This desktop still needs its North Star session.",
+      guidance: "Connect once and the desktop will create its session, bind itself, and refresh the phone link automatically.",
+      actionLabel: "Connect North Star",
+      busyLabel: "Connecting...",
+      canCall: false,
+    };
+  }
+
+  const trimmedDeviceToken = savedDeviceToken.trim();
+  if (!trimmedDeviceToken) {
+    return {
+      label: "Waiting for phone link",
+      headline: "The desktop session is ready, but this machine is not linked to your phone yet.",
+      guidance: "Use Connect North Star and then open North Star on the phone so it can confirm the shared link.",
+      actionLabel: "Connect North Star",
+      busyLabel: "Connecting...",
+      canCall: false,
+    };
+  }
+
+  const matchingDesktop = snapshot.desktops.find((desktop) => desktop.deviceToken === trimmedDeviceToken) ?? null;
+  if (!matchingDesktop) {
+    return {
+      label: "Needs repair",
+      headline: "This saved desktop link no longer matches the phone-side connection.",
+      guidance: "Repair the connection to create a fresh shared binding instead of relying on an old token or the wrong handle.",
+      actionLabel: "Repair connection",
+      busyLabel: "Repairing...",
+      canCall: false,
+    };
+  }
+
+  if (matchingDesktop.status === "offline") {
+    return {
+      label: "Reconnect",
+      headline: "The phone still knows this desktop, but the live link has gone quiet.",
+      guidance: "Refresh the connection to announce this desktop again and bring calls, pulses, and presence updates back online.",
+      actionLabel: "Refresh connection",
+      busyLabel: "Refreshing...",
+      canCall: true,
+    };
+  }
+
+  return {
+    label: "Ready",
+    headline: "Desktop and phone are connected.",
+    guidance: "Calls, messages, and location pulses can use this shared link without any extra setup ritual.",
+    actionLabel: "Refresh connection",
+    busyLabel: "Refreshing...",
+    canCall: true,
+  };
+}
+
+function buildNorthStarPairingUrl(endpoint: string, code: string, userHandle: string, displayName: string, desktopName: string) {
+  const trimmedEndpoint = endpoint.trim().replace(/\/+$/, "");
+  if (!trimmedEndpoint || !code.trim()) {
+    return "";
+  }
+  const params = new URLSearchParams({
+    pairCode: code.trim(),
+    userHandle: userHandle.trim(),
+    displayName: displayName.trim(),
+    desktopName: desktopName.trim(),
+  });
+  return `${trimmedEndpoint}/pair/${encodeURIComponent(code.trim())}?${params.toString()}`;
+}
+
+function deriveNorthStarDisplayName(userHandle: string) {
+  const trimmed = userHandle.trim();
+  if (!trimmed) {
+    return "North Star";
+  }
+  return trimmed.charAt(0).toUpperCase() + trimmed.slice(1);
 }
 
 const NORTH_STAR_WEBRTC_CONFIG: RTCConfiguration = {
@@ -1919,7 +2044,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarPulse" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | "worldPresence" | "nearbyInterestFilter" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarPulse" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "northStarPairing" | "northStarReset" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | "worldPresence" | "nearbyInterestFilter" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [lastDraftDispatch, setLastDraftDispatch] = useState<DraftedOutreachDispatchResult | null>(null);
@@ -1967,6 +2092,8 @@ function App() {
   const northStarPeerReplyPlaybackQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarPeerReplyStartedRef = useRef<Set<string>>(new Set());
   const northStarSnapshotCacheRef = useRef<NorthStarSnapshot | null>(null);
+  const [northStarPairingCode, setNorthStarPairingCode] = useState<NorthStarPairingCode | null>(null);
+  const [northStarPairingQrSrc, setNorthStarPairingQrSrc] = useState<string | null>(null);
 
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
   const northStarConnectionsVisible = activeTab === "settings" && settingsSection === "connections";
@@ -2040,6 +2167,23 @@ function App() {
   const northStarSessionReady = northStarRuntimeSnapshot?.sessionReady ?? false;
   const northStarDesktopBound = northStarRuntimeSnapshot?.desktopBound ?? false;
   const northStarReadyForCalls = northStarRuntimeSnapshot?.configured && northStarSessionReady && northStarDesktopBound;
+  const northStarConnectionHealth = getNorthStarConnectionHealth(northStarConnectionsSnapshot, settings.northStarDeviceToken);
+  const northStarActivePhoneCallCount = northStarConnectionsSnapshot?.callSessions.filter((entry) => entry.status === "pending" || entry.status === "accepted").length ?? 0;
+  const northStarIdentityLocked = Boolean(settings.northStarSessionToken.trim());
+  const northStarDesktopBinding = settings.northStarDeviceToken.trim()
+    ? northStarConnectionsSnapshot?.desktops.find((desktop) => desktop.deviceToken === settings.northStarDeviceToken.trim()) ?? null
+    : northStarConnectionsSnapshot?.desktops[0] ?? null;
+  const northStarPairingUrl = northStarPairingCode
+    ? buildNorthStarPairingUrl(
+      settings.northStarEndpoint,
+      northStarPairingCode.code,
+      settings.northStarUserHandle,
+      settings.northStarDisplayName,
+      northStarConnectionsSnapshot?.desktopName || settings.northStarDisplayName || "NeuralTrainer",
+    )
+    : "";
+  const northStarSessionTokenDisplay = northStarConnectionsSnapshot?.sessionTokenMasked || (settings.northStarSessionToken.trim() ? "Saved locally" : "Not created yet");
+  const northStarDeviceTokenDisplay = northStarConnectionsSnapshot?.deviceTokenMasked || (settings.northStarDeviceToken.trim() ? "Saved locally" : "Not bound yet");
 const northStarLiveTurnActive =
   northStarLiveDiagnostics.phase === "desktop_remote_turn_processing"
   || northStarLiveDiagnostics.phase === "desktop_remote_turn_processed";
@@ -3652,6 +3796,33 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }, [northStarConnectionsVisible]);
 
   useEffect(() => {
+    if (!northStarPairingUrl) {
+      setNorthStarPairingQrSrc(null);
+      return;
+    }
+    let cancelled = false;
+    void QRCode.toDataURL(northStarPairingUrl, {
+      margin: 1,
+      width: 220,
+      color: {
+        dark: "#0b141a",
+        light: "#f6fbff",
+      },
+    }).then((value: string) => {
+      if (!cancelled) {
+        setNorthStarPairingQrSrc(value);
+      }
+    }).catch(() => {
+      if (!cancelled) {
+        setNorthStarPairingQrSrc(null);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [northStarPairingUrl]);
+
+  useEffect(() => {
     if (
       !latestAcceptedNorthStarCall
       || (activeNorthStarSession && activeNorthStarRemoteCallId === latestAcceptedNorthStarCall.callId)
@@ -4065,6 +4236,23 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setSettings((current) => ({ ...current, [key]: defaultSettings[key] }));
   }
 
+  async function ensureNorthStarLinkedSnapshot() {
+    let snapshot = northStarSnapshotCacheRef.current;
+    if (!snapshot?.sessionReady) {
+      snapshot = await createNorthStarSession();
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
+    }
+    const currentDeviceToken = settings.northStarDeviceToken.trim();
+    const linkedDesktopExists = Boolean(currentDeviceToken && snapshot?.desktops.some((desktop) => desktop.deviceToken === currentDeviceToken));
+    if (!currentDeviceToken || !linkedDesktopExists) {
+      snapshot = await bindNorthStarDesktop();
+      commitNorthStarSnapshot(snapshot, { forceConnections: true });
+    }
+    snapshot = await sendNorthStarHeartbeat();
+    commitNorthStarSnapshot(snapshot, { forceConnections: true });
+    return snapshot;
+  }
+
   async function handleCreateNorthStarSession() {
     setBusyPanel("northStarSession");
     setError("");
@@ -4109,20 +4297,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
     setMessage("");
     try {
       await persistCurrentSettings();
-      let snapshot = northStarSnapshotCacheRef.current;
-      if (!snapshot?.sessionReady) {
-        snapshot = await createNorthStarSession();
-        commitNorthStarSnapshot(snapshot, { forceConnections: true });
-      }
-      if (!snapshot?.desktopBound) {
-        snapshot = await bindNorthStarDesktop();
-        commitNorthStarSnapshot(snapshot, { forceConnections: true });
-      }
-      snapshot = await sendNorthStarHeartbeat();
-      commitNorthStarSnapshot(snapshot, { forceConnections: true });
+      const currentDeviceToken = settings.northStarDeviceToken.trim();
+      const linkedDesktopExists = Boolean(currentDeviceToken && northStarSnapshotCacheRef.current?.desktops.some((desktop) => desktop.deviceToken === currentDeviceToken));
+      await ensureNorthStarLinkedSnapshot();
       const loaded = await loadSettings();
       setSettings(withPromptDefaults(loaded));
-      setMessage("North Star is linked and ready for calls.");
+      setMessage(linkedDesktopExists ? "North Star connection refreshed." : "North Star is linked and ready for calls.");
       await refreshDiagnostics();
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -4141,6 +4321,71 @@ async function playNorthStarReplyOverPeer(base64: string) {
       commitNorthStarSnapshot(snapshot, { forceConnections: true });
       setMessage(snapshot.detail);
       await refreshDiagnostics();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handlePrepareNorthStarPairing() {
+    setBusyPanel("northStarPairing");
+    setError("");
+    setMessage("");
+    try {
+      const normalizedUserHandle = settings.northStarUserHandle.trim();
+      const desiredHandle = normalizedUserHandle.toLowerCase();
+      const currentHandle = northStarConnectionsSnapshot?.userHandle.trim().toLowerCase() ?? "";
+      const nextSettings = withPromptDefaults({
+        ...settings,
+        northStarUserHandle: normalizedUserHandle,
+        northStarDisplayName: deriveNorthStarDisplayName(normalizedUserHandle),
+        northStarSessionToken: currentHandle && desiredHandle && currentHandle !== desiredHandle ? "" : settings.northStarSessionToken,
+        northStarDeviceToken: currentHandle && desiredHandle && currentHandle !== desiredHandle ? "" : settings.northStarDeviceToken,
+        northStarLastLocationEventId: currentHandle && desiredHandle && currentHandle !== desiredHandle ? "" : settings.northStarLastLocationEventId,
+      });
+      setSettings(nextSettings);
+      if (currentHandle && desiredHandle && currentHandle !== desiredHandle) {
+        northStarSnapshotCacheRef.current = null;
+        setNorthStarConnectionsSnapshot(null);
+        setNorthStarRuntimeSnapshot(null);
+      }
+      await persistCurrentSettings(nextSettings);
+      await ensureNorthStarLinkedSnapshot();
+      const pairing = await createNorthStarPairingCode();
+      setNorthStarPairingCode(pairing);
+      setMessage("Phone pairing is ready. Scan the QR code in North Star on the phone.");
+      await refreshDiagnostics();
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleResetNorthStarConnection() {
+    if (!window.confirm("Clear the saved North Star session and desktop link on this computer?")) {
+      return;
+    }
+    setBusyPanel("northStarReset");
+    setError("");
+    setMessage("");
+    try {
+      const nextSettings = withPromptDefaults({
+        ...settings,
+        northStarSessionToken: "",
+        northStarDeviceToken: "",
+        northStarLastLocationEventId: "",
+      });
+      setSettings(nextSettings);
+      await saveSettings(nextSettings);
+      northStarSnapshotCacheRef.current = null;
+      setNorthStarConnectionsSnapshot(null);
+      setNorthStarRuntimeSnapshot(null);
+      setNorthStarPairingCode(null);
+      setNorthStarPairingQrSrc(null);
+      setMessage("North Star link cleared on this desktop. You can now reconnect or switch handles safely.");
+      await Promise.all([refreshNorthStarSnapshot(), refreshNorthStarRuntimeSnapshot(), refreshDiagnostics()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -5029,11 +5274,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
         {renderSectionTabs([
           { id: "companion", label: "Companion" },
           { id: "connections", label: "Connections" },
+          { id: "location", label: "Location" },
           { id: "voice", label: "Voice" },
           { id: "diagnostics", label: "Diagnostics" },
         ], settingsSection, setSettingsSection)}
 
-        {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "voice") ? (
+        {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "location" || settingsSection === "voice") ? (
           <section className="panel">
             <form className="settings-form" onSubmit={handleSettingsSubmit}>
               {(settingsSection === "companion" || settingsSection === "core") ? (
@@ -5074,61 +5320,98 @@ async function playNorthStarReplyOverPeer(base64: string) {
                     </div>
                     <div className="saved-state">
                       <h3>North Star companion</h3>
-                      <p>Link once, then call North Star with a single button while the desktop keeps the line alive automatically.</p>
+                      <p>Enter the North Star user handle once, then pair the phone by scanning the QR code. Everything else should happen automatically.</p>
+                      <label>
+                        <span>North Star user handle</span>
+                        <input
+                          value={settings.northStarUserHandle}
+                          onChange={(event) => setSettings((current) => ({
+                            ...current,
+                            northStarUserHandle: event.target.value,
+                            northStarDisplayName: deriveNorthStarDisplayName(event.target.value),
+                          }))}
+                          placeholder="savvy"
+                        />
+                      </label>
                       {northStarConnectionsSnapshot ? (
                         <>
                           <dl className="facts">
-                            <div><dt>Link</dt><dd>{northStarReadyForCalls ? "Ready" : "Needs setup"}</dd></div>
+                            <div><dt>Link</dt><dd>{northStarConnectionHealth.label}</dd></div>
                             <div><dt>Companion</dt><dd>{northStarConnectionsSnapshot.displayName || "North Star"}</dd></div>
                             <div><dt>Desktop</dt><dd>{northStarConnectionsSnapshot.desktopName}</dd></div>
-                            <div><dt>Active phone calls</dt><dd>{northStarConnectionsSnapshot.callSessions.filter((entry) => entry.status === "pending" || entry.status === "accepted").length}</dd></div>
                           </dl>
-                          <p><strong>Status</strong><br />{northStarConnectionsSnapshot.detail}</p>
+                          <p><strong>Status</strong><br />{northStarConnectionHealth.headline}</p>
                           <div className="button-row">
-                            <button type="button" onClick={handleNorthStarQuickLink} disabled={busyPanel === "northStarLink"}>
-                              {busyPanel === "northStarLink" ? "Linking..." : "Link North Star"}
-                            </button>
-                            <button type="button" onClick={handleCallNorthStar} disabled={busyPanel === "northStarCall"}>
-                              {busyPanel === "northStarCall" ? "Calling..." : "Call North Star"}
-                            </button>
-                            <button type="button" className="ghost" onClick={handleNorthStarHeartbeat} disabled={busyPanel === "northStarHeartbeat" || !settings.northStarDeviceToken}>
-                              {busyPanel === "northStarHeartbeat" ? "Refreshing..." : "Refresh link"}
-                            </button>
-                            <button type="button" className="ghost" onClick={handleImportNorthStarCallReviews} disabled={busyPanel === "northStarImportReviews" || !northStarConnectionsSnapshot.callReviewCount}>
-                              {busyPanel === "northStarImportReviews" ? "Importing..." : "Import call reviews"}
+                            <button type="button" onClick={handlePrepareNorthStarPairing} disabled={busyPanel === "northStarPairing" || !settings.northStarUserHandle.trim()}>
+                              {busyPanel === "northStarPairing" ? "Preparing pairing..." : "Pair a phone"}
                             </button>
                           </div>
+                          {northStarPairingCode ? (
+                            <div className="saved-state">
+                              <h4>Phone pairing</h4>
+                              <p>Open North Star on the phone and scan this QR code. The phone will pick up the handle and connect by itself.</p>
+                              {northStarPairingQrSrc ? (
+                                <img src={northStarPairingQrSrc} alt="North Star phone pairing QR code" style={{ width: 220, maxWidth: "100%", borderRadius: "0.75rem", background: "#f6fbff", padding: "0.75rem" }} />
+                              ) : (
+                                <p>QR code is preparing...</p>
+                              )}
+                            </div>
+                          ) : null}
                         </>
                       ) : (
-                        <p>North Star desktop status could not be loaded, but recovery controls are still available below.</p>
+                        <>
+                          <p>Pairing can still start from here even if live North Star status has not loaded yet.</p>
+                          <div className="button-row">
+                            <button type="button" onClick={handlePrepareNorthStarPairing} disabled={busyPanel === "northStarPairing" || !settings.northStarUserHandle.trim()}>
+                              {busyPanel === "northStarPairing" ? "Preparing pairing..." : "Pair a phone"}
+                            </button>
+                          </div>
+                          {northStarPairingCode ? (
+                            <div className="saved-state">
+                              <h4>Phone pairing</h4>
+                              <p>Open North Star on the phone and scan this QR code. The phone will pick up the handle and connect by itself.</p>
+                              {northStarPairingQrSrc ? (
+                                <img src={northStarPairingQrSrc} alt="North Star phone pairing QR code" style={{ width: 220, maxWidth: "100%", borderRadius: "0.75rem", background: "#f6fbff", padding: "0.75rem" }} />
+                              ) : (
+                                <p>QR code is preparing...</p>
+                              )}
+                            </div>
+                          ) : null}
+                        </>
                       )}
-                      <details className="advanced-block" open={!northStarConnectionsSnapshot}>
-                        <summary>Advanced North Star setup</summary>
-                        <div className="split">
-                          <label><span>North Star endpoint</span><input value={settings.northStarEndpoint} onChange={(event) => setSettings((current) => ({ ...current, northStarEndpoint: event.target.value }))} placeholder="https://northstar.your-domain.app" /></label>
-                          <label><span>North Star user handle</span><input value={settings.northStarUserHandle} onChange={(event) => setSettings((current) => ({ ...current, northStarUserHandle: event.target.value }))} placeholder="savvy" /></label>
-                        </div>
-                        <label><span>North Star display name</span><input value={settings.northStarDisplayName} onChange={(event) => setSettings((current) => ({ ...current, northStarDisplayName: event.target.value }))} placeholder="Savvy" /></label>
-                        <div className="split">
-                          <div><strong>Session token</strong><br />{northStarConnectionsSnapshot?.sessionTokenMasked || "Not created yet"}</div>
-                          <div><strong>Device token</strong><br />{northStarConnectionsSnapshot?.deviceTokenMasked || "Not bound yet"}</div>
-                        </div>
-                        <label><span>Desktop call note</span><textarea rows={2} value={northStarCallNote} onChange={(event) => setNorthStarCallNote(event.target.value)} placeholder="Optional outreach reason. Leave empty to use a seeded companion check-in." /></label>
-                        <label><span>Desktop companion message</span><textarea rows={3} value={northStarMessageText} onChange={(event) => setNorthStarMessageText(event.target.value)} placeholder="Send a message into the North Star companion thread..." /></label>
-                        <div className="button-row">
-                          <button type="button" onClick={handleCreateNorthStarSession} disabled={busyPanel === "northStarSession"}>{busyPanel === "northStarSession" ? "Creating session..." : "Create session"}</button>
-                          <button type="button" onClick={handleBindNorthStarDesktop} disabled={busyPanel === "northStarBind" || !settings.northStarSessionToken}>{busyPanel === "northStarBind" ? "Binding..." : "Bind desktop"}</button>
-                          <button type="button" onClick={handleNorthStarPullLocations} disabled={busyPanel === "northStarPull" || !settings.northStarDeviceToken}>{busyPanel === "northStarPull" ? "Pulling..." : "Pull location events"}</button>
-                          <button type="button" onClick={handleNorthStarRequestLocationPulse} disabled={busyPanel === "northStarPulse" || !settings.northStarDeviceToken}>{busyPanel === "northStarPulse" ? "Requesting..." : "Request location pulse"}</button>
-                          <button type="button" onClick={handleNorthStarMessage} disabled={busyPanel === "northStarMessage" || !settings.northStarDeviceToken || !northStarMessageText.trim()}>{busyPanel === "northStarMessage" ? "Sending..." : "Send companion message"}</button>
-                        </div>
-                      </details>
                     </div>
                   <div className="split">
                     <label><span>LM Studio endpoint</span><input value={settings.lmStudioEndpoint} onChange={(event) => setSettings((current) => ({ ...current, lmStudioEndpoint: event.target.value }))} /></label>
                     <label><span>LM Studio model</span><input value={settings.lmStudioModel} onChange={(event) => setSettings((current) => ({ ...current, lmStudioModel: event.target.value }))} /></label>
                   </div>
                   <label><span>LM Studio API key</span><input type="password" value={settings.lmStudioApiKey} onChange={(event) => setSettings((current) => ({ ...current, lmStudioApiKey: event.target.value }))} /></label>
+                </>
+              ) : settingsSection === "location" ? (
+                <>
+                  <div className="panel-header">
+                    <h2>Location</h2>
+                    <p>Request a fresh location from North Star and confirm that the phone is answering pulses when needed.</p>
+                  </div>
+                  <div className="saved-state">
+                    <h3>North Star location link</h3>
+                    <p>If the phone is paired and location permission is allowed, NeuralTrainer can ask North Star for a fresh location pulse whenever it needs one.</p>
+                    <dl className="facts">
+                      <div><dt>Link</dt><dd>{northStarConnectionHealth.label}</dd></div>
+                      <div><dt>Desktop</dt><dd>{northStarConnectionsSnapshot?.desktopName || "Waiting"}</dd></div>
+                      <div><dt>Phone location events</dt><dd>{northStarConnectionsSnapshot?.locationEventCount ?? 0}</dd></div>
+                      <div><dt>Desktop binding</dt><dd>{northStarDesktopBinding?.status || "Waiting"}</dd></div>
+                    </dl>
+                    <p><strong>Status</strong><br />{northStarConnectionsSnapshot?.detail || "North Star location status will appear here once the phone link is active."}</p>
+                    <div className="button-row">
+                      <button type="button" onClick={handleNorthStarRequestLocationPulse} disabled={busyPanel === "northStarPulse" || !settings.northStarUserHandle.trim()}>
+                        {busyPanel === "northStarPulse" ? "Requesting..." : "Request phone location"}
+                      </button>
+                      <button type="button" className="ghost" onClick={handleNorthStarPullLocations} disabled={busyPanel === "northStarPull" || !settings.northStarUserHandle.trim()}>
+                        {busyPanel === "northStarPull" ? "Syncing..." : "Sync latest phone locations"}
+                      </button>
+                    </div>
+                    <p>The normal expected flow is: request the pulse here, North Star answers it on the phone, then the fresh location shows up in Passive Context.</p>
+                  </div>
                 </>
               ) : (
                 <>
@@ -6944,6 +7227,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "overview", label: "Overview" },
           { id: "companion", label: "Companion" },
           { id: "connections", label: "Connections" },
+          { id: "location", label: "Location" },
           { id: "voice", label: "Voice" },
           { id: "memory", label: "Memory" },
           { id: "passive", label: "Passive Context" },
@@ -6989,7 +7273,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           </div>
         ) : null}
 
-        {settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "voice" || settingsSection === "diagnostics"
+        {settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "location" || settingsSection === "voice" || settingsSection === "diagnostics"
           ? renderSettingsTab()
           : null}
         {settingsSection === "memory" ? renderMemoryTab() : null}

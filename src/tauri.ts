@@ -29,6 +29,7 @@ import type {
   MvpRealityCheckSnapshot,
   NorthStarRuntimeSnapshot,
   NorthStarSnapshot,
+  NorthStarPairingCode,
   NorthStarRtcIceServer,
   NorthStarTurnProcessingResult,
   NorthStarWebRtcSignal,
@@ -108,6 +109,9 @@ export const createNorthStarSession = () =>
 
 export const bindNorthStarDesktop = () =>
   invoke<NorthStarSnapshot>("bind_north_star_desktop");
+
+export const createNorthStarPairingCode = () =>
+  invoke<NorthStarPairingCode>("create_north_star_pairing_code");
 
 export const sendNorthStarHeartbeat = () =>
   invoke<NorthStarSnapshot>("send_north_star_heartbeat");

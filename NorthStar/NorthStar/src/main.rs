@@ -10,6 +10,7 @@ use std::{
 
 use axum::{
     extract::{
+        Path as AxumPath,
         ws::{Message, WebSocket, WebSocketUpgrade},
         Query, State,
     },
@@ -23,7 +24,7 @@ use aes_gcm::{
     Aes128Gcm, Nonce,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use futures::stream::StreamExt;
 use hkdf::Hkdf;
 use p256::ecdsa::{signature::Signer, Signature, SigningKey};
@@ -71,6 +72,7 @@ struct IceServerConfig {
 struct PersistedStore {
     sessions: HashMap<String, UserSession>,
     desktops: HashMap<String, DesktopBinding>,
+    pairing_codes: Vec<PairingCodeRecord>,
     messages: Vec<CompanionMessage>,
     location_events: Vec<LocationEvent>,
     location_pulse_requests: Vec<LocationPulseRequest>,
@@ -87,6 +89,16 @@ struct UserSession {
     user_handle: String,
     display_name: String,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PairingCodeRecord {
+    code: String,
+    user_handle: String,
+    display_name: String,
+    desktop_name: String,
+    created_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -352,6 +364,22 @@ struct SessionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct CreatePairingCodeRequest {
+    user_handle: String,
+    display_name: String,
+    desktop_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PairingCodeResponse {
+    code: String,
+    user_handle: String,
+    display_name: String,
+    desktop_name: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BindDesktopRequest {
     desktop_name: String,
 }
@@ -593,6 +621,8 @@ async fn main() {
     let app = Router::new()
         .route("/api/health", get(health))
         .route("/api/auth/dev-session", post(create_session))
+        .route("/api/pairing-codes", post(create_pairing_code))
+        .route("/api/pairing-codes/{code}", get(resolve_pairing_code))
         .route("/api/companion/bind-desktop", post(bind_desktop))
         .route("/api/companion/desktop-heartbeat", post(desktop_heartbeat))
         .route("/api/companion/state", get(companion_state))
@@ -742,6 +772,32 @@ fn persist_store(path: &Path, store: &PersistedStore) -> Result<(), AppError> {
     fs::write(path, contents).map_err(AppError::internal)
 }
 
+fn cleanup_pairing_codes(store: &mut PersistedStore) {
+    let now = Utc::now();
+    store.pairing_codes.retain(|entry| entry.expires_at > now);
+}
+
+fn normalize_pairing_code(raw: &str) -> String {
+    raw.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .map(|ch| ch.to_ascii_uppercase())
+        .collect()
+}
+
+fn generate_pairing_code(store: &PersistedStore) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    loop {
+        let mut candidate = String::with_capacity(8);
+        for _ in 0..8 {
+            let index = (OsRng.next_u32() as usize) % ALPHABET.len();
+            candidate.push(ALPHABET[index] as char);
+        }
+        if !store.pairing_codes.iter().any(|entry| entry.code == candidate) {
+            return candidate;
+        }
+    }
+}
+
 async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
         service: "north_star",
@@ -773,6 +829,87 @@ async fn create_session(
         session_token: session.session_token,
         user_handle: session.user_handle,
         display_name: session.display_name,
+    }))
+}
+
+async fn create_pairing_code(
+    State(state): State<AppState>,
+    Json(request): Json<CreatePairingCodeRequest>,
+) -> Result<Json<PairingCodeResponse>, AppError> {
+    let user_handle = request.user_handle.trim();
+    let display_name = request.display_name.trim();
+    let desktop_name = request.desktop_name.trim();
+
+    if user_handle.is_empty() {
+        return Err(AppError::bad_request("User handle is required."));
+    }
+    if display_name.is_empty() {
+        return Err(AppError::bad_request("Display name is required."));
+    }
+    if desktop_name.is_empty() {
+        return Err(AppError::bad_request("Desktop name is required."));
+    }
+
+    let record = {
+        let mut store = state.store.write().await;
+        cleanup_pairing_codes(&mut store);
+        let created_at = Utc::now();
+        let record = PairingCodeRecord {
+            code: generate_pairing_code(&store),
+            user_handle: user_handle.to_string(),
+            display_name: display_name.to_string(),
+            desktop_name: desktop_name.to_string(),
+            created_at,
+            expires_at: created_at + Duration::minutes(10),
+        };
+        store.pairing_codes.push(record.clone());
+        store
+            .pairing_codes
+            .sort_by_key(|saved| std::cmp::Reverse(saved.created_at));
+        if store.pairing_codes.len() > 200 {
+            store.pairing_codes.truncate(200);
+        }
+        persist_store(&state.state_path, &store)?;
+        record
+    };
+
+    Ok(Json(PairingCodeResponse {
+        code: record.code,
+        user_handle: record.user_handle,
+        display_name: record.display_name,
+        desktop_name: record.desktop_name,
+        expires_at: record.expires_at,
+    }))
+}
+
+async fn resolve_pairing_code(
+    State(state): State<AppState>,
+    AxumPath(code): AxumPath<String>,
+) -> Result<Json<PairingCodeResponse>, AppError> {
+    let normalized = normalize_pairing_code(&code);
+    if normalized.is_empty() {
+        return Err(AppError::bad_request("Pairing code is required."));
+    }
+
+    let record = {
+        let mut store = state.store.write().await;
+        cleanup_pairing_codes(&mut store);
+        let record = store
+            .pairing_codes
+            .iter()
+            .find(|entry| entry.code == normalized)
+            .cloned()
+            .ok_or_else(|| AppError::not_found("Pairing code not found or expired."))?;
+        persist_store(&state.state_path, &store)?;
+        record
+    };
+
+    Ok(Json(PairingCodeResponse {
+        code: record.code,
+        user_handle: record.user_handle,
+        display_name: record.display_name,
+        desktop_name: record.desktop_name,
+        expires_at: record.expires_at,
     }))
 }
 
@@ -1965,6 +2102,13 @@ struct AppError {
 }
 
 impl AppError {
+    fn bad_request(message: &str) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            message: message.to_string(),
+        }
+    }
+
     fn not_found(message: &str) -> Self {
         Self {
             status: StatusCode::NOT_FOUND,

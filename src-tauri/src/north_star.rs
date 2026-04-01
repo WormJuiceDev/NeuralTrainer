@@ -8,7 +8,7 @@ use crate::{
   error::AppError,
   models::{
     AppSettings, CallTurnResult, LocationEventInput, NorthStarCallReview, NorthStarCallSession, NorthStarCallTurn,
-    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarRtcIceServer, NorthStarRuntimeSnapshot, NorthStarSnapshot,
+    NorthStarDesktopBinding, NorthStarLocationEvent, NorthStarMessage, NorthStarPairingCode, NorthStarRtcIceServer, NorthStarRuntimeSnapshot, NorthStarSnapshot,
     NorthStarTurnProcessingResult, NorthStarWebRtcSignal,
   },
 };
@@ -104,6 +104,15 @@ struct SessionResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct PairingCodeResponse {
+  code: String,
+  user_handle: String,
+  display_name: String,
+  desktop_name: String,
+  expires_at: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct BindDesktopResponse {
   desktop_id: String,
   device_token: String,
@@ -182,6 +191,13 @@ struct DesktopLocationCapability {
 struct CreateSessionRequest {
   user_handle: String,
   display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CreatePairingCodeRequest {
+  user_handle: String,
+  display_name: String,
+  desktop_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -315,6 +331,18 @@ impl From<RawNorthStarCallTurn> for NorthStarCallTurn {
   }
 }
 
+impl From<PairingCodeResponse> for NorthStarPairingCode {
+  fn from(value: PairingCodeResponse) -> Self {
+    Self {
+      code: value.code,
+      user_handle: value.user_handle,
+      display_name: value.display_name,
+      desktop_name: value.desktop_name,
+      expires_at: value.expires_at,
+    }
+  }
+}
+
 impl From<RawNorthStarWebRtcSignal> for NorthStarWebRtcSignal {
   fn from(value: RawNorthStarWebRtcSignal) -> Self {
     Self {
@@ -432,6 +460,22 @@ pub fn bind_desktop(settings: &mut AppSettings) -> Result<NorthStarSnapshot, App
     settings,
     Some(format!("Desktop bound to North Star as {}.", response.status)),
   )
+}
+
+pub fn create_pairing_code(settings: &AppSettings) -> Result<NorthStarPairingCode, AppError> {
+  ensure_session_config(settings)?;
+  let response = client()
+    .post(format!("{}/api/pairing-codes", endpoint(settings)?))
+    .json(&CreatePairingCodeRequest {
+      user_handle: settings.north_star_user_handle.clone(),
+      display_name: settings.north_star_display_name.clone(),
+      desktop_name: desktop_name(),
+    })
+    .send()?
+    .error_for_status()?
+    .json::<PairingCodeResponse>()?;
+
+  Ok(response.into())
 }
 
 pub fn send_heartbeat(settings: &AppSettings) -> Result<NorthStarSnapshot, AppError> {

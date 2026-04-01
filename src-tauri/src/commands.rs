@@ -8,7 +8,7 @@ use crate::{
     AppSettings, CallSession, CallSessionSnapshot, CallTurnRecord, CallTurnResult, CreateNearbyInterestFilterInput, CreatePlaceInput, CreateReflectionInput, CreateRuleInput, DiagnosticStatus,
     CompanionContextCategory, CompanionContextEntry, CompanionContextSnapshot, CompanionHomeSnapshot, CreateCompanionContextCategoryInput, CreateCompanionContextEntryInput, DeleteCompanionContextCategoryInput, ReorderCompanionContextEntriesInput, UpdateCompanionContextCategoryIconInput,
     DecisionRunResult, DecisionSnapshot, DraftedOutreachAutoDispatchResult, DraftedOutreachDispatchResult, EndCallSessionInput, LocationEventInput, ManualReflection,
-    LivedMomentSnapshot, MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NearbyInterestFilter, NorthStarLiveReplyStreamEvent, NorthStarSnapshot, NorthStarTurnProcessingResult, RealWorldPresenceSnapshot, SimulationRunInput, SimulationRunResult, SimulationScenario,
+    LivedMomentSnapshot, MemoryGrowthSnapshot, MemorySystemSnapshot, MvpRealityCheckSnapshot, NearbyInterestFilter, NorthStarLiveReplyStreamEvent, NorthStarPairingCode, NorthStarSnapshot, NorthStarTurnProcessingResult, RealWorldPresenceSnapshot, SimulationRunInput, SimulationRunResult, SimulationScenario,
     NorthStarRuntimeSnapshot, SimulationSuiteResult, PassiveContextSnapshot, PhaseOneSnapshot, NorthStarRtcIceServer, NorthStarWebRtcSignal,
     PhaseThreeSnapshot, Place, PushSpeechStreamAudioInput, SpeechStreamSnapshot, StartSpeechStreamInput, StopSpeechStreamInput, VoiceSnapshot, VoiceSynthesisResult,
     ProtectedRule, RawLocationEvent, RunCallTurnInput, SettingsEntry, StartCallSessionInput, UpdateCompanionContextEntryInput, UpdateMemoryItemInput,
@@ -223,6 +223,16 @@ pub fn bind_north_star_desktop(
   db::save_settings(&state.db_path, &settings)?;
   state.push_event("Bound this desktop to North Star.");
   Ok(snapshot)
+}
+
+#[tauri::command]
+pub fn create_north_star_pairing_code(
+  state: State<'_, AppState>,
+) -> Result<NorthStarPairingCode, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let pairing = north_star::create_pairing_code(&settings)?;
+  state.push_event("Created a North Star phone pairing code.");
+  Ok(pairing)
 }
 
 #[tauri::command]

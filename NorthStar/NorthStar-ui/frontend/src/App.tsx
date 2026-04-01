@@ -239,6 +239,7 @@ const DEFAULT_API =
 const SESSION_STORAGE_KEY = "northstar.session";
 const DEVICE_STORAGE_KEY = "northstar.deviceToken";
 const LOCATION_QUEUE_KEY = "northstar.locationQueue";
+const LOCATION_STATE_KEY = "northstar.locationState";
 const CALL_REVIEW_QUEUE_KEY = "northstar.pendingCallReviews";
 const AUDIO_SETTINGS_KEY = "northstar.audioSettings";
 const DEBUG_SETTINGS_KEY = "northstar.debugSettings";
@@ -247,9 +248,10 @@ const LIVE_CHANNEL_BUFFER_HIGH_WATER = 96_000;
 const LIVE_CHANNEL_BUFFER_LOW_WATER = 32_000;
 const MOBILE_OUTBOUND_CALL_NOTE = "North Star is calling from your phone.";
 const LIVE_CALL_OPENING_TEXT = "Hi, you wanted to talk?";
-const NORTHSTAR_MOBILE_VERSION = "v64";
+const NORTHSTAR_MOBILE_VERSION = "v69";
 const MIN_SETUP_TONE_MS = 1500;
 const LIVE_TURN_DATA_CHANNEL_MAX_BASE64 = 180_000;
+const NETWORK_STEP_TIMEOUT_MS = 12000;
 
 type AudioSettings = {
   openingGain: number;
@@ -264,6 +266,34 @@ type DebugSettings = {
 type PushDebugState = {
   lastError: string | null;
   lastAttemptAt: string | null;
+};
+
+type SessionIdentityDraft = {
+  apiBase: string;
+  userHandle: string;
+  displayName: string;
+};
+
+type PairingCodeResolution = {
+  code: string;
+  user_handle: string;
+  display_name: string;
+  desktop_name: string;
+  expires_at: string;
+};
+
+type PairingJourneyState = {
+  code: string;
+  desktopName: string;
+  status: "connecting" | "success" | "needs_attention";
+  detail: string;
+};
+
+type PairingSeed = {
+  code: string;
+  userHandle: string;
+  displayName: string;
+  desktopName: string;
 };
 
 const defaultAudioSettings: AudioSettings = {
@@ -788,10 +818,13 @@ function App() {
   const [apiBase, setApiBase] = useState(DEFAULT_API);
   const [displayName, setDisplayName] = useState("Savvy");
   const [userHandle, setUserHandle] = useState("savvy");
+  const [sessionIdentityDraft, setSessionIdentityDraft] = useState<SessionIdentityDraft | null>(null);
+  const [pairingCodeInput, setPairingCodeInput] = useState("");
   const [desktopName, setDesktopName] = useState("neuraltrainer-pc");
   const [sessionToken, setSessionToken] = useState("");
   const [deviceToken, setDeviceToken] = useState("");
   const [state, setState] = useState<DesktopBinding[]>([]);
+  const [desktopStateLoaded, setDesktopStateLoaded] = useState(false);
   const [events, setEvents] = useState<CompanionEvent[]>([]);
   const [messages, setMessages] = useState<CompanionMessage[]>([]);
   const [messageDraft, setMessageDraft] = useState("");
@@ -836,7 +869,11 @@ function App() {
   const [liveReplyAudioSrc, setLiveReplyAudioSrc] = useState<string | null>(null);
   const [audioSettings, setAudioSettings] = useState<AudioSettings>(defaultAudioSettings);
   const [debugSettings, setDebugSettings] = useState<DebugSettings>(defaultDebugSettings);
+  const [desktopConnectionBusy, setDesktopConnectionBusy] = useState(false);
+  const [pairingBusy, setPairingBusy] = useState(false);
   const [message, setMessage] = useState("North Star is ready to keep you and NeuralTrainer in sync.");
+  const [pairingJourney, setPairingJourney] = useState<PairingJourneyState | null>(null);
+  const [rescanModalOpen, setRescanModalOpen] = useState(false);
 
   const locationPulseInFlightRef = useRef(false);
   const callTurnAudioChunksRef = useRef<Float32Array[]>([]);
@@ -1233,6 +1270,11 @@ function App() {
         setSessionToken(parsed.sessionToken);
         setUserHandle(parsed.userHandle);
         setDisplayName(parsed.displayName);
+        setSessionIdentityDraft({
+          apiBase: DEFAULT_API,
+          userHandle: parsed.userHandle,
+          displayName: parsed.displayName,
+        });
       } catch {
         localStorage.removeItem(SESSION_STORAGE_KEY);
       }
@@ -1259,6 +1301,22 @@ function App() {
         setLocationQueue(parsed);
       } catch {
         localStorage.removeItem(LOCATION_QUEUE_KEY);
+      }
+    }
+
+    const storedLocationState = localStorage.getItem(LOCATION_STATE_KEY);
+    if (storedLocationState) {
+      try {
+        const parsed = JSON.parse(storedLocationState) as Partial<LocationCapability>;
+        setLocationState((current) => ({
+          permission_state: parsed.permission_state ?? current.permission_state,
+          location_supported: typeof parsed.location_supported === "boolean" ? parsed.location_supported : current.location_supported,
+          background_supported: typeof parsed.background_supported === "boolean" ? parsed.background_supported : current.background_supported,
+          last_known_accuracy_meters: typeof parsed.last_known_accuracy_meters === "number" ? parsed.last_known_accuracy_meters : current.last_known_accuracy_meters,
+          last_location_at: typeof parsed.last_location_at === "string" || parsed.last_location_at === null ? (parsed.last_location_at ?? current.last_location_at) : current.last_location_at,
+        }));
+      } catch {
+        localStorage.removeItem(LOCATION_STATE_KEY);
       }
     }
 
@@ -1303,6 +1361,10 @@ function App() {
   }, [locationQueue]);
 
   useEffect(() => {
+    localStorage.setItem(LOCATION_STATE_KEY, JSON.stringify(locationState));
+  }, [locationState]);
+
+  useEffect(() => {
     localStorage.setItem(AUDIO_SETTINGS_KEY, JSON.stringify(audioSettings));
   }, [audioSettings]);
 
@@ -1316,6 +1378,54 @@ function App() {
       liveRemoteAudioGainRef.current.gain.value = audioSettings.replyGain;
     }
   }, [audioSettings, liveConversationPhase, liveReplyAudioSrc]);
+
+  useEffect(() => {
+    setLocationState((current) => ({
+      ...current,
+      background_supported: installedStandalone,
+    }));
+  }, [installedStandalone]);
+
+  useEffect(() => {
+    async function hydrateLocationPermission() {
+      if (!("geolocation" in navigator)) {
+        setLocationState({
+          permission_state: "unsupported",
+          location_supported: false,
+          background_supported: false,
+          last_known_accuracy_meters: null,
+          last_location_at: null,
+        });
+        return;
+      }
+
+      let permissionState = "unknown";
+      if ("permissions" in navigator && navigator.permissions.query) {
+        try {
+          const permission = await navigator.permissions.query({
+            name: "geolocation" as PermissionName,
+          });
+          permissionState = permission.state;
+        } catch {
+          permissionState = "unknown";
+        }
+      }
+
+      if (permissionState === "granted") {
+        await checkLocationCapability({ silent: true });
+        return;
+      }
+
+      setLocationState((current) => ({
+        ...current,
+        permission_state: permissionState,
+        location_supported: true,
+        background_supported: installedStandalone,
+      }));
+    }
+
+    void hydrateLocationPermission();
+  }, [installedStandalone]);
 
   useEffect(() => {
     if (!sessionToken) return;
@@ -1403,6 +1513,17 @@ function App() {
     }
 
     const params = new URLSearchParams(window.location.search);
+    const pathMatch = window.location.pathname.match(/\/pair\/([A-Za-z0-9-]+)/i);
+    const pairCode = params.get("pairCode") ?? pathMatch?.[1] ?? null;
+    const pairingSeed = pairCode ? {
+      code: pairCode,
+      userHandle: params.get("userHandle") ?? "",
+      displayName: params.get("displayName") ?? "",
+      desktopName: params.get("desktopName") ?? "",
+    } : null;
+    if (pairCode) {
+      void applyPairingCode(pairCode, { autoConnect: true, pairingSeed });
+    }
     applyDeepLink(params.get("navType"), params.get("navId"));
 
     function onServiceWorkerMessage(event: MessageEvent) {
@@ -1471,10 +1592,189 @@ function App() {
   }, []);
 
   async function authedFetch(path: string, init?: RequestInit) {
+    return authedFetchWithSession(sessionToken, path, init, apiBase);
+  }
+
+  async function authedFetchWithSession(activeSessionToken: string, path: string, init?: RequestInit, activeApiBase = apiBase) {
     const headers = new Headers(init?.headers || {});
     headers.set("Content-Type", headers.get("Content-Type") || "application/json");
-    headers.set("x-northstar-session", sessionToken);
-    return fetch(`${apiBase}${path}`, { ...init, headers });
+    headers.set("x-northstar-session", activeSessionToken);
+    return fetchWithTimeout(`${activeApiBase}${path}`, { ...init, headers });
+  }
+
+  async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit, timeoutMs = NETWORK_STEP_TIMEOUT_MS) {
+    const controller = new AbortController();
+    const timer = window.setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const mergedSignal = init?.signal;
+      if (mergedSignal) {
+        mergedSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      }
+      return await fetch(input, {
+        ...init,
+        signal: controller.signal,
+      });
+    } finally {
+      window.clearTimeout(timer);
+    }
+  }
+
+  function normalizePairingCode(raw: string) {
+    return raw.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+  }
+
+  async function resolvePairingCode(rawCode: string) {
+    const normalized = normalizePairingCode(rawCode);
+    if (!normalized) {
+      setMessage("Enter a pairing code first.");
+      return null;
+    }
+    const response = await fetchWithTimeout(`${apiBase}/api/pairing-codes/${encodeURIComponent(normalized)}`);
+    const payload = (await response.json().catch(() => ({ error: "Pairing code lookup failed." }))) as PairingCodeResolution & { error?: string };
+    if (!response.ok) {
+      setMessage(payload.error || "Pairing code lookup failed.");
+      return null;
+    }
+    if (
+      typeof payload.code !== "string"
+      || typeof payload.user_handle !== "string"
+      || typeof payload.display_name !== "string"
+      || typeof payload.desktop_name !== "string"
+    ) {
+      setMessage("North Star pairing details were incomplete. Please redeploy North Star and try the QR code again.");
+      return null;
+    }
+    return payload;
+  }
+
+  async function applyPairingCode(rawCode: string, options?: { autoConnect?: boolean; pairingSeed?: PairingSeed | null }) {
+    setPairingBusy(true);
+    setView("settings");
+    setSettingsSection("desktop");
+    const normalizedCode = normalizePairingCode(rawCode);
+    setPairingJourney({
+      code: normalizedCode,
+      desktopName: "your desktop",
+      status: "connecting",
+      detail: "Connecting this phone to NeuralTrainer...",
+    });
+    setMessage("Connecting this phone to NeuralTrainer...");
+    try {
+      const seededPairing = options?.pairingSeed
+        && options.pairingSeed.code.trim().toUpperCase() === normalizedCode
+        && options.pairingSeed.userHandle.trim()
+        && options.pairingSeed.displayName.trim()
+        && options.pairingSeed.desktopName.trim()
+          ? {
+            code: normalizedCode,
+            user_handle: options.pairingSeed.userHandle.trim(),
+            display_name: options.pairingSeed.displayName.trim(),
+            desktop_name: options.pairingSeed.desktopName.trim(),
+            expires_at: "",
+          }
+          : null;
+      const pairing = seededPairing ?? await resolvePairingCode(normalizedCode);
+      if (!pairing) {
+        setPairingJourney({
+          code: normalizedCode,
+          desktopName: "your desktop",
+          status: "needs_attention",
+          detail: "The pairing code could not be used. Try scanning the desktop QR code again.",
+        });
+        return;
+      }
+
+      const nextHandle = pairing.user_handle.trim();
+      const nextDisplayName = pairing.display_name.trim();
+      const nextDesktopName = pairing.desktop_name.trim();
+      setPairingJourney({
+        code: pairing.code,
+        desktopName: nextDesktopName,
+        status: "connecting",
+        detail: `Connecting this phone to ${nextDesktopName}...`,
+      });
+      const sessionConflicts =
+        sessionToken
+        && (
+          nextHandle.toLowerCase() !== userHandle.trim().toLowerCase()
+          || apiBase.trim().replace(/\/+$/, "") !== window.location.origin.replace(/\/+$/, "")
+        );
+      if (sessionConflicts) {
+        const detail = `This phone is already connected as @${userHandle}. Start over first to switch to @${nextHandle}.`;
+        setMessage(detail);
+        setPairingJourney({
+          code: pairing.code,
+          desktopName: nextDesktopName,
+          status: "needs_attention",
+          detail,
+        });
+        setView("settings");
+        setSettingsSection("account");
+        return;
+      }
+
+      setApiBase(window.location.origin);
+      setUserHandle(nextHandle);
+      setDisplayName(nextDisplayName);
+      setDesktopName(nextDesktopName);
+      setPairingCodeInput(pairing.code);
+      setSessionIdentityDraft({
+        apiBase: window.location.origin,
+        userHandle: nextHandle,
+        displayName: nextDisplayName,
+      });
+
+      if (options?.autoConnect ?? true) {
+        setMessage(`Connecting this phone to ${nextDesktopName}...`);
+        const connected = await ensureDesktopConnection({
+          apiBase: window.location.origin,
+          userHandle: nextHandle,
+          displayName: nextDisplayName,
+          desktopName: nextDesktopName,
+        });
+        if (connected) {
+          const detail = `${nextDesktopName} is connected. Calls, messages, and location pulses can use this shared link now.`;
+          setMessage(`Connected to ${nextDesktopName}.`);
+          setPairingJourney({
+            code: pairing.code,
+            desktopName: nextDesktopName,
+            status: "success",
+            detail,
+          });
+        } else {
+          setPairingJourney({
+            code: pairing.code,
+            desktopName: nextDesktopName,
+            status: "needs_attention",
+            detail: `North Star found ${nextDesktopName}, but the repair did not finish. Tap ${desktopNeedsRepair ? "Repair connection" : "Connect this phone"} below.`,
+          });
+        }
+      } else {
+        const detail = `Pairing details loaded for ${nextDesktopName}. Tap Connect this phone to finish.`;
+        setMessage(detail);
+        setPairingJourney({
+          code: pairing.code,
+          desktopName: nextDesktopName,
+          status: "needs_attention",
+          detail,
+        });
+      }
+    } catch (error) {
+      const detail = error instanceof Error && error.name === "AbortError"
+        ? "North Star took too long to finish the repair. Please try the QR code again."
+        : error instanceof Error && error.message
+          ? error.message
+          : "North Star could not finish connecting to the desktop.";
+      setMessage(detail);
+      setPairingJourney({
+        code: normalizedCode,
+        desktopName: "your desktop",
+        status: "needs_attention",
+        detail,
+      });
+    } finally {
+      setPairingBusy(false);
+    }
   }
 
   function waitForIceGathering(peer: RTCPeerConnection) {
@@ -2343,6 +2643,7 @@ function App() {
     }
     const payload = (await response.json()) as { desktops: DesktopBinding[] };
     setState(sortDesktopBindings(payload.desktops));
+    setDesktopStateLoaded(true);
   }
 
   async function refreshMessages() {
@@ -2415,13 +2716,16 @@ function App() {
     setPushStatus(payload);
   }
 
-  async function createSession() {
-    const response = await fetch(`${apiBase}/api/auth/dev-session`, {
+  async function createSessionRecord(options?: { apiBase?: string; userHandle?: string; displayName?: string }) {
+    const nextApiBase = options?.apiBase ?? apiBase;
+    const nextUserHandle = options?.userHandle ?? userHandle;
+    const nextDisplayName = options?.displayName ?? displayName;
+    const response = await fetchWithTimeout(`${nextApiBase}/api/auth/dev-session`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        user_handle: userHandle,
-        display_name: displayName,
+        user_handle: nextUserHandle,
+        display_name: nextDisplayName,
       }),
     });
     const payload = (await response.json()) as {
@@ -2432,7 +2736,7 @@ function App() {
     };
     if (!response.ok || !payload.session_token || !payload.user_handle || !payload.display_name) {
       setMessage(payload.error || "Session creation failed.");
-      return;
+      return null;
     }
 
     const storedSession: StoredSession = {
@@ -2444,31 +2748,54 @@ function App() {
     setSessionToken(payload.session_token);
     setUserHandle(payload.user_handle);
     setDisplayName(payload.display_name);
+    setSessionIdentityDraft({
+      apiBase: nextApiBase,
+      userHandle: payload.user_handle,
+      displayName: payload.display_name,
+    });
+    return storedSession;
+  }
+
+  async function createSession() {
+    const storedSession = await createSessionRecord();
+    if (!storedSession) {
+      return;
+    }
     setMessage("This phone is now signed in to North Star.");
   }
 
-  async function bindDesktop() {
-    if (!sessionToken) {
+  async function bindDesktopToken(activeSessionToken: string, options?: { apiBase?: string; desktopName?: string }) {
+    const nextApiBase = options?.apiBase ?? apiBase;
+    const nextDesktopName = options?.desktopName ?? desktopName;
+    if (!activeSessionToken) {
       setMessage("Create a companion session first.");
-      return;
+      return null;
     }
 
-    const response = await authedFetch("/api/companion/bind-desktop", {
+    const response = await authedFetchWithSession(activeSessionToken, "/api/companion/bind-desktop", {
       method: "POST",
-      body: JSON.stringify({ desktop_name: desktopName }),
-    });
+      body: JSON.stringify({ desktop_name: nextDesktopName }),
+    }, nextApiBase);
     const payload = (await response.json()) as { device_token?: string; error?: string };
     if (!response.ok || !payload.device_token) {
       setMessage(payload.error || "Desktop binding failed.");
-      return;
+      return null;
     }
     localStorage.setItem(DEVICE_STORAGE_KEY, payload.device_token);
     setDeviceToken(payload.device_token);
+    return payload.device_token;
+  }
+
+  async function bindDesktop() {
+    const nextDeviceToken = await bindDesktopToken(sessionToken);
+    if (!nextDeviceToken) {
+      return;
+    }
     setMessage("This phone is now linked to your desktop.");
     await refreshState();
   }
 
-  async function checkLocationCapability() {
+  async function checkLocationCapability(options?: { silent?: boolean }) {
     if (!("geolocation" in navigator)) {
       setLocationState({
         permission_state: "unsupported",
@@ -2477,8 +2804,10 @@ function App() {
         last_known_accuracy_meters: null,
         last_location_at: null,
       });
-      setMessage("This device/browser does not expose geolocation.");
-      return;
+        if (!options?.silent) {
+          setMessage("This device/browser does not expose geolocation.");
+        }
+        return;
     }
 
     let permissionState = "unknown";
@@ -2502,7 +2831,9 @@ function App() {
           last_known_accuracy_meters: position.coords.accuracy,
           last_location_at: new Date().toISOString(),
         });
-        setMessage("Location is allowed on this phone. NeuralTrainer can now ask for pulses.");
+        if (!options?.silent) {
+          setMessage("Location is allowed on this phone. NeuralTrainer can now ask for pulses.");
+        }
       },
       () => {
         setLocationState({
@@ -2512,23 +2843,26 @@ function App() {
           last_known_accuracy_meters: null,
           last_location_at: null,
         });
-        setMessage("North Star still needs location permission on this phone.");
+        if (!options?.silent) {
+          setMessage("North Star still needs location permission on this phone.");
+        }
       },
       { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 },
     );
   }
 
-  async function sendHeartbeat() {
-    if (!deviceToken) {
+  async function postDesktopHeartbeat(activeDeviceToken: string, options?: { apiBase?: string }) {
+    const nextApiBase = options?.apiBase ?? apiBase;
+    if (!activeDeviceToken) {
       setMessage("Bind a desktop first.");
-      return;
+      return false;
     }
 
-    const response = await fetch(`${apiBase}/api/companion/desktop-heartbeat`, {
+    const response = await fetchWithTimeout(`${nextApiBase}/api/companion/desktop-heartbeat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        device_token: deviceToken,
+        device_token: activeDeviceToken,
         status: "online",
         location_capability: locationState,
       }),
@@ -2537,11 +2871,117 @@ function App() {
     if (!response.ok) {
       const payload = (await response.json().catch(() => ({ error: "Heartbeat failed." }))) as { error?: string };
       setMessage(payload.error || "Heartbeat failed.");
+      return false;
+    }
+
+    return true;
+  }
+
+  async function sendHeartbeat(options?: { silent?: boolean }) {
+    const success = await postDesktopHeartbeat(deviceToken);
+    if (!success) {
       return;
     }
 
-    setMessage("Desktop heartbeat sent to North Star.");
+    if (!options?.silent) {
+      setMessage("Connection refreshed with NeuralTrainer.");
+    }
     await refreshState();
+  }
+
+  async function refreshStateFor(activeSessionToken: string, activeApiBase: string, activeUserHandle: string) {
+    const response = await authedFetchWithSession(activeSessionToken, `/api/companion/state?user_handle=${encodeURIComponent(activeUserHandle)}`, undefined, activeApiBase);
+    if (!response.ok) {
+      setMessage("North Star state could not be loaded.");
+      return;
+    }
+    const payload = (await response.json()) as { desktops: DesktopBinding[] };
+    setState(sortDesktopBindings(payload.desktops));
+    setDesktopStateLoaded(true);
+  }
+
+  async function ensureDesktopConnection(options?: { silent?: boolean; apiBase?: string; userHandle?: string; displayName?: string; desktopName?: string }) {
+    const nextApiBase = options?.apiBase ?? apiBase;
+    const nextUserHandle = options?.userHandle ?? userHandle;
+    const nextDisplayName = options?.displayName ?? displayName;
+    const nextDesktopName = options?.desktopName ?? desktopName;
+    setDesktopConnectionBusy(true);
+    try {
+      let activeSessionToken = sessionToken;
+      if (!activeSessionToken) {
+        const storedSession = await createSessionRecord({
+          apiBase: nextApiBase,
+          userHandle: nextUserHandle,
+          displayName: nextDisplayName,
+        });
+        if (!storedSession) {
+          return false;
+        }
+        activeSessionToken = storedSession.sessionToken;
+      }
+
+      const knownDeviceBinding = deviceToken && state.some((entry) => entry.device_token === deviceToken) ? deviceToken : "";
+      let activeDeviceToken = knownDeviceBinding;
+      if (!activeDeviceToken) {
+        const boundDeviceToken = await bindDesktopToken(activeSessionToken, {
+          apiBase: nextApiBase,
+          desktopName: nextDesktopName,
+        });
+        if (!boundDeviceToken) {
+          return false;
+        }
+        activeDeviceToken = boundDeviceToken;
+      }
+
+      const heartbeatOk = await postDesktopHeartbeat(activeDeviceToken, { apiBase: nextApiBase });
+      if (!heartbeatOk) {
+        return false;
+      }
+
+      await refreshStateFor(activeSessionToken, nextApiBase, nextUserHandle);
+      if (!options?.silent) {
+        setMessage(knownDeviceBinding ? "Phone connection refreshed." : "This phone is connected to NeuralTrainer.");
+      }
+      return true;
+    } finally {
+      setDesktopConnectionBusy(false);
+    }
+  }
+
+  function clearPhoneConnection(options?: { keepDraftIdentity?: boolean }) {
+    localStorage.removeItem(SESSION_STORAGE_KEY);
+    localStorage.removeItem(DEVICE_STORAGE_KEY);
+    setSessionToken("");
+    setDeviceToken("");
+    setState([]);
+    setDesktopStateLoaded(false);
+    setEvents([]);
+    setMessages([]);
+    setLocationEvents([]);
+    setLocationPulseRequests([]);
+    setCallSessions([]);
+    setCallReviews([]);
+    setCallTurns([]);
+    setSelectedCallId("");
+    setPostCallReviewCallId("");
+    setPushStatus(null);
+    setSessionIdentityDraft(null);
+    setPairingJourney(null);
+    if (!options?.keepDraftIdentity) {
+      setUserHandle("savvy");
+      setDisplayName("Savvy");
+      setApiBase(DEFAULT_API);
+    }
+  }
+
+  function startOverWithAnotherHandle() {
+    if (!window.confirm("Clear this phone's current North Star identity and desktop link so you can reconnect with another handle?")) {
+      return;
+    }
+    clearPhoneConnection({ keepDraftIdentity: true });
+    setMessage("This phone is ready to connect with a different handle.");
+    setView("settings");
+    setSettingsSection("account");
   }
 
   async function sendMessage() {
@@ -3331,13 +3771,32 @@ function App() {
   const pushReady = Boolean(pushStatus?.push_supported && (pushStatus?.registered_subscriptions ?? 0) > 0);
   const installReady = Boolean(installPromptEvent);
   const sessionReady = Boolean(sessionToken);
-  const desktopReady = Boolean(deviceToken);
+  const linkedDesktop = state.find((entry) => entry.device_token === deviceToken) ?? null;
+  const desktopNeedsRepair = Boolean(deviceToken) && !linkedDesktop;
+  const desktopReady = Boolean(linkedDesktop);
   const connectionSummary = sessionReady && desktopReady
     ? `Connected to ${mostRecentDesktop?.desktop_name || "your desktop"}`
-    : "Finish linking this phone to your desktop companion";
+    : desktopNeedsRepair
+      ? "This phone needs a fresh repair link to NeuralTrainer"
+      : "Finish linking this phone to your desktop companion";
   const desktopLocationState = mostRecentDesktop?.location_capability ?? locationState;
   const locationHeadline = locationSummary(desktopLocationState, locationPulseRequests.length);
   const notificationsHeadline = pushSummary(pushStatus, pushCapability);
+  const desktopConnectionActionLabel = !sessionReady
+    ? "Connect this phone"
+    : desktopNeedsRepair
+      ? "Repair connection"
+      : desktopReady
+        ? "Refresh connection"
+        : "Connect this phone";
+  const desktopConnectionHelper = !sessionReady
+    ? "This will sign in, link to NeuralTrainer, and announce that the phone is ready."
+    : desktopNeedsRepair
+      ? "The saved phone link no longer matches the desktop. Repair will create a fresh shared connection."
+      : desktopReady
+        ? "This phone and desktop already know each other. Refresh keeps the live link healthy."
+        : "Use one button to link this phone to NeuralTrainer and finish the shared connection.";
+  const activeSessionIdentity = sessionIdentityDraft ?? { apiBase, userHandle, displayName };
   const callScreenTitle =
     selectedCall?.status === "pending"
       ? "Incoming call"
@@ -3346,7 +3805,7 @@ function App() {
         : "Call recap";
   const compactStats = [
     { label: "Session", value: sessionReady ? "Ready" : "Missing" },
-    { label: "Desktop", value: desktopReady ? "Linked" : "Pending" },
+    { label: "Desktop", value: desktopReady ? "Linked" : desktopNeedsRepair ? "Repair" : "Pending" },
     { label: "Push", value: pushReady ? "On" : "Setup" },
     { label: "Location", value: locationReady ? "On" : "Needs access" },
   ];
@@ -3371,6 +3830,19 @@ function App() {
       : settingsSection === "menu"
         ? "Companion preferences"
         : currentSettingsMeta?.helper ?? "Companion preferences";
+
+  useEffect(() => {
+    if (!desktopStateLoaded || !sessionReady || !deviceToken || !desktopNeedsRepair || pairingBusy || desktopConnectionBusy) {
+      return;
+    }
+    localStorage.removeItem(DEVICE_STORAGE_KEY);
+    setDeviceToken("");
+    setView("chats");
+    setMenuOpen(false);
+    setPairingJourney(null);
+    setRescanModalOpen(true);
+    setMessage("This phone needs to be paired again from NeuralTrainer.");
+  }, [desktopStateLoaded, sessionReady, deviceToken, desktopNeedsRepair, pairingBusy, desktopConnectionBusy]);
 
   function openSettings(target: SettingsSection) {
     setSettingsSection(target);
@@ -3703,6 +4175,27 @@ function App() {
   }, [sessionToken, pendingCallReviews]);
 
   useEffect(() => {
+    if (!sessionToken || !deviceToken || !state.some((entry) => entry.device_token === deviceToken)) {
+      return;
+    }
+    const refreshConnection = () => {
+      if (document.visibilityState !== "visible") {
+        return;
+      }
+      void sendHeartbeat({ silent: true });
+    };
+    refreshConnection();
+    const timer = window.setInterval(refreshConnection, 20000);
+    window.addEventListener("focus", refreshConnection);
+    document.addEventListener("visibilitychange", refreshConnection);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("focus", refreshConnection);
+      document.removeEventListener("visibilitychange", refreshConnection);
+    };
+  }, [sessionToken, deviceToken, state, locationState]);
+
+  useEffect(() => {
     return () => {
       stopRemoteTurnRecording();
       teardownLivePeerConnection();
@@ -3884,40 +4377,54 @@ function App() {
   } else if (settingsSection === "account") {
     settingsContent = (
       <section className="settings-page">
-        <label className="field">
-          <span>API base</span>
-          <input value={apiBase} onChange={(event) => setApiBase(event.target.value)} />
-        </label>
-        <label className="field">
-          <span>Display name</span>
-          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} />
-        </label>
-        <label className="field">
-          <span>User handle</span>
-          <input value={userHandle} onChange={(event) => setUserHandle(event.target.value)} />
-        </label>
-        <div className="composer-actions">
-          <button onClick={createSession}>Create session</button>
-          <button className="secondary" onClick={refreshAll}>Refresh</button>
+        <div className="settings-facts settings-facts--single">
+          <div>
+            <dt>Signed in as</dt>
+            <dd>@{activeSessionIdentity.userHandle || "unknown"}</dd>
+          </div>
+          <div>
+            <dt>Name</dt>
+            <dd>{activeSessionIdentity.displayName || "North Star"}</dd>
+          </div>
+          <div>
+            <dt>Server</dt>
+            <dd>{activeSessionIdentity.apiBase}</dd>
+          </div>
         </div>
+        <p className="helper-copy">NeuralTrainer owns phone pairing now. If this phone ever loses its desktop link, just rescan the QR code from NeuralTrainer.</p>
       </section>
     );
   } else if (settingsSection === "desktop") {
     settingsContent = (
       <section className="settings-page">
-        <p className="helper-copy">Install North Star on this phone so Chrome can treat it like a real companion app and keep wake requests more dependable.</p>
-        <label className="field">
-          <span>Desktop name</span>
-          <input value={desktopName} onChange={(event) => setDesktopName(event.target.value)} />
-        </label>
+        {pairingJourney ? (
+          <article className={`pairing-status-card pairing-status-card--${pairingJourney.status}`}>
+            <p className="eyebrow">
+              {pairingJourney.status === "connecting"
+                ? "Connecting"
+                : pairingJourney.status === "success"
+                  ? "Connected"
+                  : "Needs attention"}
+            </p>
+            <h3>
+              {pairingJourney.status === "success"
+                ? `${pairingJourney.desktopName} is ready`
+                : pairingJourney.status === "connecting"
+                  ? `Connecting to ${pairingJourney.desktopName}`
+                  : `Finish connecting to ${pairingJourney.desktopName}`}
+            </h3>
+            <p>{pairingJourney.detail}</p>
+          </article>
+        ) : null}
+        <p className="helper-copy">NeuralTrainer now handles pairing from its QR code. This page just shows whether the shared link is healthy on this phone.</p>
         <div className="settings-facts settings-facts--single">
           <div>
             <dt>Status</dt>
-            <dd>{mostRecentDesktop ? formatStatus(mostRecentDesktop.status) : "Not linked"}</dd>
+            <dd>{desktopNeedsRepair ? "Needs repair" : mostRecentDesktop ? formatStatus(mostRecentDesktop.status) : "Not linked"}</dd>
           </div>
           <div>
-            <dt>Last heartbeat</dt>
-            <dd>{formatDateTime(mostRecentDesktop?.last_heartbeat_at ?? null)}</dd>
+            <dt>Connection</dt>
+            <dd>{desktopReady ? "Ready" : desktopNeedsRepair ? "Repair the saved link" : sessionReady ? "Waiting for desktop link" : "Session not created"}</dd>
           </div>
           <div>
             <dt>Install</dt>
@@ -3925,8 +4432,6 @@ function App() {
           </div>
         </div>
         <div className="composer-actions">
-          <button onClick={bindDesktop}>Link desktop</button>
-          <button className="secondary" onClick={sendHeartbeat}>Heartbeat</button>
           <button className="secondary" onClick={promptInstall} disabled={!installPromptEvent && !installedStandalone}>
             {installedStandalone ? "Installed" : "Install app"}
           </button>
@@ -4048,11 +4553,7 @@ function App() {
           </div>
         </div>
         <div className="composer-actions">
-          <button onClick={checkLocationCapability}>Allow location</button>
-          <button className="secondary" onClick={uploadLocationNow}>Send test pulse</button>
-          <button className="secondary" onClick={() => void fulfillPendingLocationPulses({ silent: false, openedFromWake: false })} disabled={locationPulseRequests.length === 0}>
-            Answer waiting pulse
-          </button>
+          <button onClick={() => void checkLocationCapability()}>Allow location</button>
         </div>
       </section>
     );
@@ -4270,6 +4771,20 @@ function App() {
     </section>
   ) : null;
 
+  const rescanModal = rescanModalOpen ? (
+    <section className="rescan-modal" role="dialog" aria-modal="true" aria-labelledby="rescan-modal-title">
+      <div className="rescan-modal-backdrop" />
+      <div className="rescan-modal-panel">
+        <p className="eyebrow">Desktop link lost</p>
+        <h2 id="rescan-modal-title">Scan the NeuralTrainer QR code again</h2>
+        <p>Your phone is no longer linked to NeuralTrainer. Open NeuralTrainer, go to Connections, choose Pair phone, and scan the new QR code.</p>
+        <div className="composer-actions">
+          <button onClick={() => setRescanModalOpen(false)}>Okay</button>
+        </div>
+      </div>
+    </section>
+  ) : null;
+
   return (
     <main className="northstar-app">
       <div className="app-frame">
@@ -4298,7 +4813,7 @@ function App() {
                   onClick={() => void startCallFromPhone()}
                   aria-label="Call NeuralTrainer"
                   disabled={!desktopReady || activeCallCount > 0}
-                  title={!desktopReady ? "Link your desktop first" : activeCallCount > 0 ? "A call is already active" : "Call NeuralTrainer"}
+                  title={!desktopReady ? (desktopNeedsRepair ? "Repair the desktop connection first" : "Link your desktop first") : activeCallCount > 0 ? "A call is already active" : "Call NeuralTrainer"}
                 >
                   <PhoneIcon kind="accept" />
                 </button>
@@ -4341,6 +4856,7 @@ function App() {
           {view === "settings" ? settingsView : null}
         </section>
         {liveCallScreen}
+        {rescanModal}
       </div>
     </main>
   );

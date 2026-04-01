@@ -103,6 +103,11 @@ button {
   gap: 0.75rem;
 }
 
+.composer-actions {
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
 .topbar-leading {
   min-width: 0;
   flex: 1;
@@ -496,6 +501,7 @@ button {
   background: #00a884;
   color: #081318;
   font-weight: 800;
+  max-width: 100%;
 }
 
 .send-button:disabled {
@@ -508,6 +514,38 @@ button {
   z-index: 20;
   display: grid;
   place-items: stretch;
+}
+
+.rescan-modal {
+  position: absolute;
+  inset: 0;
+  z-index: 24;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+}
+
+.rescan-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(5, 10, 14, 0.72);
+}
+
+.rescan-modal-panel {
+  position: relative;
+  display: grid;
+  gap: 0.8rem;
+  width: min(100%, 26rem);
+  padding: 1.15rem;
+  border-radius: 1rem;
+  border: 1px solid rgba(124, 242, 213, 0.18);
+  background: linear-gradient(180deg, #152228, #0f171c);
+  box-shadow: var(--shadow);
+}
+
+.rescan-modal-panel h2,
+.rescan-modal-panel p {
+  margin: 0;
 }
 
 .call-overlay-backdrop {
@@ -649,6 +687,12 @@ button {
 .app-panel--settings {
   background: #0b141a;
   padding: 0.85rem;
+}
+
+.app-panel--settings {
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
 }
 
 .app-panel--settings-scroll {
@@ -856,6 +900,15 @@ button {
   padding: 1rem;
 }
 
+.settings-menu,
+.settings-page,
+.settings-summary-card,
+.diagnostic-block,
+.settings-facts,
+.settings-summary-grid {
+  min-width: 0;
+}
+
 .settings-summary-grid,
 .settings-facts {
   display: grid;
@@ -889,8 +942,51 @@ button {
   align-content: start;
 }
 
+.field {
+  display: grid;
+  gap: 0.45rem;
+  min-width: 0;
+}
+
 .settings-facts--single {
   grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.settings-facts dd,
+.helper-copy,
+.settings-summary-card p,
+.settings-nav-item span,
+.pairing-status-card p,
+.pairing-status-card h3 {
+  overflow-wrap: anywhere;
+}
+
+.pairing-status-card {
+  display: grid;
+  gap: 0.55rem;
+  padding: 1rem;
+  border-radius: 1rem;
+  border: 1px solid var(--line);
+}
+
+.pairing-status-card h3,
+.pairing-status-card p {
+  margin: 0;
+}
+
+.pairing-status-card--connecting {
+  background: linear-gradient(180deg, rgba(0, 168, 132, 0.16), rgba(17, 27, 33, 0.96));
+  border-color: rgba(0, 168, 132, 0.36);
+}
+
+.pairing-status-card--success {
+  background: linear-gradient(180deg, rgba(0, 168, 132, 0.24), rgba(17, 27, 33, 0.98));
+  border-color: rgba(124, 242, 213, 0.4);
+}
+
+.pairing-status-card--needs_attention {
+  background: linear-gradient(180deg, rgba(255, 214, 10, 0.16), rgba(17, 27, 33, 0.98));
+  border-color: rgba(255, 214, 10, 0.28);
 }
 
 .diagnostic-block h4,

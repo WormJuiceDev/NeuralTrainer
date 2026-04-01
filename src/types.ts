@@ -47,6 +47,14 @@ export type NorthStarDesktopBinding = {
   status: string;
 };
 
+export type NorthStarPairingCode = {
+  code: string;
+  userHandle: string;
+  displayName: string;
+  desktopName: string;
+  expiresAt: string;
+};
+
 export type NorthStarMessage = {
   messageId: string;
   userHandle: string;
