@@ -124,6 +124,29 @@ struct WikipediaGeoSearchItem {
   dist: Option<f64>,
 }
 
+#[derive(Debug, Deserialize, serde::Serialize, Clone, Default)]
+struct NominatimReverseResponse {
+  display_name: Option<String>,
+  name: Option<String>,
+  address: Option<NominatimAddress>,
+}
+
+#[derive(Debug, Deserialize, serde::Serialize, Clone, Default)]
+struct NominatimAddress {
+  road: Option<String>,
+  neighbourhood: Option<String>,
+  suburb: Option<String>,
+  quarter: Option<String>,
+  city_district: Option<String>,
+  village: Option<String>,
+  town: Option<String>,
+  city: Option<String>,
+  municipality: Option<String>,
+  county: Option<String>,
+  state: Option<String>,
+  country: Option<String>,
+}
+
 pub fn init_storage() -> Result<(PathBuf, PathBuf, String), AppError> {
   let base_dir = dirs::data_local_dir().ok_or(AppError::MissingAppDataDir)?;
   let app_dir = base_dir.join("NeuralTrainer");
@@ -220,8 +243,17 @@ pub fn load_settings(db_path: &PathBuf) -> Result<AppSettings, AppError> {
       "call_outbound_explanation_prompt" => {
         settings.call_outbound_explanation_prompt = serde_json::from_str(&value_json)?
       }
+      "call_inbound_opener_prompt" => {
+        settings.call_inbound_opener_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_inbound_opener_fallback" => {
+        settings.call_inbound_opener_fallback = serde_json::from_str(&value_json)?
+      }
       "call_opener_prompt" => {
         settings.call_opener_prompt = serde_json::from_str(&value_json)?
+      }
+      "call_outbound_opener_fallback" => {
+        settings.call_outbound_opener_fallback = serde_json::from_str(&value_json)?
       }
       "north_star_endpoint" => settings.north_star_endpoint = serde_json::from_str(&value_json)?,
       "north_star_user_handle" => settings.north_star_user_handle = serde_json::from_str(&value_json)?,
@@ -356,8 +388,20 @@ pub fn save_settings(
       serde_json::to_string(&payload.call_outbound_explanation_prompt)?,
     ),
     (
+      "call_inbound_opener_prompt",
+      serde_json::to_string(&payload.call_inbound_opener_prompt)?,
+    ),
+    (
+      "call_inbound_opener_fallback",
+      serde_json::to_string(&payload.call_inbound_opener_fallback)?,
+    ),
+    (
       "call_opener_prompt",
       serde_json::to_string(&payload.call_opener_prompt)?,
+    ),
+    (
+      "call_outbound_opener_fallback",
+      serde_json::to_string(&payload.call_outbound_opener_fallback)?,
     ),
     (
       "north_star_endpoint",
@@ -660,6 +704,128 @@ fn fetch_wikipedia_geosearch(
   Ok(response.json()?)
 }
 
+fn fetch_nominatim_reverse_geocode(
+  latitude: f64,
+  longitude: f64,
+) -> Result<NominatimReverseResponse, AppError> {
+  let client = reqwest::blocking::Client::new();
+  let response = client
+    .get("https://nominatim.openstreetmap.org/reverse")
+    .header(
+      reqwest::header::USER_AGENT,
+      "NeuralTrainer/1.0 (desktop reverse geocode; https://northstar.youworld.app)",
+    )
+    .query(&[
+      ("format", "jsonv2"),
+      ("lat", &latitude.to_string()),
+      ("lon", &longitude.to_string()),
+      ("zoom", "18"),
+      ("addressdetails", "1"),
+    ])
+    .send()?
+    .error_for_status()?;
+  Ok(response.json()?)
+}
+
+fn reverse_geocode_area_label(payload: &NominatimReverseResponse) -> Option<String> {
+  let address = payload.address.as_ref();
+  let immediate = address
+    .and_then(|value| {
+      value
+        .neighbourhood
+        .as_ref()
+        .or(value.suburb.as_ref())
+        .or(value.quarter.as_ref())
+        .or(value.city_district.as_ref())
+        .or(value.road.as_ref())
+    })
+    .cloned()
+    .or_else(|| payload.name.clone());
+  let locality = address
+    .and_then(|value| {
+      value
+        .village
+        .as_ref()
+        .or(value.town.as_ref())
+        .or(value.city.as_ref())
+        .or(value.municipality.as_ref())
+    })
+    .cloned();
+  let region = address.and_then(|value| value.state.clone());
+  let country = address.and_then(|value| value.country.clone());
+
+  match (immediate, locality, region, country) {
+    (Some(immediate), Some(locality), _, Some(country)) if immediate != locality => {
+      Some(format!("{immediate}, {locality}, {country}"))
+    }
+    (Some(immediate), _, Some(region), Some(country)) => Some(format!("{immediate}, {region}, {country}")),
+    (Some(immediate), Some(locality), _, None) if immediate != locality => Some(format!("{immediate}, {locality}")),
+    (Some(immediate), _, _, _) => Some(immediate),
+    (None, Some(locality), Some(region), Some(country)) => Some(format!("{locality}, {region}, {country}")),
+    (None, Some(locality), _, Some(country)) => Some(format!("{locality}, {country}")),
+    (None, Some(locality), _, _) => Some(locality),
+    (None, None, Some(region), Some(country)) => Some(format!("{region}, {country}")),
+    (None, None, _, Some(country)) => Some(country),
+    _ => payload
+      .display_name
+      .as_ref()
+      .map(|value| {
+        value
+          .split(',')
+          .map(|part| part.trim())
+          .filter(|part| !part.is_empty())
+          .take(3)
+          .collect::<Vec<_>>()
+          .join(", ")
+      })
+      .filter(|value| !value.is_empty()),
+  }
+}
+
+fn describe_location_from_reverse_geocode(
+  location: &RawLocationEvent,
+  reverse_geocode: Option<&NominatimReverseResponse>,
+) -> String {
+  let area_label = reverse_geocode.and_then(reverse_geocode_area_label);
+  match area_label {
+    Some(area) => format!(
+      "Grounded from the latest location pulse near {} at {:.4}, {:.4}.",
+      area,
+      location.latitude,
+      location.longitude,
+    ),
+    None => format!(
+      "Grounded from the latest location pulse at {:.4}, {:.4}.",
+      location.latitude,
+      location.longitude,
+    ),
+  }
+}
+
+fn load_or_fetch_reverse_geocode(
+  connection: &Connection,
+  latitude: f64,
+  longitude: f64,
+  allow_network: bool,
+) -> Result<(Option<NominatimReverseResponse>, bool, bool), AppError> {
+  let cache_key = format!("reverse_geocode:{:.4}:{:.4}", latitude, longitude);
+  if allow_network {
+    if let Ok(payload) = fetch_nominatim_reverse_geocode(latitude, longitude) {
+      let payload_json = serde_json::to_string(&payload)?;
+      store_external_signal_cache(connection, &cache_key, "reverse_geocode", &payload_json)?;
+      return Ok((Some(payload), false, false));
+    }
+  }
+
+  if let Some((payload_json, _)) = load_external_signal_cache(connection, &cache_key)? {
+    if let Ok(payload) = serde_json::from_str::<NominatimReverseResponse>(&payload_json) {
+      return Ok((Some(payload), true, false));
+    }
+  }
+
+  Ok((None, false, allow_network))
+}
+
 fn haversine_distance_meters(latitude_a: f64, longitude_a: f64, latitude_b: f64, longitude_b: f64) -> f64 {
   let earth_radius_m = 6_371_000.0;
   let lat_a = latitude_a.to_radians();
@@ -865,6 +1031,8 @@ pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPr
     .and_then(|value| parse_datetime_in_timezone(value, timezone));
   let local_now = Utc::now().with_timezone(&timezone);
   let (daylight_state, minutes_until_transition) = daylight_state_for(local_now, sunrise_at, sunset_at);
+  let (reverse_geocode, reverse_geocode_from_cache, reverse_geocode_unavailable) =
+    load_or_fetch_reverse_geocode(&connection, location.latitude, location.longitude, true)?;
 
   let weather = current.as_ref().map(|block| {
     let summary = weather_code_summary(block.weather_code).to_string();
@@ -950,14 +1118,30 @@ pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPr
     location_available: true,
     latitude: Some(location.latitude),
     longitude: Some(location.longitude),
-    location_summary: format!(
-      "Grounded from the latest location pulse at {:.4}, {:.4}.",
-      location.latitude, location.longitude
-    ),
+    location_summary: describe_location_from_reverse_geocode(&location, reverse_geocode.as_ref()),
     weather,
     daylight,
     warning_summary: "Warning feeds are planned in this phase, but this first slice is only grounding weather and daylight.".into(),
     source_statuses: vec![
+      WorldSignalSourceStatus {
+        source_key: "reverse_geocode".into(),
+        label: "OpenStreetMap reverse geocode".into(),
+        status: if reverse_geocode_unavailable {
+          "unavailable".into()
+        } else if reverse_geocode_from_cache {
+          "cached".into()
+        } else {
+          "live".into()
+        },
+        detail: if reverse_geocode_unavailable {
+          "Named location lookup was unavailable, so the world snapshot fell back to raw coordinates.".into()
+        } else if reverse_geocode_from_cache {
+          "Using cached reverse-geocode naming for the latest location pulse.".into()
+        } else {
+          "Live reverse-geocode naming was loaded for the latest location pulse.".into()
+        },
+        checked_at: Utc::now().to_rfc3339(),
+      },
       WorldSignalSourceStatus {
         source_key: "open_meteo".into(),
         label: "Open-Meteo".into(),
@@ -1011,6 +1195,18 @@ pub fn get_real_world_presence_snapshot(db_path: &PathBuf) -> Result<RealWorldPr
     nearby_candidates,
     summary: "The first world-awareness slice is now grounding weather, daylight, and nearby discovery from the current location pulse.".into(),
   })
+}
+
+pub fn current_location_context_summary(
+  db_path: &PathBuf,
+) -> Result<String, AppError> {
+  let connection = Connection::open(db_path)?;
+  let Some(location) = latest_raw_location_event(&connection)? else {
+    return Ok("latest location summary: no recent phone location pulse is available".into());
+  };
+
+  let (reverse_geocode, _, _) = load_or_fetch_reverse_geocode(&connection, location.latitude, location.longitude, false)?;
+  Ok(describe_location_from_reverse_geocode(&location, reverse_geocode.as_ref()))
 }
 
 pub fn list_nearby_interest_filters(db_path: &PathBuf) -> Result<Vec<NearbyInterestFilter>, AppError> {

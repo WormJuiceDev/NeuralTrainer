@@ -5,11 +5,13 @@
     android:background="#0B141A">
 
     <LinearLayout
+        android:id="@+id/appShell"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
         android:orientation="vertical">
 
         <LinearLayout
+            android:id="@+id/topbar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="#202C33"
@@ -69,10 +71,11 @@
                 android:layout_height="wrap_content"
                 android:layout_marginStart="8dp"
                 android:minWidth="0dp"
-                android:text="@string/connection_short" />
+                android:text="@string/menu_short" />
         </LinearLayout>
 
         <HorizontalScrollView
+            android:id="@+id/tabBar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:background="#111B21"
@@ -93,13 +96,6 @@
                     android:layout_width="wrap_content"
                     android:layout_height="wrap_content"
                     android:text="@string/companion_tab" />
-
-                <Button
-                    android:id="@+id/callsTabButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:layout_marginStart="8dp"
-                    android:text="@string/calls_tab" />
 
                 <Button
                     android:id="@+id/connectionTabButton"
@@ -140,6 +136,7 @@
                 </ScrollView>
 
                 <LinearLayout
+                    android:id="@+id/composerBar"
                     android:layout_width="match_parent"
                     android:layout_height="wrap_content"
                     android:background="#111B21"
@@ -169,73 +166,6 @@
                         android:text="@string/send_short" />
                 </LinearLayout>
             </LinearLayout>
-
-            <ScrollView
-                android:id="@+id/callsSection"
-                android:layout_width="match_parent"
-                android:layout_height="match_parent"
-                android:fillViewport="true"
-                android:padding="12dp"
-                android:visibility="gone">
-
-                <LinearLayout
-                    android:layout_width="match_parent"
-                    android:layout_height="wrap_content"
-                    android:orientation="vertical">
-
-                    <TextView
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:text="@string/calls_heading"
-                        android:textColor="#E9EDEF"
-                        android:textSize="18sp"
-                        android:textStyle="bold" />
-
-                    <TextView
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="6dp"
-                        android:text="@string/calls_copy"
-                        android:textColor="#AEBAC1" />
-
-                    <LinearLayout
-                        android:id="@+id/callCardContainer"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="14dp"
-                        android:orientation="vertical" />
-
-                    <LinearLayout
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="16dp"
-                        android:orientation="horizontal">
-
-                        <Button
-                            android:id="@+id/startCallButton"
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_weight="1"
-                            android:text="@string/call_neuraltrainer" />
-
-                        <Button
-                            android:id="@+id/refreshCallsButton"
-                            android:layout_width="0dp"
-                            android:layout_height="wrap_content"
-                            android:layout_marginStart="8dp"
-                            android:layout_weight="1"
-                            android:text="@string/refresh_calls" />
-                    </LinearLayout>
-
-                    <TextView
-                        android:id="@+id/callTransportNoteText"
-                        android:layout_width="match_parent"
-                        android:layout_height="wrap_content"
-                        android:layout_marginTop="12dp"
-                        android:text="@string/call_transport_note"
-                        android:textColor="#AEBAC1" />
-                </LinearLayout>
-            </ScrollView>
 
             <ScrollView
                 android:id="@+id/connectionSection"
@@ -348,10 +278,11 @@
         android:id="@+id/callOverlay"
         android:layout_width="match_parent"
         android:layout_height="match_parent"
-        android:background="#CC071015"
+        android:background="#CC081318"
         android:visibility="gone">
 
         <LinearLayout
+            android:id="@+id/callOverlayPanel"
             android:layout_width="match_parent"
             android:layout_height="match_parent"
             android:gravity="center_horizontal"
@@ -399,6 +330,57 @@
                 android:text="@string/call_transport_note"
                 android:textColor="#AEBAC1" />
 
+            <TextView
+                android:id="@+id/callOverlayDiagnostics"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="16dp"
+                android:background="#17232A"
+                android:padding="14dp"
+                android:textColor="#AEBAC1"
+                android:textSize="12sp"
+                android:visibility="gone" />
+
+            <LinearLayout
+                android:id="@+id/callVisualizer"
+                android:layout_width="wrap_content"
+                android:layout_height="132dp"
+                android:layout_marginTop="28dp"
+                android:gravity="center"
+                android:orientation="horizontal"
+                android:visibility="gone">
+
+                <View
+                    android:id="@+id/callVisualizerBar1"
+                    android:layout_width="18dp"
+                    android:layout_height="84dp"
+                    android:layout_marginHorizontal="5dp" />
+
+                <View
+                    android:id="@+id/callVisualizerBar2"
+                    android:layout_width="18dp"
+                    android:layout_height="112dp"
+                    android:layout_marginHorizontal="5dp" />
+
+                <View
+                    android:id="@+id/callVisualizerBar3"
+                    android:layout_width="18dp"
+                    android:layout_height="128dp"
+                    android:layout_marginHorizontal="5dp" />
+
+                <View
+                    android:id="@+id/callVisualizerBar4"
+                    android:layout_width="18dp"
+                    android:layout_height="112dp"
+                    android:layout_marginHorizontal="5dp" />
+
+                <View
+                    android:id="@+id/callVisualizerBar5"
+                    android:layout_width="18dp"
+                    android:layout_height="84dp"
+                    android:layout_marginHorizontal="5dp" />
+            </LinearLayout>
+
             <LinearLayout
                 android:id="@+id/callOverlayActions"
                 android:layout_width="match_parent"
@@ -407,25 +389,45 @@
                 android:gravity="center"
                 android:orientation="horizontal">
 
-                <Button
+                <androidx.appcompat.widget.AppCompatImageButton
+                    android:id="@+id/callMicButton"
+                    android:layout_width="72dp"
+                    android:layout_height="72dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/mute_call"
+                    android:padding="18dp"
+                    android:src="@drawable/ic_call_mic"
+                    android:visibility="gone" />
+
+                <androidx.appcompat.widget.AppCompatImageButton
                     android:id="@+id/callDeclineButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
-                    android:text="@string/decline_call" />
+                    android:layout_width="88dp"
+                    android:layout_height="88dp"
+                    android:layout_marginStart="12dp"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/decline_call"
+                    android:padding="24dp"
+                    android:src="@drawable/ic_call_hangup" />
 
-                <Button
+                <androidx.appcompat.widget.AppCompatImageButton
                     android:id="@+id/callAcceptButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
+                    android:layout_width="88dp"
+                    android:layout_height="88dp"
                     android:layout_marginStart="12dp"
-                    android:text="@string/accept_call" />
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/accept_call"
+                    android:padding="24dp"
+                    android:src="@drawable/ic_call_accept" />
 
-                <Button
+                <androidx.appcompat.widget.AppCompatImageButton
                     android:id="@+id/callEndButton"
-                    android:layout_width="wrap_content"
-                    android:layout_height="wrap_content"
+                    android:layout_width="88dp"
+                    android:layout_height="88dp"
                     android:layout_marginStart="12dp"
-                    android:text="@string/end_call"
+                    android:background="@android:color/transparent"
+                    android:contentDescription="@string/end_call"
+                    android:padding="24dp"
+                    android:src="@drawable/ic_call_hangup"
                     android:visibility="gone" />
             </LinearLayout>
         </LinearLayout>

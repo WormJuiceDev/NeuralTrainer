@@ -28,7 +28,10 @@ export type AppSettings = {
   callOutboundStreamedReplyPrompt: string;
   callInboundExplanationPrompt: string;
   callOutboundExplanationPrompt: string;
+  callInboundOpenerPrompt: string;
+  callInboundOpenerFallback: string;
   callOpenerPrompt: string;
+  callOutboundOpenerFallback: string;
   northStarEndpoint: string;
   northStarUserHandle: string;
   northStarDisplayName: string;

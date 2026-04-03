@@ -11,8 +11,8 @@ android {
     applicationId = "app.youworld.northstar"
     minSdk = 29
     targetSdk = 35
-    versionCode = 9
-    versionName = "v1-native-dev9"
+    versionCode = 34
+    versionName = "v1-native-dev39"
 
     testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
   }
@@ -50,4 +50,5 @@ dependencies {
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
   implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.9.0")
   implementation("com.google.android.gms:play-services-location:21.3.0")
+  implementation("com.glia:webrtc-android:m138.7204.1")
 }

@@ -30,4 +30,13 @@ class SettingsStore(context: Context) {
 
   fun pendingQrPairing(): Boolean = prefs.getBoolean("pending_qr_pairing", false)
   fun setPendingQrPairing(value: Boolean) = prefs.edit().putBoolean("pending_qr_pairing", value).apply()
+
+  fun pendingPairingDeviceToken(): String = prefs.getString("pending_pairing_device_token", "") ?: ""
+  fun setPendingPairingDeviceToken(value: String) = prefs.edit().putString("pending_pairing_device_token", value).apply()
+
+  fun showDebug(): Boolean = prefs.getBoolean("show_debug", false)
+  fun setShowDebug(value: Boolean) = prefs.edit().putBoolean("show_debug", value).apply()
+
+  fun micBoostEnabled(): Boolean = prefs.getBoolean("mic_boost_enabled", true)
+  fun setMicBoostEnabled(value: Boolean) = prefs.edit().putBoolean("mic_boost_enabled", value).apply()
 }

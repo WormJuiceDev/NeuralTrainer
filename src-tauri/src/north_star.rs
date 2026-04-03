@@ -755,10 +755,14 @@ pub fn fetch_runtime_snapshot(settings: &AppSettings) -> Result<NorthStarRuntime
 
 pub fn latest_accepted_call(settings: &AppSettings) -> Result<Option<NorthStarCallSession>, AppError> {
   let snapshot = fetch_snapshot(settings, None)?;
+  let preferred_device_token = settings.north_star_device_token.trim();
   Ok(snapshot
     .call_sessions
     .into_iter()
-    .find(|call| call.status == "accepted"))
+    .find(|call| {
+      call.status == "accepted"
+        && (preferred_device_token.is_empty() || call.device_token == preferred_device_token)
+    }))
 }
 
 pub fn end_latest_accepted_call(settings: &AppSettings) -> Result<(), AppError> {

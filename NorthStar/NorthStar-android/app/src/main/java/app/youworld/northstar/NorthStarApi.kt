@@ -62,14 +62,39 @@ class NorthStarApi {
     return parseCallSessionsResponse(response.body)
   }
 
-  fun startCallFromPhone(apiBase: String, sessionToken: String, note: String): CompanionCallSession {
+  fun rtcConfig(apiBase: String, sessionToken: String): List<RtcIceServerConfig> {
+    val response = request("GET", "$apiBase/api/companion/rtc-config", sessionToken, null)
+    if (!response.ok) error("North Star RTC config could not be loaded.")
+    return parseRtcConfigResponse(response.body)
+  }
+
+  fun sendWebRtcSignal(apiBase: String, sessionToken: String, callId: String, signalKind: String, payloadJson: String) {
+    val payload = JSONObject()
+      .put("call_id", callId)
+      .put("signal_kind", signalKind)
+      .put("payload_json", payloadJson)
+    val response = request("POST", "$apiBase/api/companion/webrtc-signals", sessionToken, payload.toString())
+    if (!response.ok) error("North Star live signal send failed.")
+  }
+
+  fun pullWebRtcSignals(apiBase: String, sessionToken: String, callId: String): List<CompanionWebRtcSignal> {
+    val response = request("GET", "$apiBase/api/companion/webrtc-signals?call_id=${callId.urlEncode()}", sessionToken, null)
+    if (!response.ok) error("North Star live signals could not be loaded.")
+    return parseWebRtcSignalsResponse(response.body)
+  }
+
+  fun startCallFromPhone(apiBase: String, sessionToken: String, note: String, deviceToken: String?): CompanionCallSession {
     val payload = JSONObject().put("note", note)
+    if (!deviceToken.isNullOrBlank()) {
+      payload.put("device_token", deviceToken)
+    }
     val response = request("POST", "$apiBase/api/companion/call-sessions/from-mobile", sessionToken, payload.toString())
     val json = JSONObject(response.body)
     if (!response.ok) error(json.optString("error", "North Star could not start the call."))
     return CompanionCallSession(
       callId = json.getString("call_id"),
       desktopName = json.getString("desktop_name"),
+      deviceToken = json.optString("device_token"),
       requestedAt = json.getString("requested_at"),
       respondedAt = json.optString("responded_at").ifBlank { null },
       status = json.getString("status"),

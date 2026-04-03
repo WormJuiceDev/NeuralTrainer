@@ -150,7 +150,7 @@ import type {
 } from "./types";
 
 type TabId = "home" | "context" | "tectonics" | "settings";
-type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "location" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
+type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "calls" | "location" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
 type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
 type ContextSectionId = string;
 type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment" | "world";
@@ -229,6 +229,19 @@ Fallback purpose if needed:
 
 Return only the spoken opener.`;
 
+const defaultCallInboundOpenerPrompt = `You are answering a live phone call that the user just placed to you from North Star. Write only the first spoken opener. Speak like someone who was just called and is now picking up naturally. Do not act like you placed an outbound outreach call. Do not narrate systems, workflows, products, apps, or support language. Keep it human, relaxed, concise, and plainly spoken, usually 1 to 2 short sentences.
+
+Call context:
+{session_context}
+
+Fallback purpose if needed:
+{default_fallback}
+
+Return only the spoken opener.`;
+
+const defaultCallInboundOpenerFallback = `Hey you called me, whats up.`;
+const defaultCallOutboundOpenerFallback = `Hey, I wanted to check in with you for a minute.`;
+
 const MAX_INTERPRETED_MEMORIES_UI = 80;
 const MAX_DETECTOR_RECORDS_UI = 80;
 const MAX_TECTONIC_TIMELINE_UI = 48;
@@ -243,6 +256,8 @@ type PromptSettingKey =
   | "callOutboundStreamedReplyPrompt"
   | "callInboundExplanationPrompt"
   | "callOutboundExplanationPrompt"
+  | "callInboundOpenerPrompt"
+  | "callInboundOpenerFallback"
   | "callOpenerPrompt";
 
 const promptFieldMeta: Array<{ key: PromptSettingKey; label: string; description: string; rows: number }> = [
@@ -250,6 +265,7 @@ const promptFieldMeta: Array<{ key: PromptSettingKey; label: string; description
   { key: "callOutboundOutreachPrompt", label: "NeuralTrainer -> North Star: outreach reason reply prompt", description: "Used only when NeuralTrainer called North Star and the user asks why the call was placed or what the companion wanted to talk about.", rows: 8 },
   { key: "callInboundStreamedReplyPrompt", label: "North Star -> NeuralTrainer: streamed live reply prompt", description: "Used when the user called NeuralTrainer and the chunked live reply streaming path is used.", rows: 14 },
   { key: "callOutboundStreamedReplyPrompt", label: "NeuralTrainer -> North Star: streamed live reply prompt", description: "Used when NeuralTrainer initiated the call and the chunked live reply streaming path is used.", rows: 14 },
+  { key: "callInboundOpenerPrompt", label: "North Star -> NeuralTrainer: opener prompt", description: "Used when the user places the call from North Star and NeuralTrainer needs to speak the opening line.", rows: 9 },
   { key: "callOpenerPrompt", label: "NeuralTrainer -> North Star: opener prompt", description: "Used when NeuralTrainer places the call to North Star and needs to speak the opening line.", rows: 9 },
 ];
 
@@ -264,7 +280,10 @@ function withPromptDefaults(settings: AppSettings): AppSettings {
     callOutboundStreamedReplyPrompt: settings.callOutboundStreamedReplyPrompt.trim() ? settings.callOutboundStreamedReplyPrompt : defaultCallOutboundStreamedReplyPrompt,
     callInboundExplanationPrompt: settings.callInboundExplanationPrompt.trim() ? settings.callInboundExplanationPrompt : defaultCallInboundExplanationPrompt,
     callOutboundExplanationPrompt: settings.callOutboundExplanationPrompt.trim() ? settings.callOutboundExplanationPrompt : defaultCallOutboundExplanationPrompt,
+    callInboundOpenerPrompt: settings.callInboundOpenerPrompt.trim() ? settings.callInboundOpenerPrompt : defaultCallInboundOpenerPrompt,
+    callInboundOpenerFallback: settings.callInboundOpenerFallback.trim() ? settings.callInboundOpenerFallback : defaultCallInboundOpenerFallback,
     callOpenerPrompt: settings.callOpenerPrompt.trim() ? settings.callOpenerPrompt : defaultCallOpenerPrompt,
+    callOutboundOpenerFallback: settings.callOutboundOpenerFallback.trim() ? settings.callOutboundOpenerFallback : defaultCallOutboundOpenerFallback,
   };
 }
 
@@ -290,6 +309,11 @@ type NorthStarLiveDiagnostics = {
   dataChannelState: string;
   remoteTrackState: string;
   lastSignal: string;
+  lastMessageType: string;
+  rawMessagesReceived: number;
+  liveSpeechMessagesSeen: number;
+  liveSpeechDrops: number;
+  lastDropReason: string;
   localIceCandidates: number;
   remoteIceCandidates: number;
   localCandidateKinds: string;
@@ -367,6 +391,11 @@ const defaultNorthStarLiveDiagnostics: NorthStarLiveDiagnostics = {
   dataChannelState: "idle",
   remoteTrackState: "waiting",
   lastSignal: "none",
+  lastMessageType: "none",
+  rawMessagesReceived: 0,
+  liveSpeechMessagesSeen: 0,
+  liveSpeechDrops: 0,
+  lastDropReason: "none",
   localIceCandidates: 0,
   remoteIceCandidates: 0,
   localCandidateKinds: "none",
@@ -565,7 +594,7 @@ function getNorthStarConnectionHealth(
   };
 }
 
-function buildNorthStarPairingUrl(endpoint: string, code: string, userHandle: string, displayName: string, desktopName: string) {
+function buildNorthStarPairingUrl(endpoint: string, code: string, userHandle: string, displayName: string, desktopName: string, deviceToken: string) {
   const trimmedEndpoint = endpoint.trim().replace(/\/+$/, "");
   if (!trimmedEndpoint || !code.trim()) {
     return "";
@@ -577,6 +606,9 @@ function buildNorthStarPairingUrl(endpoint: string, code: string, userHandle: st
     displayName: displayName.trim(),
     desktopName: desktopName.trim(),
   });
+  if (deviceToken.trim()) {
+    params.set("deviceToken", deviceToken.trim());
+  }
   return `northstar://pair/${encodeURIComponent(code.trim())}?${params.toString()}`;
 }
 
@@ -606,12 +638,16 @@ function defaultNorthStarOutreachNote() {
   return scenarios[dayIndex];
 }
 
-function hasStableNorthStarLiveMedia(peer: RTCPeerConnection | null, stream: MediaStream | null) {
+function hasStableNorthStarLiveMedia(
+  peer: RTCPeerConnection | null,
+  stream: MediaStream | null,
+  channelReady = false,
+) {
   return Boolean(
     peer
     && peer.connectionState === "connected"
     && peer.iceConnectionState === "connected"
-    && stream,
+    && (stream || channelReady),
   );
 }
 
@@ -703,7 +739,10 @@ const defaultSettings: AppSettings = {
   callOutboundStreamedReplyPrompt: defaultCallOutboundStreamedReplyPrompt,
   callInboundExplanationPrompt: defaultCallInboundExplanationPrompt,
   callOutboundExplanationPrompt: defaultCallOutboundExplanationPrompt,
+  callInboundOpenerPrompt: defaultCallInboundOpenerPrompt,
+  callInboundOpenerFallback: defaultCallInboundOpenerFallback,
   callOpenerPrompt: defaultCallOpenerPrompt,
+  callOutboundOpenerFallback: defaultCallOutboundOpenerFallback,
   northStarEndpoint: "http://127.0.0.1:3100",
   northStarUserHandle: "",
   northStarDisplayName: "",
@@ -2057,6 +2096,7 @@ function App() {
   const northStarRtcIceServersRef = useRef<RTCIceServer[] | null>(null);
   const missingAcceptedNorthStarPollsRef = useRef(0);
   const northStarAcceptedSessionStartCallIdRef = useRef<string | null>(null);
+  const northStarAcceptedSessionPromiseRef = useRef<Promise<void> | null>(null);
   const staleAcceptedHandoffCleanupRef = useRef<number | null>(null);
   const northStarWebRtcPeerRef = useRef<RTCPeerConnection | null>(null);
   const northStarWebRtcChannelRef = useRef<RTCDataChannel | null>(null);
@@ -2065,6 +2105,7 @@ function App() {
   const northStarOutboundDrainScheduledRef = useRef(false);
   const northStarOutboundDrainRunningRef = useRef(false);
   const processedNorthStarSignalIdsRef = useRef<Set<string>>(new Set());
+  const northStarPendingRemoteIceCandidatesRef = useRef<RTCIceCandidateInit[]>([]);
   const northStarLiveTurnChunksRef = useRef<Map<string, string[]>>(new Map());
   const northStarPeerAudioContextRef = useRef<AudioContext | null>(null);
   const northStarPeerAudioDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
@@ -2086,12 +2127,15 @@ function App() {
   const northStarLiveReplyPreviewPendingTextRef = useRef("");
   const northStarLiveReplyPreviewFlushTimerRef = useRef<number | null>(null);
   const northStarLiveDiagnosticsRef = useRef<NorthStarLiveDiagnostics>(defaultNorthStarLiveDiagnostics);
+  const activeNorthStarSessionIdRef = useRef<number | null>(null);
+  const activeNorthStarRemoteCallIdRef = useRef<string | null>(null);
   const northStarLiveDataChannelRecoveryTimerRef = useRef<number | null>(null);
   const northStarActiveSpeechRequestIdRef = useRef<string | null>(null);
   const northStarSpeechQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarReplyTransportQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarPeerReplyPlaybackQueueRef = useRef<Promise<void>>(Promise.resolve());
   const northStarPeerReplyStartedRef = useRef<Set<string>>(new Set());
+  const northStarLiveGenerationRef = useRef(0);
   const northStarSnapshotCacheRef = useRef<NorthStarSnapshot | null>(null);
   const [northStarPairingCode, setNorthStarPairingCode] = useState<NorthStarPairingCode | null>(null);
   const [northStarPairingQrSrc, setNorthStarPairingQrSrc] = useState<string | null>(null);
@@ -2152,8 +2196,11 @@ function App() {
     companionHomeSnapshot?.categories.filter((section) => section.entries.length > 0).length
     ?? 0;
   const latestAcceptedNorthStarCall =
-      northStarRuntimeSnapshot?.callSessions.find((call) => call.status === "accepted")
-      ?? null;
+    northStarRuntimeSnapshot?.callSessions.find((call) => (
+      call.status === "accepted"
+      && (!settings.northStarDeviceToken.trim() || call.deviceToken === settings.northStarDeviceToken.trim())
+    ))
+    ?? null;
   const activeNorthStarSession =
     callSessionSnapshot?.activeSession?.handoffKind === "north_star_companion"
     && callSessionSnapshot.activeSession.sessionState === "active"
@@ -2164,6 +2211,8 @@ function App() {
     activeNorthStarRemoteCallId
       ? northStarRuntimeSnapshot?.callSessions.find((call) => call.callId === activeNorthStarRemoteCallId) ?? null
       : null;
+  activeNorthStarSessionIdRef.current = activeNorthStarSession?.id ?? null;
+  activeNorthStarRemoteCallIdRef.current = activeNorthStarRemoteCallId;
   const pendingAcceptedNorthStarCallId = latestAcceptedNorthStarCall?.callId ?? null;
   const northStarSessionReady = northStarRuntimeSnapshot?.sessionReady ?? false;
   const northStarDesktopBound = northStarRuntimeSnapshot?.desktopBound ?? false;
@@ -2180,7 +2229,8 @@ function App() {
       northStarPairingCode.code,
       settings.northStarUserHandle,
       settings.northStarDisplayName,
-      northStarConnectionsSnapshot?.desktopName || settings.northStarDisplayName || "NeuralTrainer",
+      northStarPairingCode.desktopName || northStarConnectionsSnapshot?.desktopName || "NeuralTrainer",
+      settings.northStarDeviceToken,
     )
     : "";
   const northStarSessionTokenDisplay = northStarConnectionsSnapshot?.sessionTokenMasked || (settings.northStarSessionToken.trim() ? "Saved locally" : "Not created yet");
@@ -2288,8 +2338,9 @@ const northStarAwaitingConversationStart =
   }
 
   function teardownNorthStarWebRtc(options?: { resetProcessedSignals?: boolean; clearPendingOutboundMessages?: boolean }) {
-    const resetProcessedSignals = options?.resetProcessedSignals ?? true;
+    const resetProcessedSignals = options?.resetProcessedSignals ?? false;
     const clearPendingOutboundMessages = options?.clearPendingOutboundMessages ?? true;
+    northStarLiveGenerationRef.current += 1;
     northStarWebRtcChannelRef.current?.close();
     northStarWebRtcPeerRef.current?.close();
     northStarPeerAudioContextRef.current?.close().catch(() => undefined);
@@ -2312,10 +2363,19 @@ const northStarAwaitingConversationStart =
     }
     northStarOutboundDrainScheduledRef.current = false;
     northStarOutboundDrainRunningRef.current = false;
+    northStarSpeechQueueRef.current = Promise.resolve();
+    northStarReplyTransportQueueRef.current = Promise.resolve();
+    northStarPeerReplyPlaybackQueueRef.current = Promise.resolve();
     northStarLiveTurnChunksRef.current = new Map();
     northStarLiveStreamSeenChunksRef.current = new Map();
     northStarLiveReplyAudioPartsRef.current = new Map();
     northStarLiveReplyPreviewTextRef.current = new Map();
+    northStarPendingRemoteIceCandidatesRef.current = [];
+    northStarLiveReplyPreviewPendingTextRef.current = "";
+    if (northStarLiveReplyPreviewFlushTimerRef.current !== null) {
+      window.clearTimeout(northStarLiveReplyPreviewFlushTimerRef.current);
+      northStarLiveReplyPreviewFlushTimerRef.current = null;
+    }
     northStarPeerReplyStartedRef.current = new Set();
     flushNorthStarLiveReplyPreviewText("");
     northStarPeerAudioContextRef.current = null;
@@ -2439,6 +2499,12 @@ const northStarAwaitingConversationStart =
             replyText: payload.replyText ?? "",
             replyMode: payload.replyMode ?? "model_stream",
           }));
+          if (northStarPeerReplyStartedRef.current.has(payload.requestId)) {
+            await queueNorthStarReplyTransport(() => sendOrQueueNorthStarChannelJson({
+              type: "live_reply_remote_audio_finished",
+              requestId: payload.requestId,
+            }));
+          }
           northStarPeerReplyStartedRef.current.delete(payload.requestId);
         }).catch(() => undefined);
         updateNorthStarLiveDiagnostics({
@@ -2779,7 +2845,10 @@ const northStarAwaitingConversationStart =
     };
   }
 
-async function playNorthStarReplyOverPeer(base64: string) {
+async function playNorthStarReplyOverPeer(
+  base64: string,
+  options?: { onStart?: () => void },
+) {
   const { context, destination } = ensureNorthStarPeerAudio();
   if (context.state === "suspended") {
     await context.resume();
@@ -2788,8 +2857,10 @@ async function playNorthStarReplyOverPeer(base64: string) {
   const source = context.createBufferSource();
   source.buffer = audioBuffer;
   source.connect(destination);
+  const replyDurationMs = Math.round(audioBuffer.duration * 1000);
+  options?.onStart?.();
   return await new Promise<number>((resolve) => {
-    source.onended = () => resolve(Math.round(audioBuffer.duration * 1000));
+    source.onended = () => resolve(replyDurationMs);
     source.start();
   });
 }
@@ -2877,28 +2948,17 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   async function sendChunkedNorthStarOpening(
-    channel: RTCDataChannel,
     openerId: string,
     result: { text: string; audioBase64: string },
   ) {
     const payloadJson = JSON.stringify(result);
-    if (payloadJson.length <= NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE) {
-      await sendNorthStarChannelJson(channel, {
-        type: "live_opening_audio",
-        openerId,
-        text: result.text,
-        audioBase64: result.audioBase64,
-      });
-      return;
-    }
-
     const total = Math.ceil(payloadJson.length / NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE);
     for (let index = 0; index < total; index += 1) {
       const slice = payloadJson.slice(
         index * NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE,
         (index + 1) * NORTH_STAR_LIVE_CHANNEL_CHUNK_SIZE,
       );
-      await sendNorthStarChannelJson(channel, {
+      await sendOrQueueNorthStarChannelJson({
         type: "live_opening_chunk",
         openerId,
         index,
@@ -2916,6 +2976,16 @@ async function playNorthStarReplyOverPeer(base64: string) {
   async function sendOrQueueNorthStarChannelJson(payload: unknown) {
     northStarPendingOutboundChannelMessagesRef.current.push(payload);
     scheduleNorthStarOutboundDrain();
+  }
+
+  function sendNorthStarChannelJsonImmediate(
+    channel: RTCDataChannel | null | undefined,
+    payload: unknown,
+  ) {
+    if (!channel || channel.readyState !== "open") {
+      return Promise.reject(new Error("North Star data channel is not open."));
+    }
+    return sendNorthStarChannelJson(channel, payload);
   }
 
   function scheduleNorthStarOutboundDrain(channelOverride?: RTCDataChannel | null) {
@@ -3006,13 +3076,25 @@ async function playNorthStarReplyOverPeer(base64: string) {
   }
 
   function queueNorthStarReplyTransport(task: () => Promise<void>) {
-    const next = northStarReplyTransportQueueRef.current.then(task, task);
+    const generation = northStarLiveGenerationRef.current;
+    const guardedTask = () => (
+      generation !== northStarLiveGenerationRef.current
+        ? Promise.resolve()
+        : task()
+    );
+    const next = northStarReplyTransportQueueRef.current.then(guardedTask, guardedTask);
     northStarReplyTransportQueueRef.current = next.catch(() => undefined);
     return next;
   }
 
   function queueNorthStarPeerReplyPlayback(task: () => Promise<void>) {
-    const next = northStarPeerReplyPlaybackQueueRef.current.then(task, task);
+    const generation = northStarLiveGenerationRef.current;
+    const guardedTask = () => (
+      generation !== northStarLiveGenerationRef.current
+        ? Promise.resolve()
+        : task()
+    );
+    const next = northStarPeerReplyPlaybackQueueRef.current.then(guardedTask, guardedTask);
     northStarPeerReplyPlaybackQueueRef.current = next.catch(() => undefined);
     return next;
   }
@@ -3116,6 +3198,12 @@ async function playNorthStarReplyOverPeer(base64: string) {
       if (northStarActiveSpeechRequestIdRef.current !== payload.requestId) {
         return;
       }
+      if (northStarWebRtcChannelRef.current?.readyState === "open") {
+        void sendNorthStarChannelJsonImmediate(northStarWebRtcChannelRef.current, {
+          type: "live_speech_processing_started",
+          requestId: payload.requestId,
+        }).catch(() => undefined);
+      }
       updateNorthStarLiveDiagnostics({
         phase: "desktop_live_speech_processing",
         issue: "",
@@ -3214,19 +3302,25 @@ async function playNorthStarReplyOverPeer(base64: string) {
             | { type: "live_speech_end"; requestId: string }
             | { type: "live_opening_request"; openerId: string; text: string }
             | { type: string };
+          updateNorthStarLiveDiagnostics({
+            lastMessageType: payload.type || "unknown",
+            rawMessagesReceived: northStarLiveDiagnosticsRef.current.rawMessagesReceived + 1,
+            issue: "",
+          });
           if (payload.type === "live_opening_request") {
             const openerId = "openerId" in payload ? payload.openerId : "";
             const text = "text" in payload ? payload.text.trim() : "";
             if (!openerId || !text) {
               return;
             }
-            void ensureNorthStarAcceptedSessionFor(callId, { silent: true });
             updateNorthStarLiveDiagnostics({
               phase: "desktop_opening_requested",
               issue: "",
             });
-            void synthesizeNorthStarOpening(text)
-              .then((result) => {
+            void (async () => {
+              try {
+                await ensureNorthStarAcceptedSessionFor(callId, { silent: true });
+                const result = await synthesizeNorthStarOpening(text);
                 if (event.channel.readyState !== "open") {
                   return;
                 }
@@ -3234,41 +3328,64 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   phase: "desktop_opening_started",
                   issue: "",
                 });
-                void sendChunkedNorthStarOpening(event.channel, openerId, {
-                  text: result.text,
-                  audioBase64: result.audioBase64,
-                }).catch(() => {
-                  if (event.channel.readyState !== "open") {
-                    return;
-                  }
-                  updateNorthStarLiveDiagnostics({
-                    phase: "desktop_opening_failed",
-                    issue: "Desktop could not send the opening line over the live channel.",
+                await queueNorthStarPeerReplyPlayback(async () => {
+                  await queueNorthStarReplyTransport(() => sendOrQueueNorthStarChannelJson({
+                    type: "live_opening_remote_audio_started",
+                    openerId,
+                    text: result.text,
+                  }));
+                  await playNorthStarReplyOverPeer(result.audioBase64, {
+                    onStart: () => undefined,
+                  });
+                  await sendNorthStarChannelJsonImmediate(event.channel, {
+                    type: "live_opening_remote_audio_finished",
+                    openerId,
+                    message: "The line is open. North Star is listening for the next thing you say.",
                   });
                 });
-              })
-              .catch(() => {
+              } catch {
                 if (event.channel.readyState !== "open") {
                   return;
                 }
+                const issue = northStarAcceptedSessionStartCallIdRef.current === null
+                  ? "Desktop could not prepare the accepted North Star session before opening the live call."
+                  : "Desktop could not play the opening line over the live call audio path.";
                 updateNorthStarLiveDiagnostics({
                   phase: "desktop_opening_failed",
-                  issue: "Desktop could not synthesize the opening line.",
+                  issue,
                 });
                 void sendNorthStarChannelJson(event.channel, {
                   type: "live_opening_error",
                   openerId,
                   message: "NeuralTrainer joined the line, but the opening hello did not play.",
                 }).catch(() => undefined);
-              });
+              }
+            })();
             return;
           }
-          const activeSessionId = activeNorthStarSession?.id;
+          const activeSessionId = activeNorthStarSessionIdRef.current;
           if (!activeSessionId) {
+            const speechLikeMessage =
+              payload.type === "live_speech_start"
+              || payload.type === "live_speech_frame"
+              || payload.type === "live_speech_end";
+            if (speechLikeMessage) {
+              updateNorthStarLiveDiagnostics({
+                liveSpeechMessagesSeen: northStarLiveDiagnosticsRef.current.liveSpeechMessagesSeen + 1,
+                liveSpeechDrops: northStarLiveDiagnosticsRef.current.liveSpeechDrops + 1,
+                lastDropReason: "missing_active_session_id",
+                phase: "desktop_live_speech_dropped",
+                issue: "Desktop received live speech before the accepted call session was active.",
+              });
+            }
             return;
           }
           if (payload.type === "live_speech_start") {
             const speechPayload = payload as { type: "live_speech_start"; requestId: string; sampleRate?: number; audioFormat?: string };
+            updateNorthStarLiveDiagnostics({
+              liveSpeechMessagesSeen: northStarLiveDiagnosticsRef.current.liveSpeechMessagesSeen + 1,
+              lastDropReason: "",
+            });
             void handleNorthStarLiveSpeechMessage(speechPayload, activeSessionId).catch(() => {
               if (event.channel.readyState !== "open") {
                 return;
@@ -3288,6 +3405,10 @@ async function playNorthStarReplyOverPeer(base64: string) {
           }
           if (payload.type === "live_speech_frame") {
             const speechPayload = payload as { type: "live_speech_frame"; requestId: string; audioBase64: string; sampleRate?: number; audioFormat?: string };
+            updateNorthStarLiveDiagnostics({
+              liveSpeechMessagesSeen: northStarLiveDiagnosticsRef.current.liveSpeechMessagesSeen + 1,
+              lastDropReason: "",
+            });
             void handleNorthStarLiveSpeechMessage(speechPayload, activeSessionId).catch(() => {
               if (event.channel.readyState !== "open") {
                 return;
@@ -3307,6 +3428,10 @@ async function playNorthStarReplyOverPeer(base64: string) {
           }
           if (payload.type === "live_speech_end") {
             const speechPayload = payload as { type: "live_speech_end"; requestId: string };
+            updateNorthStarLiveDiagnostics({
+              liveSpeechMessagesSeen: northStarLiveDiagnosticsRef.current.liveSpeechMessagesSeen + 1,
+              lastDropReason: "",
+            });
             void handleNorthStarLiveSpeechMessage(speechPayload, activeSessionId).catch(() => {
               if (event.channel.readyState !== "open") {
                 return;
@@ -3392,6 +3517,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
               }).catch(() => undefined);
             });
         } catch {
+          updateNorthStarLiveDiagnostics({
+            phase: "desktop_message_parse_failed",
+            lastDropReason: "message_parse_failed",
+            issue: "Desktop could not parse a live data-channel message.",
+          });
           return;
         }
       };
@@ -3399,7 +3529,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
         if (northStarWebRtcChannelRef.current === event.channel) {
           northStarWebRtcChannelRef.current = null;
         }
-        const mediaStillStable = hasStableNorthStarLiveMedia(peer, northStarIncomingMediaStreamRef.current);
+        const mediaStillStable = hasStableNorthStarLiveMedia(
+          peer,
+          northStarIncomingMediaStreamRef.current,
+          event.channel.readyState === "open",
+        );
         updateNorthStarLiveDiagnostics({
           phase: mediaStillStable ? "desktop_data_channel_closed_media_still_live" : "desktop_data_channel_closed",
           dataChannelState: "closed",
@@ -3430,7 +3564,11 @@ async function playNorthStarReplyOverPeer(base64: string) {
       if (northStarWebRtcCallIdRef.current !== callId) {
         return;
       }
-      const mediaStillStable = hasStableNorthStarLiveMedia(peer, northStarIncomingMediaStreamRef.current);
+      const mediaStillStable = hasStableNorthStarLiveMedia(
+        peer,
+        northStarIncomingMediaStreamRef.current,
+        northStarWebRtcChannelRef.current?.readyState === "open",
+      );
       updateNorthStarLiveDiagnostics({
         phase: "desktop_connection_state_changed",
         connectionState: peer.connectionState,
@@ -3445,16 +3583,14 @@ async function playNorthStarReplyOverPeer(base64: string) {
       if (peer.connectionState === "connected") {
         setMessage("North Star live call channel connected.");
       } else if ((peer.connectionState === "failed" || peer.connectionState === "disconnected") && !mediaStillStable) {
-        setMessage("North Star live channel dropped back to fallback mode.");
+        setMessage("North Star live call channel dropped. Reconnecting the live line.");
       }
     };
     peer.ontrack = (event) => {
-      if (!event.streams[0]) {
-        return;
-      }
+      const stream = event.streams[0] ?? new MediaStream([event.track]);
       northStarIncomingReceiverRef.current = event.receiver;
       northStarIncomingTrackRef.current = event.track;
-      northStarIncomingMediaStreamRef.current = event.streams[0];
+      northStarIncomingMediaStreamRef.current = stream;
       setNorthStarRemoteTrackStats({
         trackMuted: event.track.muted,
         trackEnabled: event.track.enabled,
@@ -3487,7 +3623,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           trackReadyState: event.track.readyState,
         }));
       };
-      startNorthStarIncomingTrackLoop(event.streams[0]);
+      startNorthStarIncomingTrackLoop(stream);
       setMessage("North Star live microphone track connected.");
       updateNorthStarLiveDiagnostics({
         phase: "desktop_remote_track_received",
@@ -3504,6 +3640,20 @@ async function playNorthStarReplyOverPeer(base64: string) {
 
     if (signal.signalKind === "offer") {
       void ensureNorthStarAcceptedSessionFor(callId, { silent: true });
+      const existingPeer = northStarWebRtcPeerRef.current;
+      if (
+        northStarWebRtcCallIdRef.current === callId
+        && existingPeer
+        && existingPeer.signalingState !== "closed"
+        && northStarLiveDiagnosticsRef.current.dataChannelState !== "closed"
+      ) {
+        updateNorthStarLiveDiagnostics({
+          phase: "desktop_duplicate_offer_ignored",
+          lastSignal: "duplicate_offer_ignored",
+          issue: "",
+        });
+        return;
+      }
       teardownNorthStarWebRtc({
         resetProcessedSignals: false,
         clearPendingOutboundMessages: false,
@@ -3512,6 +3662,13 @@ async function playNorthStarReplyOverPeer(base64: string) {
       attachNorthStarDesktopPeer(callId, peer);
       northStarWebRtcPeerRef.current = peer;
       await peer.setRemoteDescription(JSON.parse(signal.payloadJson) as RTCSessionDescriptionInit);
+      if (northStarPendingRemoteIceCandidatesRef.current.length) {
+        const pendingCandidates = [...northStarPendingRemoteIceCandidatesRef.current];
+        northStarPendingRemoteIceCandidatesRef.current = [];
+        for (const candidate of pendingCandidates) {
+          await peer.addIceCandidate(candidate);
+        }
+      }
       updateNorthStarLiveDiagnostics({
         phase: "desktop_offer_applied",
         lastSignal: "offer_applied",
@@ -3533,17 +3690,18 @@ async function playNorthStarReplyOverPeer(base64: string) {
     }
 
     if (signal.signalKind === "ice_candidate") {
+      const parsedCandidate = JSON.parse(signal.payloadJson) as RTCIceCandidateInit;
       const peer = northStarWebRtcPeerRef.current;
-      if (!peer) {
+      if (!peer || !peer.remoteDescription) {
+        northStarPendingRemoteIceCandidatesRef.current.push(parsedCandidate);
         updateNorthStarLiveDiagnostics({
-          phase: "desktop_ice_candidate_skipped",
-          lastSignal: "ice_candidate_received_without_peer",
-          issue: "Desktop received an ICE candidate before the peer was ready.",
+          phase: "desktop_ice_candidate_queued",
+          lastSignal: !peer ? "ice_candidate_received_without_peer" : "ice_candidate_received_before_remote_description",
+          issue: "",
         });
         return;
       }
-      await peer.addIceCandidate(JSON.parse(signal.payloadJson) as RTCIceCandidateInit);
-      const parsedCandidate = JSON.parse(signal.payloadJson) as RTCIceCandidateInit;
+      await peer.addIceCandidate(parsedCandidate);
       updateNorthStarLiveDiagnostics({
         phase: "desktop_ice_candidate_applied",
         lastSignal: "ice_candidate_applied",
@@ -3895,7 +4053,29 @@ async function playNorthStarReplyOverPeer(base64: string) {
 
     async function pollSignals() {
       try {
-        const signals = await pullNorthStarWebRtcSignals(stableCallId);
+        const signals = (await pullNorthStarWebRtcSignals(stableCallId)).slice().sort((left, right) => {
+          const leftTime = Date.parse(left.createdAt);
+          const rightTime = Date.parse(right.createdAt);
+          if (!Number.isNaN(leftTime) && !Number.isNaN(rightTime) && leftTime !== rightTime) {
+            return leftTime - rightTime;
+          }
+          if (left.signalKind === right.signalKind) {
+            return 0;
+          }
+          if (left.signalKind === "offer") {
+            return -1;
+          }
+          if (right.signalKind === "offer") {
+            return 1;
+          }
+          if (left.signalKind === "answer") {
+            return -1;
+          }
+          if (right.signalKind === "answer") {
+            return 1;
+          }
+          return 0;
+        });
         if (cancelled || northStarWebRtcCallIdRef.current !== stableCallId) {
           return;
         }
@@ -5029,39 +5209,59 @@ async function playNorthStarReplyOverPeer(base64: string) {
     if (activeNorthStarSession && activeNorthStarRemoteCallId === callId) {
       return;
     }
-    if (callSessionSnapshot?.activeSession && !activeNorthStarSession) {
-      return;
-    }
     if (northStarAcceptedSessionStartCallIdRef.current === callId) {
+      await northStarAcceptedSessionPromiseRef.current;
       return;
     }
 
     const silent = options?.silent ?? false;
     northStarAcceptedSessionStartCallIdRef.current = callId;
-    if (!silent) {
-      setBusyPanel("northStarAcceptedCall");
-      setError("");
-      setMessage("");
-    }
-    setNorthStarTurnStatus(null);
-    setCallTurnResult(null);
-    setCallReplyAudioSrc(null);
-    setCallTranscriptSummary("");
-    setCallSessionNotes("");
-    setSpeechStream(null);
-    try {
-      const snapshot = await startNorthStarAcceptedCall();
-      setCallSessionSnapshot(snapshot);
-      setMessage("Started the accepted North Star companion call.");
-      await Promise.all([refreshNorthStarSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics()]);
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      northStarAcceptedSessionStartCallIdRef.current = null;
+    const ensurePromise = (async () => {
       if (!silent) {
-        setBusyPanel(null);
+        setBusyPanel("northStarAcceptedCall");
+        setError("");
+        setMessage("");
       }
-    }
+      setNorthStarTurnStatus(null);
+      setCallTurnResult(null);
+      setCallReplyAudioSrc(null);
+      setCallTranscriptSummary("");
+      setCallSessionNotes("");
+      setSpeechStream(null);
+      try {
+        const snapshot = await startNorthStarAcceptedCall();
+        setCallSessionSnapshot(snapshot);
+        setMessage("Started the accepted North Star companion call.");
+
+        for (let attempt = 0; attempt < 8; attempt += 1) {
+          await Promise.all([refreshNorthStarSnapshot(), refreshCallSessionSnapshot(), refreshDiagnostics()]);
+          const refreshedSnapshot = await getCallSessionSnapshot();
+          setCallSessionSnapshot(refreshedSnapshot);
+          const activeSession =
+            refreshedSnapshot.activeSession?.handoffKind === "north_star_companion"
+            && refreshedSnapshot.activeSession.sessionState === "active"
+              ? refreshedSnapshot.activeSession
+              : null;
+          const activeRemoteCallId = activeSession?.notes.match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i)?.[0] ?? null;
+          if (activeSession && activeRemoteCallId === callId) {
+            return;
+          }
+          await new Promise<void>((resolve) => window.setTimeout(resolve, 150));
+        }
+        throw new Error("Accepted North Star session did not finish becoming active for the current call.");
+      } catch (caught) {
+        setError(caught instanceof Error ? caught.message : String(caught));
+        throw caught;
+      } finally {
+        northStarAcceptedSessionStartCallIdRef.current = null;
+        northStarAcceptedSessionPromiseRef.current = null;
+        if (!silent) {
+          setBusyPanel(null);
+        }
+      }
+    })();
+    northStarAcceptedSessionPromiseRef.current = ensurePromise;
+    await ensurePromise;
   }
 
   async function handleProcessNorthStarTurn() {
@@ -5294,7 +5494,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "diagnostics", label: "Diagnostics" },
         ], settingsSection, setSettingsSection)}
 
-        {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "location" || settingsSection === "voice") ? (
+        {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "calls" || settingsSection === "location" || settingsSection === "voice") ? (
           <section className="panel">
             <form className="settings-form" onSubmit={handleSettingsSubmit}>
               {(settingsSection === "companion" || settingsSection === "core") ? (
@@ -5401,6 +5601,39 @@ async function playNorthStarReplyOverPeer(base64: string) {
                   </div>
                   <label><span>LM Studio API key</span><input type="password" value={settings.lmStudioApiKey} onChange={(event) => setSettings((current) => ({ ...current, lmStudioApiKey: event.target.value }))} /></label>
                 </>
+              ) : settingsSection === "calls" ? (
+                <>
+                  <div className="panel-header">
+                    <h2>Calls</h2>
+                    <p>Start a North Star phone call from NeuralTrainer without reopening the old developer-style controls.</p>
+                  </div>
+                  <div className="saved-state">
+                    <h3>North Star call link</h3>
+                    <p>If the phone is paired and the native APK is installed, NeuralTrainer can ring the phone directly from here.</p>
+                    <dl className="facts">
+                      <div><dt>Link</dt><dd>{northStarConnectionHealth.label}</dd></div>
+                      <div><dt>Desktop</dt><dd>{northStarConnectionsSnapshot?.desktopName || "Waiting"}</dd></div>
+                      <div><dt>Phone calls</dt><dd>{northStarRuntimeSnapshot?.callSessions.length ?? 0}</dd></div>
+                      <div><dt>Accepted calls</dt><dd>{northStarRuntimeSnapshot?.callSessions.filter((call) => call.status === "accepted").length ?? 0}</dd></div>
+                    </dl>
+                    <p><strong>Status</strong><br />{northStarConnectionHealth.headline}</p>
+                    <div className="button-row">
+                      <button type="button" onClick={handleCallNorthStar} disabled={busyPanel === "northStarCall" || !settings.northStarUserHandle.trim()}>
+                        {busyPanel === "northStarCall" ? "Calling..." : "Call North Star"}
+                      </button>
+                    </div>
+                    <label>
+                      <span>Call note</span>
+                      <textarea
+                        rows={3}
+                        value={northStarCallNote}
+                        onChange={(event) => setNorthStarCallNote(event.target.value)}
+                        placeholder="Optional reason for the call. Leave empty to use the seeded companion opener."
+                      />
+                    </label>
+                    <p>The normal expected flow is: start the call here, North Star rings on the phone, then accept on the APK to open the live line.</p>
+                  </div>
+                </>
               ) : settingsSection === "location" ? (
                 <>
                   <div className="panel-header">
@@ -5449,8 +5682,8 @@ async function playNorthStarReplyOverPeer(base64: string) {
 
                   <div className="voice-card">
                     <h3>Prompt menu</h3>
-                    <p>These live-call prompts are multiline and fully editable here. Supported placeholders include <code>{"{session_context}"}</code>, <code>{"{transcript_text}"}</code>, and for the opener <code>{"{default_fallback}"}</code>.</p>
-                    <p><strong>Direction guide</strong><br />This menu only exposes the North Star live-call path. `Shared` means both call directions use it. `NeuralTrainer -&gt; North Star` means it is only used when NeuralTrainer is the one placing the call.</p>
+                    <p>These live-call prompts are multiline and fully editable here. Supported placeholders include <code>{"{session_context}"}</code>, <code>{"{transcript_text}"}</code>, and for opener prompts <code>{"{default_fallback}"}</code>.</p>
+                    <p><strong>Direction guide</strong><br />This menu exposes both North Star call directions. `Shared` means both call directions use it. `North Star -&gt; NeuralTrainer` means the user placed the call from the phone. `NeuralTrainer -&gt; North Star` means NeuralTrainer placed the call to the phone.</p>
                     {promptFieldMeta.map((entry) => (
                       <div key={entry.key} className="saved-state">
                         <div className="panel-header">
@@ -5472,6 +5705,44 @@ async function playNorthStarReplyOverPeer(base64: string) {
                         </div>
                       </div>
                     ))}
+                    <div className="saved-state">
+                      <div className="panel-header">
+                        <h4>North Star -&gt; NeuralTrainer: opener fallback line</h4>
+                        <p>Used as the direct default opener text when the user called from the phone and the opener needs a concrete fallback line.</p>
+                      </div>
+                      <label>
+                        <span>North Star -&gt; NeuralTrainer: opener fallback line</span>
+                        <textarea
+                          rows={3}
+                          value={settings.callInboundOpenerFallback}
+                          onChange={(event) => setSettings((current) => ({ ...current, callInboundOpenerFallback: event.target.value }))}
+                        />
+                      </label>
+                      <div className="actions">
+                        <button type="button" className="ghost" onClick={() => setSettings((current) => ({ ...current, callInboundOpenerFallback: defaultCallInboundOpenerFallback }))}>
+                          Reset to default
+                        </button>
+                      </div>
+                    </div>
+                    <div className="saved-state">
+                      <div className="panel-header">
+                        <h4>NeuralTrainer -&gt; North Star: opener fallback line</h4>
+                        <p>Used as the direct default opener text when NeuralTrainer placed the call and the opener needs a concrete fallback line.</p>
+                      </div>
+                      <label>
+                        <span>NeuralTrainer -&gt; North Star: opener fallback line</span>
+                        <textarea
+                          rows={3}
+                          value={settings.callOutboundOpenerFallback}
+                          onChange={(event) => setSettings((current) => ({ ...current, callOutboundOpenerFallback: event.target.value }))}
+                        />
+                      </label>
+                      <div className="actions">
+                        <button type="button" className="ghost" onClick={() => setSettings((current) => ({ ...current, callOutboundOpenerFallback: defaultCallOutboundOpenerFallback }))}>
+                          Reset to default
+                        </button>
+                      </div>
+                    </div>
                   </div>
 
                   <div className="voice-card">
@@ -6566,7 +6837,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
                           : "The line is open. North Star is listening for the next thing you say."}
                     </p>
                     <p className="memory-explanation">
-                      {northStarLiveChannelReady ? "Call path: live channel connected." : "Call path: fallback voice path."}
+                    {northStarLiveChannelReady ? "Call path: live channel connected." : "Call path: live channel still connecting."}
                     </p>
                     <div className="saved-state">
                       <h3>Live call diagnostics</h3>
@@ -6576,12 +6847,17 @@ async function playNorthStarReplyOverPeer(base64: string) {
                       <p className="memory-explanation"><strong>ICE:</strong> {formatStatus(northStarLiveDiagnostics.iceConnectionState)} / gathering {formatStatus(northStarLiveDiagnostics.iceGatheringState)}</p>
                       <p className="memory-explanation"><strong>Signaling:</strong> {formatStatus(northStarLiveDiagnostics.signalingState)}</p>
                       <p className="memory-explanation"><strong>Data channel:</strong> {formatStatus(northStarLiveDiagnostics.dataChannelState)}</p>
+                      <p className="memory-explanation"><strong>Last message type:</strong> {formatStatus(northStarLiveDiagnostics.lastMessageType)}</p>
                       <p className="memory-explanation"><strong>Remote track:</strong> {formatStatus(northStarLiveDiagnostics.remoteTrackState)}</p>
                       <p className="memory-explanation"><strong>ICE policy:</strong> {formatStatus(northStarLiveDiagnostics.icePolicy)}</p>
                       <p className="memory-explanation"><strong>ICE servers:</strong> {northStarLiveDiagnostics.iceServerKinds}</p>
                       <p className="memory-explanation"><strong>ICE candidates:</strong> local {northStarLiveDiagnostics.localIceCandidates} / remote {northStarLiveDiagnostics.remoteIceCandidates}</p>
                       <p className="memory-explanation"><strong>Candidate kinds:</strong> local {northStarLiveDiagnostics.localCandidateKinds} / remote {northStarLiveDiagnostics.remoteCandidateKinds}</p>
                       <p className="memory-explanation"><strong>Live turns received:</strong> {northStarLiveTurnTransportStats.liveTurnsReceived} turns / {northStarLiveTurnTransportStats.liveTurnChunksReceived} chunks</p>
+                      <p className="memory-explanation"><strong>Raw channel messages:</strong> {northStarLiveDiagnostics.rawMessagesReceived}</p>
+                      <p className="memory-explanation"><strong>Live speech messages seen:</strong> {northStarLiveDiagnostics.liveSpeechMessagesSeen}</p>
+                      <p className="memory-explanation"><strong>Live speech drops:</strong> {northStarLiveDiagnostics.liveSpeechDrops}</p>
+                      <p className="memory-explanation"><strong>Last drop reason:</strong> {northStarLiveDiagnostics.lastDropReason || "none"}</p>
                       <p className="memory-explanation"><strong>Active live input path:</strong> {northStarLiveTurnTransportStats.liveTurnsReceived > 0 ? "phone live speech frames over data channel" : "waiting for phone live speech"}</p>
                       <p className="memory-explanation"><strong>Last live turn id:</strong> {northStarLiveTurnTransportStats.lastLiveTurnRequestId}</p>
                       {northStarLiveDiagnostics.issue ? (
@@ -7242,6 +7518,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           { id: "overview", label: "Overview" },
           { id: "companion", label: "Companion" },
           { id: "connections", label: "Connections" },
+          { id: "calls", label: "Calls" },
           { id: "location", label: "Location" },
           { id: "voice", label: "Voice" },
           { id: "memory", label: "Memory" },
@@ -7288,7 +7565,7 @@ async function playNorthStarReplyOverPeer(base64: string) {
           </div>
         ) : null}
 
-        {settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "location" || settingsSection === "voice" || settingsSection === "diagnostics"
+        {settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "calls" || settingsSection === "location" || settingsSection === "voice" || settingsSection === "diagnostics"
           ? renderSettingsTab()
           : null}
         {settingsSection === "memory" ? renderMemoryTab() : null}

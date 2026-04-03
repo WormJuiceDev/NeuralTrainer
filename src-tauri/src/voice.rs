@@ -55,6 +55,7 @@ const DEFAULT_CALL_INBOUND_STREAMED_REPLY_PROMPT: &str = DEFAULT_CALL_INBOUND_MA
 const DEFAULT_CALL_OUTBOUND_STREAMED_REPLY_PROMPT: &str = DEFAULT_CALL_OUTBOUND_MAIN_REPLY_PROMPT;
 const DEFAULT_CALL_INBOUND_EXPLANATION_PROMPT: &str = "The user is clearly asking for an explanation during a call they placed to you. Answer the question itself right away. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
 const DEFAULT_CALL_OUTBOUND_EXPLANATION_PROMPT: &str = "The user is clearly asking for an explanation during a call you initiated as outbound outreach. Answer the question itself right away, while staying aware of why you called. Do not just acknowledge it. Start with the explanation in the first sentence. Give a concise but real explanation in 2 to 4 natural spoken sentences. If the user asks why you called or what is going on, answer directly from the outreach purpose.\n\nCall context:\n{session_context}\n\nUser just said:\n{transcript_text}\n\nReturn only the spoken reply.";
+const DEFAULT_CALL_INBOUND_OPENER_PROMPT: &str = "You are answering a live phone call that the user just placed to you from North Star. Write only the first spoken opener. Speak like someone who was just called and is now picking up naturally. Do not act like you placed an outbound outreach call. Do not narrate systems, workflows, products, apps, or support language. Keep it human, relaxed, concise, and plainly spoken, usually 1 to 2 short sentences.\n\nCall context:\n{session_context}\n\nFallback purpose if needed:\n{default_fallback}\n\nReturn only the spoken opener.";
 const DEFAULT_CALL_OPENER_PROMPT: &str = "You are a warm life companion beginning a live phone call. Write only the first spoken opener. If the call context says this is outbound outreach, briefly and naturally say why you called so the user can feel your real reason for reaching out. Do not be generic. Do not say 'what's up' or act like the user called you first when this is outbound outreach. Do not mention NeuralTrainer, products, apps, systems, workflows, or supporting their journey. Keep it warm, grounded, and concise, usually 1 to 3 sentences.\n\nCall context:\n{session_context}\n\nFallback purpose if needed:\n{default_fallback}\n\nReturn only the spoken opener.";
 
 pub struct VoiceWorker {
@@ -1511,6 +1512,7 @@ fn request_call_reply(
   max_tokens: i32,
 ) -> Result<Option<String>, AppError> {
   let client = Client::new();
+  let grounded_system_prompt = call_grounding_system_prompt(system_prompt);
   let response = client
     .post(format!("{endpoint}/v1/chat/completions"))
     .bearer_auth(&settings.lm_studio_api_key)
@@ -1519,7 +1521,7 @@ fn request_call_reply(
       "temperature": temperature,
       "max_tokens": max_tokens,
       "messages": [
-        { "role": "system", "content": system_prompt },
+        { "role": "system", "content": grounded_system_prompt },
         { "role": "user", "content": user_prompt }
       ]
     }))
@@ -1634,7 +1636,7 @@ where
   }
 
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
-  let system_prompt = "You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning. Sound like a normal person, not a therapist or support script. If the user asks for an explanation, give the explanation itself instead of only acknowledging the question.";
+  let system_prompt = call_grounding_system_prompt("You are on a live phone call. Reply with plain spoken answer text only. Do not use <think> tags. Do not explain your reasoning. Sound like a normal person, not a therapist or support script. If the user asks for an explanation, give the explanation itself instead of only acknowledging the question.");
   if is_outbound_outreach_call(session_context) && is_outreach_origin_question(transcript_text) {
     let opener_followup_prompt = render_call_prompt_template(
       &settings.call_outbound_outreach_prompt,
@@ -2079,10 +2081,19 @@ fn generate_north_star_opening_text(
   fallback_text: &str,
 ) -> String {
   let cleaned_fallback = sanitize_text(fallback_text);
-  let default_fallback = if cleaned_fallback.is_empty() {
+  let configured_default_fallback = if is_outbound_outreach_call(session_context) {
+    sanitize_text(&settings.call_outbound_opener_fallback)
+  } else {
+    sanitize_text(&settings.call_inbound_opener_fallback)
+  };
+  let default_fallback = if !configured_default_fallback.is_empty() {
+    configured_default_fallback
+  } else if !cleaned_fallback.is_empty() {
+    cleaned_fallback
+  } else if is_outbound_outreach_call(session_context) {
     "Hey, I wanted to check in with you for a minute.".to_string()
   } else {
-    cleaned_fallback
+    "Hey you called me, whats up.".to_string()
   };
   if settings.lm_studio_endpoint.trim().is_empty()
     || settings.lm_studio_model.trim().is_empty()
@@ -2092,9 +2103,14 @@ fn generate_north_star_opening_text(
   }
 
   let endpoint = settings.lm_studio_endpoint.trim_end_matches('/').to_string();
+  let (saved_prompt, default_prompt) = if is_outbound_outreach_call(session_context) {
+    (&settings.call_opener_prompt, DEFAULT_CALL_OPENER_PROMPT)
+  } else {
+    (&settings.call_inbound_opener_prompt, DEFAULT_CALL_INBOUND_OPENER_PROMPT)
+  };
   let opener_prompt = render_call_prompt_template(
-    &settings.call_opener_prompt,
-    DEFAULT_CALL_OPENER_PROMPT,
+    saved_prompt,
+    default_prompt,
     session_context,
     "",
     Some(default_fallback.as_str()),
@@ -2142,6 +2158,12 @@ fn render_call_prompt_template(
     .replace("{session_context}", session_context)
     .replace("{transcript_text}", transcript_text)
     .replace("{default_fallback}", default_fallback.unwrap_or(""))
+}
+
+fn call_grounding_system_prompt(base_prompt: &str) -> String {
+  format!(
+    "{base_prompt}\n\nGrounding contract:\n- Treat the call context as the only trusted source of outside-world facts.\n- Only state a world fact as true when it is explicitly present in the call context.\n- Do not turn partial clues into factual claims.\n- If something is not explicitly grounded in the call context, say you do not have that information right now.\n- Keep inferences clearly tentative, and never present them as confirmed facts."
+  )
 }
 
 fn is_usable_call_reply(text: &str) -> bool {

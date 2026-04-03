@@ -4,7 +4,7 @@
         <item name="colorPrimaryVariant">#09384B</item>
         <item name="colorOnPrimary">#FFFFFF</item>
         <item name="colorSecondary">#1DBF9F</item>
-        <item name="android:statusBarColor" tools:targetApi="l">#081525</item>
-        <item name="android:navigationBarColor">#081525</item>
+        <item name="android:statusBarColor" tools:targetApi="l">#202C33</item>
+        <item name="android:navigationBarColor">#0B141A</item>
     </style>
 </resources>

@@ -40,14 +40,49 @@ data class CompanionMessage(
 data class CompanionCallSession(
   val callId: String,
   val desktopName: String,
+  val deviceToken: String,
   val requestedAt: String,
   val respondedAt: String?,
   val status: String,
   val note: String,
 )
 
+data class CompanionWebRtcSignal(
+  val signalId: String,
+  val signalKind: String,
+  val payloadJson: String,
+)
+
+data class RtcIceServerConfig(
+  val urls: List<String>,
+  val username: String?,
+  val credential: String?,
+)
+
 data class LocationPulseRequest(
   val pulseId: String,
+)
+
+data class NativeLiveCallDiagnostics(
+  val phase: String = "idle",
+  val dataChannelState: String = "idle",
+  val dataChannelBufferedAmount: Long = 0L,
+  val recorderSource: String = "none",
+  val recorderState: String = "idle",
+  val currentRequestId: String = "none",
+  val readCount: Int = 0,
+  val readFailures: Int = 0,
+  val lastReadBytes: Int = 0,
+  val rms: Double = 0.0,
+  val peak: Double = 0.0,
+  val speaking: Boolean = false,
+  val speechFrames: Int = 0,
+  val silenceMs: Int = 0,
+  val turnMs: Int = 0,
+  val sendAttempts: Int = 0,
+  val sendSuccesses: Int = 0,
+  val sendFailures: Int = 0,
+  val lastEvent: String = "idle",
 )
 
 fun parseStateResponse(json: String): List<DesktopBinding> {
@@ -107,10 +142,56 @@ fun parseCallSessionsResponse(json: String): List<CompanionCallSession> {
         CompanionCallSession(
           callId = item.optString("call_id"),
           desktopName = item.optString("desktop_name"),
+          deviceToken = item.optString("device_token"),
           requestedAt = item.optString("requested_at"),
           respondedAt = item.optString("responded_at").ifBlank { null },
           status = item.optString("status"),
           note = item.optString("note"),
+        ),
+      )
+    }
+  }
+}
+
+fun parseWebRtcSignalsResponse(json: String): List<CompanionWebRtcSignal> {
+  val root = JSONObject(json)
+  val signals = root.optJSONArray("signals") ?: JSONArray()
+  return buildList {
+    for (index in 0 until signals.length()) {
+      val item = signals.optJSONObject(index) ?: continue
+      add(
+        CompanionWebRtcSignal(
+          signalId = item.optString("signal_id"),
+          signalKind = item.optString("signal_kind"),
+          payloadJson = item.optString("payload_json"),
+        ),
+      )
+    }
+  }
+}
+
+fun parseRtcConfigResponse(json: String): List<RtcIceServerConfig> {
+  val root = JSONObject(json)
+  val servers = root.optJSONArray("ice_servers") ?: JSONArray()
+  return buildList {
+    for (index in 0 until servers.length()) {
+      val item = servers.optJSONObject(index) ?: continue
+      val urlsValue = item.opt("urls")
+      val urls = when (urlsValue) {
+        is JSONArray -> buildList {
+          for (urlIndex in 0 until urlsValue.length()) {
+            val value = urlsValue.optString(urlIndex)
+            if (value.isNotBlank()) add(value)
+          }
+        }
+        is String -> listOf(urlsValue)
+        else -> emptyList()
+      }
+      add(
+        RtcIceServerConfig(
+          urls = urls,
+          username = item.optString("username").ifBlank { null },
+          credential = item.optString("credential").ifBlank { null },
         ),
       )
     }

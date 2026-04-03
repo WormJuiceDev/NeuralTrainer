@@ -1,3 +1,8 @@
+use std::{
+  thread,
+  time::Duration,
+};
+
 use base64::Engine as _;
 use tauri::{async_runtime, ipc::Channel, AppHandle, Emitter, State};
 
@@ -62,8 +67,9 @@ fn build_north_star_session_context(state: &AppState, session: &CallSession) -> 
     .unwrap_or_else(|| session.notes.trim().to_string());
   let remote_call_id = session_note_field(&session.notes, "remote_call_id:")
     .unwrap_or_else(|| "unknown".into());
+  let location_context = build_north_star_location_context(state)?;
   Ok(format!(
-    "call mode: {}\noutreach purpose: {}\nremote call id: {}\nraw call note: {}\nhandoff kind: {}\noutcome so far: {}\ntranscript summary so far: {}\nrecent exchange:\n{}",
+    "call mode: {}\noutreach purpose: {}\nremote call id: {}\nraw call note: {}\nhandoff kind: {}\noutcome so far: {}\ntranscript summary so far: {}\nlocation context:\n{}\nrecent exchange:\n{}",
     call_origin,
     outreach_purpose,
     remote_call_id,
@@ -71,8 +77,107 @@ fn build_north_star_session_context(state: &AppState, session: &CallSession) -> 
     session.handoff_kind,
     session.outcome,
     session.transcript_summary,
+    location_context,
     db::build_call_turn_context(&state.db_path, session.id, 3)?,
   ))
+}
+
+fn build_north_star_location_context(state: &AppState) -> Result<String, AppError> {
+  let settings = db::load_settings(&state.db_path)?;
+  let lived_moment = db::lived_moment_snapshot(&state.db_path, &settings.timezone)?;
+  let mut lines = Vec::new();
+
+  lines.push("grounded world facts available right now:".into());
+  lines.push(format!("- {}", db::current_location_context_summary(&state.db_path)?));
+
+  if let Some(location) = lived_moment.latest_location_event.as_ref() {
+    let accuracy = location
+      .accuracy_meters
+      .map(|value| format!("{value:.0}m"))
+      .unwrap_or_else(|| "unknown".into());
+    lines.push(format!(
+      "- latest phone location fix: {} / {:.5}, {:.5} / movement {} / accuracy {} / source {}",
+      location.occurred_at,
+      location.latitude,
+      location.longitude,
+      location.movement_state,
+      accuracy,
+      location.source,
+    ));
+  } else {
+    lines.push("- latest phone location fix: none available".into());
+  }
+
+  if let Some(place) = lived_moment.matched_place.as_ref() {
+    lines.push(format!(
+      "- matched meaningful place: {} ({})",
+      place.label,
+      place.place_kind,
+    ));
+  } else if let Some(place) = lived_moment.repeated_place.as_ref() {
+    lines.push(format!(
+      "- repeated place pattern: {} / {} visits",
+      place.label,
+      place.visit_count,
+    ));
+  } else {
+    lines.push("- matched meaningful place: none".into());
+  }
+
+  lines.push(format!("- lived moment summary: {}", lived_moment.summary));
+  lines.push("boundary: if a world fact is not explicitly listed above, treat it as unavailable rather than implied.".into());
+  Ok(lines.join("\n"))
+}
+
+fn refresh_north_star_call_location_context_impl(
+  state: &AppState,
+  reason: &str,
+) -> Result<(), AppError> {
+  let mut settings = db::load_settings(&state.db_path)?;
+  if settings.north_star_user_handle.trim().is_empty() || settings.north_star_device_token.trim().is_empty() {
+    return Ok(());
+  }
+
+  match north_star::request_location_pulse(&settings) {
+    Ok(_) => state.push_event(format!("Asked North Star for a fresh location pulse for {reason}.")),
+    Err(caught) => {
+      state.push_event(format!("North Star call location pulse could not be requested for {reason}: {caught}"));
+      return Ok(());
+    }
+  }
+
+  for attempt in 0..3 {
+    thread::sleep(Duration::from_millis(1800));
+    match north_star::pull_location_events(&state.db_path, &mut settings) {
+      Ok(snapshot) => {
+        db::save_settings(&state.db_path, &settings)?;
+      state.push_event(format!("North Star call location refresh ({reason}): {}", snapshot.detail));
+      let _ = db::get_real_world_presence_snapshot(&state.db_path);
+      if !snapshot.detail.starts_with("No new North Star location events") || attempt == 2 {
+        break;
+      }
+      }
+      Err(caught) => {
+        state.push_event(format!(
+          "North Star call location pull attempt {} failed for {reason}: {}",
+          attempt + 1,
+          caught,
+        ));
+      }
+    }
+  }
+
+  Ok(())
+}
+
+fn schedule_north_star_call_location_refresh(state: &AppState, reason: &str) {
+  let state = state.clone();
+  let reason = reason.to_string();
+  async_runtime::spawn(async move {
+    let refresh_state = state.clone();
+    let refresh_reason = reason.clone();
+    let _ = async_runtime::spawn_blocking(move || refresh_north_star_call_location_context_impl(&refresh_state, &refresh_reason)).await;
+  });
 }
 
 #[tauri::command]
@@ -1269,6 +1374,9 @@ pub fn start_call_session(
     "Started call session {} with handoff '{}'.",
     session.id, session.handoff_kind
   ));
+  if session.handoff_kind == "north_star_companion" {
+    schedule_north_star_call_location_refresh(&state, "north_star_call_start");
+  }
   db::call_session_snapshot(&state.db_path, Some(session.id))
 }
 
@@ -1298,6 +1406,7 @@ pub fn start_north_star_accepted_call(
   }
 
   state.push_event("Started a local call session from an accepted North Star call.");
+  schedule_north_star_call_location_refresh(&state, "accepted_north_star_call_start");
   db::call_session_snapshot(&state.db_path, Some(session.id))
 }
 

@@ -462,6 +462,7 @@ struct CompleteLocationPulseRequest {
 #[derive(Debug, Deserialize)]
 struct MobileCallRequest {
     note: String,
+    device_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1333,8 +1334,23 @@ async fn create_mobile_call_request(
             .desktops
             .values()
             .filter(|desktop| desktop.user_handle == session.user_handle)
+            .filter(|desktop| {
+                request
+                    .device_token
+                    .as_deref()
+                    .map(|token| token.trim().is_empty() || desktop.device_token == token)
+                    .unwrap_or(true)
+            })
             .max_by_key(|desktop| desktop.last_heartbeat_at.unwrap_or(desktop.bound_at))
             .cloned()
+            .or_else(|| {
+                store
+                    .desktops
+                    .values()
+                    .filter(|desktop| desktop.user_handle == session.user_handle)
+                    .max_by_key(|desktop| desktop.last_heartbeat_at.unwrap_or(desktop.bound_at))
+                    .cloned()
+            })
             .ok_or_else(|| AppError::not_found("No linked desktop is ready for North Star yet"))?;
 
         let call = CompanionCallSession {
