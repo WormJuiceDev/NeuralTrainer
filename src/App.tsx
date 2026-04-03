@@ -1,4 +1,5 @@
 import { FormEvent, memo, startTransition, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import L from "leaflet";
 import {
   BriefcaseBusiness,
   Compass,
@@ -27,12 +28,13 @@ import {
   autoDispatchEligibleOutreach,
   createNearbyInterestFilter,
   createNorthStarSession,
-  clearAllLocalData,
   clearVoiceAssets,
   downloadKokoroAssets,
   dispatchDraftedOutreach,
   dispatchNextDraftedOutreach,
   endCallSession,
+  exportMemoryIntel,
+  exportSystemSettings,
   getCallTurnsForSession,
   getCompanionContextSnapshot,
   getCompanionHomeSnapshot,
@@ -48,7 +50,11 @@ import {
   getNorthStarSnapshot,
   getNorthStarRtcConfig,
   importNorthStarCallReviews,
+  importMemoryIntel,
+  importSystemSettings,
   completeNorthStarLiveSpeechStream,
+  pickExportPath,
+  pickImportPath,
   processNextNorthStarCallTurn,
   processNorthStarLiveTurn,
   pushSpeechStreamAudio,
@@ -98,6 +104,7 @@ import {
 } from "./tauri";
 import type {
   AppSettings,
+  BackupTransferResult,
   CallSession,
   CallSessionSnapshot,
   CallTurnRecord,
@@ -125,6 +132,7 @@ import type {
   PassiveContextSnapshot,
   PhaseOneSnapshot,
   PhaseThreeSnapshot,
+  Place,
   MvpRealityCheckSnapshot,
   NorthStarPairingCode,
   NorthStarSnapshot,
@@ -149,9 +157,9 @@ import type {
   VoiceSynthesisResult,
 } from "./types";
 
-type TabId = "home" | "context" | "tectonics" | "settings";
+type TabId = "home" | "context" | "places" | "tectonics" | "settings";
 type SettingsSectionId = "overview" | "companion" | "core" | "connections" | "calls" | "location" | "voice" | "memory" | "passive" | "judgment" | "review" | "diagnostics";
-type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics";
+type MemorySectionId = "places" | "rules" | "reflections" | "overview" | "growth" | "tectonics" | "safeguard";
 type ContextSectionId = string;
 type PassiveSectionId = "ingest" | "timeline" | "patterns" | "moment" | "world";
 type JudgmentSectionId = "reality" | "simulator" | "runtime" | "history";
@@ -512,6 +520,18 @@ function sameNorthStarConnectionsProjection(a: NorthStarConnectionsProjection | 
   );
 }
 
+function sameSpeechStreamSnapshot(a: SpeechStreamSnapshot | null, b: SpeechStreamSnapshot) {
+  if (!a) return false;
+  return (
+    a.active === b.active
+    && a.startedAt === b.startedAt
+    && a.partialText === b.partialText
+    && a.finalText === b.finalText
+    && a.status === b.status
+    && a.lastError === b.lastError
+  );
+}
+
 function getNorthStarConnectionHealth(
   snapshot: NorthStarConnectionsProjection | null,
   savedDeviceToken: string,
@@ -686,6 +706,7 @@ function describeIceServerKinds(servers: RTCIceServer[]) {
 const tabs: TabDefinition[] = [
   { id: "home", label: "Home", eyebrow: "Companion", title: "Life context at a glance", description: "A person-centered map of what matters, what is active, and what still needs to be taught." },
   { id: "context", label: "Context", eyebrow: "Manual Context", title: "Teach the companion directly", description: "Enter the people, places, values, and living details the companion should actually know." },
+  { id: "places", label: "My Places", eyebrow: "Meaningful Places", title: "Map the places that belong to your life", description: "Drop grounded markers on the map, name them directly, and let them become places the companion can actually remember." },
   { id: "tectonics", label: "Tectonics", eyebrow: "Movement", title: "Deep movement over time", description: "A dedicated visual surface for the global change the companion is noticing beneath the visible layer." },
   { id: "settings", label: "Settings", eyebrow: "System", title: "Runtime and legacy tools", description: "Keep the operational surfaces close at hand without making them the app's identity." },
 ];
@@ -751,6 +772,23 @@ const defaultSettings: AppSettings = {
   northStarLastLocationEventId: "",
 };
 
+const fallbackKokoroVoices: string[] = [];
+
+function parseVoiceBlend(value: string) {
+  const [primaryRaw, secondaryRaw] = value
+    .split("+")
+    .map((part) => part.trim())
+    .filter(Boolean);
+  return {
+    primary: primaryRaw || "af_heart",
+    secondary: secondaryRaw || "none",
+  };
+}
+
+function buildVoiceBlend(primary: string, secondary: string) {
+  return secondary && secondary !== "none" ? `${primary}+${secondary}` : primary;
+}
+
 const defaultPlace: CreatePlaceInput = {
   label: "",
   latitude: null,
@@ -762,6 +800,8 @@ const defaultPlace: CreatePlaceInput = {
   isProtected: false,
   notes: "",
 };
+
+const builtInMeaningKinds = ["uncertain", "belonging", "reflection", "discovery", "return", "mixed"] as const;
 
 const defaultRule: CreateRuleInput = {
   ruleKind: "protected_time",
@@ -919,6 +959,111 @@ function buildCompanionMapLayout(
   }
 
   return placements;
+}
+
+type MeaningfulPlacesMapBounds = {
+  minLatitude: number;
+  maxLatitude: number;
+  minLongitude: number;
+  maxLongitude: number;
+  centerLatitude: number;
+  centerLongitude: number;
+};
+
+function clampMapLatitude(value: number) {
+  return Math.max(-85, Math.min(85, value));
+}
+
+function normalizeMapLongitude(value: number) {
+  if (value < -180) return -180;
+  if (value > 180) return 180;
+  return value;
+}
+
+function mercatorLatitudeToUnit(value: number) {
+  const radians = (clampMapLatitude(value) * Math.PI) / 180;
+  return (1 - Math.log(Math.tan(radians) + 1 / Math.cos(radians)) / Math.PI) / 2;
+}
+
+function mercatorUnitToLatitude(value: number) {
+  const radians = Math.atan(Math.sinh(Math.PI * (1 - 2 * value)));
+  return (radians * 180) / Math.PI;
+}
+
+function longitudeToMapPercent(longitude: number, bounds: MeaningfulPlacesMapBounds) {
+  const span = bounds.maxLongitude - bounds.minLongitude || 1;
+  return ((longitude - bounds.minLongitude) / span) * 100;
+}
+
+function latitudeToMapPercent(latitude: number, bounds: MeaningfulPlacesMapBounds) {
+  const top = mercatorLatitudeToUnit(bounds.maxLatitude);
+  const bottom = mercatorLatitudeToUnit(bounds.minLatitude);
+  const current = mercatorLatitudeToUnit(latitude);
+  const span = bottom - top || 1;
+  return ((current - top) / span) * 100;
+}
+
+function mapPercentToLongitude(percent: number, bounds: MeaningfulPlacesMapBounds) {
+  return bounds.minLongitude + (percent / 100) * (bounds.maxLongitude - bounds.minLongitude);
+}
+
+function mapPercentToLatitude(percent: number, bounds: MeaningfulPlacesMapBounds) {
+  const top = mercatorLatitudeToUnit(bounds.maxLatitude);
+  const bottom = mercatorLatitudeToUnit(bounds.minLatitude);
+  return mercatorUnitToLatitude(top + (percent / 100) * (bottom - top));
+}
+
+function buildMeaningfulPlacesMapBounds(
+  currentLatitude: number | null,
+  currentLongitude: number | null,
+  places: Place[],
+  repeatedPlaces: PassiveContextSnapshot["repeatedPlaces"],
+) {
+  const points = [
+    ...(currentLatitude != null && currentLongitude != null ? [{ latitude: currentLatitude, longitude: currentLongitude }] : []),
+    ...places
+      .filter((place) => place.latitude != null && place.longitude != null)
+      .map((place) => ({ latitude: place.latitude as number, longitude: place.longitude as number })),
+    ...repeatedPlaces.map((place) => ({ latitude: place.latitude, longitude: place.longitude })),
+  ];
+
+  const fallbackLatitude = currentLatitude ?? defaultLocationEvent.latitude;
+  const fallbackLongitude = currentLongitude ?? defaultLocationEvent.longitude;
+
+  const latitudes = points.length ? points.map((point) => point.latitude) : [fallbackLatitude];
+  const longitudes = points.length ? points.map((point) => point.longitude) : [fallbackLongitude];
+
+  const minLatitude = Math.min(...latitudes);
+  const maxLatitude = Math.max(...latitudes);
+  const minLongitude = Math.min(...longitudes);
+  const maxLongitude = Math.max(...longitudes);
+
+  const centerLatitude = (minLatitude + maxLatitude) / 2;
+  const centerLongitude = (minLongitude + maxLongitude) / 2;
+  const latitudeSpan = Math.max(maxLatitude - minLatitude, 2.6);
+  const longitudeSpan = Math.max(maxLongitude - minLongitude, 3.8);
+
+  return {
+    minLatitude: clampMapLatitude(centerLatitude - latitudeSpan / 2),
+    maxLatitude: clampMapLatitude(centerLatitude + latitudeSpan / 2),
+    minLongitude: normalizeMapLongitude(centerLongitude - longitudeSpan / 2),
+    maxLongitude: normalizeMapLongitude(centerLongitude + longitudeSpan / 2),
+    centerLatitude,
+    centerLongitude,
+  };
+}
+
+function inferMapRegionLabel(locationSummary: string | null | undefined) {
+  if (!locationSummary) return "your current region";
+  const cleaned = locationSummary
+    .replace(/^you(?:'re| are)\s+/i, "")
+    .replace(/^near\s+/i, "")
+    .trim();
+  const segments = cleaned
+    .split(",")
+    .map((segment) => segment.trim())
+    .filter(Boolean);
+  return segments[segments.length - 1] || cleaned || "your current region";
 }
 
 function formatDuration(seconds: number) {
@@ -1939,6 +2084,184 @@ const ConversationTurnsPanel = memo(function ConversationTurnsPanel({
   );
 });
 
+const MeaningfulPlacesMap = memo(function MeaningfulPlacesMap({
+  bounds,
+  places,
+  draftPlace,
+  onDropMarker,
+}: {
+  bounds: MeaningfulPlacesMapBounds;
+  places: Place[];
+  draftPlace: { label: string; latitude: number | null; longitude: number | null };
+  onDropMarker: (latitude: number, longitude: number) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const mapRef = useRef<L.Map | null>(null);
+  const markerLayerRef = useRef<L.LayerGroup | null>(null);
+  const initializedViewRef = useRef(false);
+  const rightDragStateRef = useRef<{ active: boolean; lastX: number; lastY: number }>({
+    active: false,
+    lastX: 0,
+    lastY: 0,
+  });
+
+  useEffect(() => {
+    if (!containerRef.current || mapRef.current) {
+      return;
+    }
+
+    const map = L.map(containerRef.current, {
+      zoomControl: true,
+      attributionControl: true,
+      dragging: false,
+    });
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+      maxZoom: 19,
+    }).addTo(map);
+
+    markerLayerRef.current = L.layerGroup().addTo(map);
+    mapRef.current = map;
+
+    return () => {
+      markerLayerRef.current = null;
+      mapRef.current?.remove();
+      mapRef.current = null;
+      initializedViewRef.current = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!mapRef.current) {
+      return;
+    }
+    const nextBounds = L.latLngBounds(
+      [bounds.minLatitude, bounds.minLongitude],
+      [bounds.maxLatitude, bounds.maxLongitude],
+    );
+    if (!initializedViewRef.current) {
+      mapRef.current.fitBounds(nextBounds, { padding: [28, 28] });
+      initializedViewRef.current = true;
+      return;
+    }
+    const currentBounds = mapRef.current.getBounds();
+    if (!currentBounds.contains(nextBounds)) {
+      mapRef.current.fitBounds(nextBounds, { padding: [28, 28] });
+    }
+  }, [bounds]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const markerLayer = markerLayerRef.current;
+    if (!map || !markerLayer) {
+      return;
+    }
+    markerLayer.clearLayers();
+
+    places
+      .filter((place) => place.latitude != null && place.longitude != null)
+      .forEach((place) => {
+        const marker = L.circleMarker([place.latitude as number, place.longitude as number], {
+          radius: 8,
+          weight: 2,
+          color: "#dff2ff",
+          fillColor: "#2f74d5",
+          fillOpacity: 0.92,
+        });
+        marker.bindTooltip(place.label, {
+          permanent: true,
+          direction: "top",
+          offset: [0, -10],
+          className: "meaningful-places-leaflet-label",
+        });
+        marker.addTo(markerLayer);
+      });
+
+    if (draftPlace.latitude != null && draftPlace.longitude != null) {
+      const draftMarker = L.circleMarker([draftPlace.latitude, draftPlace.longitude], {
+        radius: 8,
+        weight: 2,
+        color: "#ffe0b2",
+        fillColor: "#d7862e",
+        fillOpacity: 0.96,
+        dashArray: "4 3",
+      });
+      draftMarker.bindTooltip(draftPlace.label.trim() || "New place", {
+        permanent: true,
+        direction: "top",
+        offset: [0, -10],
+        className: "meaningful-places-leaflet-label draft",
+      });
+      draftMarker.addTo(markerLayer);
+    }
+  }, [draftPlace, places]);
+
+  useEffect(() => {
+    const map = mapRef.current;
+    const container = containerRef.current;
+    if (!map || !container) {
+      return;
+    }
+
+    const handleClick = (event: L.LeafletMouseEvent) => {
+      onDropMarker(event.latlng.lat, event.latlng.lng);
+    };
+
+    const handleMouseDown = (event: MouseEvent) => {
+      if (event.button !== 2) {
+        return;
+      }
+      event.preventDefault();
+      rightDragStateRef.current = {
+        active: true,
+        lastX: event.clientX,
+        lastY: event.clientY,
+      };
+      container.style.cursor = "grabbing";
+    };
+
+    const handleMouseMove = (event: MouseEvent) => {
+      if (!rightDragStateRef.current.active) {
+        return;
+      }
+      const deltaX = event.clientX - rightDragStateRef.current.lastX;
+      const deltaY = event.clientY - rightDragStateRef.current.lastY;
+      rightDragStateRef.current.lastX = event.clientX;
+      rightDragStateRef.current.lastY = event.clientY;
+      map.panBy([-deltaX, -deltaY], { animate: false });
+    };
+
+    const stopRightDrag = () => {
+      if (!rightDragStateRef.current.active) {
+        return;
+      }
+      rightDragStateRef.current.active = false;
+      container.style.cursor = "";
+    };
+
+    const handleContextMenu = (event: MouseEvent) => {
+      event.preventDefault();
+    };
+
+    map.on("click", handleClick);
+    container.addEventListener("mousedown", handleMouseDown);
+    window.addEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mouseup", stopRightDrag);
+    container.addEventListener("contextmenu", handleContextMenu);
+
+    return () => {
+      map.off("click", handleClick);
+      container.removeEventListener("mousedown", handleMouseDown);
+      window.removeEventListener("mousemove", handleMouseMove);
+      window.removeEventListener("mouseup", stopRightDrag);
+      container.removeEventListener("contextmenu", handleContextMenu);
+      container.style.cursor = "";
+    };
+  }, [onDropMarker]);
+
+  return <div ref={containerRef} className="meaningful-places-leaflet-map" />;
+});
+
 const CallHistoryPanel = memo(function CallHistoryPanel({
   sessions,
 }: {
@@ -2059,6 +2382,9 @@ function App() {
   const [passiveSection, setPassiveSection] = useState<PassiveSectionId>("ingest");
   const [judgmentSection, setJudgmentSection] = useState<JudgmentSectionId>("reality");
   const [reviewSection, setReviewSection] = useState<ReviewSectionId>("places");
+  const [showMemoryWipeModal, setShowMemoryWipeModal] = useState(false);
+  const [lastMemoryIntelTransfer, setLastMemoryIntelTransfer] = useState<BackupTransferResult | null>(null);
+  const [lastSettingsTransfer, setLastSettingsTransfer] = useState<BackupTransferResult | null>(null);
   const [diagnostics, setDiagnostics] = useState<DiagnosticStatus | null>(null);
   const [voiceSnapshot, setVoiceSnapshot] = useState<VoiceSnapshot | null>(null);
   const [voicePreview, setVoicePreview] = useState<VoiceSynthesisResult | null>(null);
@@ -2077,6 +2403,8 @@ function App() {
   const [northStarTurnStatus, setNorthStarTurnStatus] = useState<NorthStarTurnProcessingResult | null>(null);
   const [northStarLiveReplyPreviewText, setNorthStarLiveReplyPreviewText] = useState("");
   const [placeForm, setPlaceForm] = useState<CreatePlaceInput>(defaultPlace);
+  const [editingPlaceId, setEditingPlaceId] = useState<number | null>(null);
+  const [editingPlaceSignificanceScore, setEditingPlaceSignificanceScore] = useState(0.75);
   const [ruleForm, setRuleForm] = useState<CreateRuleInput>(defaultRule);
   const [reflectionForm, setReflectionForm] = useState<CreateReflectionInput>(defaultReflection);
   const [locationForm, setLocationForm] = useState<LocationEventInput>(defaultLocationEvent);
@@ -2084,7 +2412,7 @@ function App() {
   const [reviewRule, setReviewRule] = useState<UpdateRuleInput | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
-  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarPulse" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "northStarPairing" | "northStarReset" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "localCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | "worldPresence" | "nearbyInterestFilter" | null>(null);
+  const [busyPanel, setBusyPanel] = useState<"companionCategoryCreate" | "companionCategoryDelete" | "companionCategoryUpdate" | "companionContextCreate" | "companionContextUpdate" | "companionContextReorder" | "companionContextArchive" | "place" | "rule" | "reflection" | "memoryGrowth" | "contextMemory" | "contextMemorySeed" | "memoryReview" | "location" | "northStarSession" | "northStarBind" | "northStarHeartbeat" | "northStarMessage" | "northStarCall" | "northStarPull" | "northStarPulse" | "northStarImportReviews" | "northStarTurn" | "northStarLink" | "northStarPairing" | "northStarReset" | "draftDispatch" | "decisions" | "callDecisions" | "reviewPlace" | "reviewRule" | "realitySeed" | "simulationRun" | "runtimeReset" | "simulationSuite" | "voiceDownload" | "voiceRuntime" | "voicePreview" | "voiceCleanup" | "callStart" | "callEnd" | "speechSetup" | "callTurn" | "speechStreamStart" | "speechStreamStop" | "northStarAcceptedCall" | "worldPresence" | "nearbyInterestFilter" | "memoryIntelExport" | "memoryIntelImport" | "settingsExport" | "settingsImport" | null>(null);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
   const [lastDraftDispatch, setLastDraftDispatch] = useState<DraftedOutreachDispatchResult | null>(null);
@@ -2095,6 +2423,12 @@ function App() {
   const [northStarLiveTurnTransportStats, setNorthStarLiveTurnTransportStats] = useState<NorthStarLiveTurnTransportStats>(defaultNorthStarLiveTurnTransportStats);
   const northStarRtcIceServersRef = useRef<RTCIceServer[] | null>(null);
   const missingAcceptedNorthStarPollsRef = useRef(0);
+  const speechStreamPollInFlightRef = useRef(false);
+  const northStarRuntimePollInFlightRef = useRef(false);
+  const northStarHeartbeatPollInFlightRef = useRef(false);
+  const northStarSignalPollInFlightRef = useRef(false);
+  const northStarTurnPollInFlightRef = useRef(false);
+  const northStarRemoteTrackStatsPollInFlightRef = useRef(false);
   const northStarAcceptedSessionStartCallIdRef = useRef<string | null>(null);
   const northStarAcceptedSessionPromiseRef = useRef<Promise<void> | null>(null);
   const staleAcceptedHandoffCleanupRef = useRef<number | null>(null);
@@ -2142,6 +2476,39 @@ function App() {
 
   const activeTabMeta = tabs.find((tab) => tab.id === activeTab) ?? tabs[0];
   const northStarConnectionsVisible = activeTab === "settings" && settingsSection === "connections";
+  const meaningfulPlaces = snapshot?.places ?? [];
+  const repeatedPlaces = passiveSnapshot?.repeatedPlaces ?? [];
+  const availableKokoroVoices = useMemo(() => {
+    const merged = new Set<string>(fallbackKokoroVoices);
+    for (const voice of voiceSnapshot?.exampleVoices ?? []) {
+      if (voice.trim()) {
+        merged.add(voice.trim());
+      }
+    }
+    const currentBlend = settings.ttsDefaultVoice.split("+").map((part) => part.trim()).filter(Boolean);
+    for (const voice of currentBlend) {
+      merged.add(voice);
+    }
+    return Array.from(merged).sort((left, right) => left.localeCompare(right));
+  }, [settings.ttsDefaultVoice, voiceSnapshot?.exampleVoices]);
+  const selectedVoiceBlend = useMemo(
+    () => parseVoiceBlend(settings.ttsDefaultVoice),
+    [settings.ttsDefaultVoice],
+  );
+  const meaningfulPlacesMapBounds = useMemo(
+    () => buildMeaningfulPlacesMapBounds(realWorldPresenceSnapshot?.latitude ?? null, realWorldPresenceSnapshot?.longitude ?? null, meaningfulPlaces, repeatedPlaces),
+    [meaningfulPlaces, realWorldPresenceSnapshot?.latitude, realWorldPresenceSnapshot?.longitude, repeatedPlaces],
+  );
+  const meaningfulPlacesMapRegionLabel = inferMapRegionLabel(realWorldPresenceSnapshot?.locationSummary);
+  const meaningKindOptions = useMemo(() => {
+    const customKinds = meaningfulPlaces
+      .map((place) => place.meaningKind.trim())
+      .filter(Boolean)
+      .filter((value, index, values) => values.indexOf(value) === index)
+      .filter((value) => !builtInMeaningKinds.includes(value as typeof builtInMeaningKinds[number]));
+    return [...builtInMeaningKinds, ...customKinds];
+  }, [meaningfulPlaces]);
+  const placeMeaningUsesCustomValue = placeForm.meaningKind.trim().length > 0 && !builtInMeaningKinds.includes(placeForm.meaningKind.trim().toLowerCase() as typeof builtInMeaningKinds[number]);
   const unresolvedMomentCount = phaseThreeSnapshot?.savedMoments.filter((moment) => !moment.resolvedAt).length ?? 0;
   const callReadyMomentCount = phaseThreeSnapshot?.savedMoments.filter((moment) => !moment.resolvedAt && moment.confidence >= settings.callConfidenceThreshold).length ?? 0;
   const selectedMemoryItem =
@@ -3744,7 +4111,10 @@ async function playNorthStarReplyOverPeer(
   async function refreshNorthStarSnapshot() { commitNorthStarSnapshot(await getNorthStarSnapshot()); }
   async function refreshNorthStarRuntimeSnapshot() { commitNorthStarRuntimeSnapshot(await getNorthStarRuntimeSnapshot()); }
   async function refreshVoiceSnapshot() { setVoiceSnapshot(await getVoiceSnapshot()); }
-  async function refreshSpeechStreamSnapshot() { setSpeechStream(await getSpeechStreamSnapshot()); }
+  async function refreshSpeechStreamSnapshot() {
+    const snapshot = await getSpeechStreamSnapshot();
+    setSpeechStream((current) => (sameSpeechStreamSnapshot(current, snapshot) ? current : snapshot));
+  }
   async function refreshSnapshot() { setSnapshot(await getPhaseOneSnapshot()); }
   async function refreshPassiveSnapshot() { setPassiveSnapshot(await getPassiveContextSnapshot()); }
   async function refreshPhaseThreeSnapshot() { setPhaseThreeSnapshot(await getPhaseThreeSnapshot()); }
@@ -3925,27 +4295,49 @@ async function playNorthStarReplyOverPeer(
   useEffect(() => {
     if (!speechStreamNeedsHotPolling) return;
     const timer = window.setInterval(() => {
-      void refreshSpeechStreamSnapshot();
+      if (speechStreamPollInFlightRef.current) return;
+      speechStreamPollInFlightRef.current = true;
+      void refreshSpeechStreamSnapshot().finally(() => {
+        speechStreamPollInFlightRef.current = false;
+      });
     }, 250);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      speechStreamPollInFlightRef.current = false;
+    };
   }, [speechStreamNeedsHotPolling]);
 
   useEffect(() => {
     if (!northStarRuntimeSnapshot?.configured) return;
     const timer = window.setInterval(() => {
-      void refreshNorthStarRuntimeSnapshot();
+      if (northStarRuntimePollInFlightRef.current) return;
+      northStarRuntimePollInFlightRef.current = true;
+      void refreshNorthStarRuntimeSnapshot().finally(() => {
+        northStarRuntimePollInFlightRef.current = false;
+      });
     }, 3000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      northStarRuntimePollInFlightRef.current = false;
+    };
   }, [northStarRuntimeSnapshot?.configured]);
 
   useEffect(() => {
     if (!northStarDesktopBound || busyPanel === "northStarHeartbeat") return;
     const timer = window.setInterval(() => {
+      if (northStarHeartbeatPollInFlightRef.current) return;
+      northStarHeartbeatPollInFlightRef.current = true;
       void sendNorthStarHeartbeat()
         .then((snapshot) => commitNorthStarSnapshot(snapshot))
-        .catch(() => undefined);
+        .catch(() => undefined)
+        .finally(() => {
+          northStarHeartbeatPollInFlightRef.current = false;
+        });
     }, 15000);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      northStarHeartbeatPollInFlightRef.current = false;
+    };
   }, [northStarDesktopBound, busyPanel]);
 
   useEffect(() => {
@@ -4052,6 +4444,10 @@ async function playNorthStarReplyOverPeer(
     }
 
     async function pollSignals() {
+      if (northStarSignalPollInFlightRef.current) {
+        return;
+      }
+      northStarSignalPollInFlightRef.current = true;
       try {
         const signals = (await pullNorthStarWebRtcSignals(stableCallId)).slice().sort((left, right) => {
           const leftTime = Date.parse(left.createdAt);
@@ -4084,6 +4480,8 @@ async function playNorthStarReplyOverPeer(
         }
       } catch {
         // Keep the existing turn-upload call path alive while live signaling is still being added.
+      } finally {
+        northStarSignalPollInFlightRef.current = false;
       }
     }
 
@@ -4095,6 +4493,7 @@ async function playNorthStarReplyOverPeer(
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      northStarSignalPollInFlightRef.current = false;
     };
   }, [activeNorthStarSession?.id, activeNorthStarRemoteCallId, pendingAcceptedNorthStarCallId]);
 
@@ -4109,9 +4508,16 @@ async function playNorthStarReplyOverPeer(
       return;
     }
     const timer = window.setInterval(() => {
-      void handleProcessNorthStarTurn();
+      if (northStarTurnPollInFlightRef.current) return;
+      northStarTurnPollInFlightRef.current = true;
+      void handleProcessNorthStarTurn().finally(() => {
+        northStarTurnPollInFlightRef.current = false;
+      });
     }, 1800);
-    return () => window.clearInterval(timer);
+    return () => {
+      window.clearInterval(timer);
+      northStarTurnPollInFlightRef.current = false;
+    };
   }, [
     callSessionSnapshot?.activeSession?.id,
     callSessionSnapshot?.activeSession?.handoffKind,
@@ -4128,11 +4534,15 @@ async function playNorthStarReplyOverPeer(
 
     let cancelled = false;
     const timer = window.setInterval(() => {
+      if (northStarRemoteTrackStatsPollInFlightRef.current) {
+        return;
+      }
       const receiver = northStarIncomingReceiverRef.current;
       const track = northStarIncomingTrackRef.current;
       if (!receiver || !track) {
         return;
       }
+      northStarRemoteTrackStatsPollInFlightRef.current = true;
       void receiver.getStats().then((report) => {
         if (cancelled) {
           return;
@@ -4157,12 +4567,15 @@ async function playNorthStarReplyOverPeer(
           packetsReceived,
           audioLevel,
         });
-      }).catch(() => undefined);
+      }).catch(() => undefined).finally(() => {
+        northStarRemoteTrackStatsPollInFlightRef.current = false;
+      });
     }, 1000);
 
     return () => {
       cancelled = true;
       window.clearInterval(timer);
+      northStarRemoteTrackStatsPollInFlightRef.current = false;
     };
   }, [activeNorthStarSession?.id, northStarLiveDiagnostics.remoteTrackState]);
 
@@ -4702,15 +5115,83 @@ async function playNorthStarReplyOverPeer(
     setError("");
     setMessage("");
     try {
-      await createPlace(placeForm);
+      const trimmedPlace = {
+        ...placeForm,
+        label: placeForm.label.trim(),
+        placeKind: placeForm.placeKind.trim(),
+        meaningKind: placeForm.meaningKind.trim() || "uncertain",
+        notes: placeForm.notes.trim(),
+      };
+      if (editingPlaceId != null) {
+        await updatePlace({
+          id: editingPlaceId,
+          label: trimmedPlace.label,
+          latitude: trimmedPlace.latitude,
+          longitude: trimmedPlace.longitude,
+          radiusMeters: trimmedPlace.radiusMeters,
+          placeKind: trimmedPlace.placeKind,
+          meaningKind: trimmedPlace.meaningKind,
+          significanceScore: editingPlaceSignificanceScore,
+          isProtected: trimmedPlace.isProtected,
+          notes: trimmedPlace.notes,
+        });
+        setMessage("Meaningful place updated.");
+      } else {
+        await createPlace(trimmedPlace);
+        setMessage("Meaningful place added.");
+      }
       setPlaceForm(defaultPlace);
-      setMessage("Meaningful place added.");
+      setEditingPlaceId(null);
+      setEditingPlaceSignificanceScore(0.75);
       await Promise.all([refreshSnapshot(), refreshPassiveSnapshot(), refreshPhaseThreeSnapshot(), refreshDiagnostics(), refreshRealityCheckSnapshot()]);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setBusyPanel(null);
     }
+  }
+
+  function beginEditingPlace(place: Place) {
+    setEditingPlaceId(place.id);
+    setEditingPlaceSignificanceScore(place.significanceScore);
+    setPlaceForm({
+      label: place.label,
+      latitude: place.latitude,
+      longitude: place.longitude,
+      radiusMeters: place.radiusMeters,
+      placeKind: place.placeKind,
+      meaningKind: place.meaningKind,
+      isUserNamed: place.isUserNamed,
+      isProtected: place.isProtected,
+      notes: place.notes,
+    });
+  }
+
+  function resetPlaceForm() {
+    setPlaceForm(defaultPlace);
+    setEditingPlaceId(null);
+    setEditingPlaceSignificanceScore(0.75);
+  }
+
+  function handleMyPlacesMapClick(latitude: number, longitude: number) {
+    setPlaceForm((current) => ({
+      ...current,
+      latitude: Number(latitude.toFixed(6)),
+      longitude: Number(longitude.toFixed(6)),
+    }));
+  }
+
+  function seedPlaceFromCurrentLocation() {
+    if (realWorldPresenceSnapshot?.latitude == null || realWorldPresenceSnapshot.longitude == null) {
+      return;
+    }
+    const latitude = realWorldPresenceSnapshot.latitude;
+    const longitude = realWorldPresenceSnapshot.longitude;
+    setPlaceForm((current) => ({
+      ...current,
+      latitude: Number(latitude.toFixed(6)),
+      longitude: Number(longitude.toFixed(6)),
+    }));
   }
 
   async function handleRuleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -4944,39 +5425,6 @@ async function playNorthStarReplyOverPeer(
       setSpeechStream(null);
       setMessage("Voice assets were removed from local storage.");
       await refreshDiagnostics();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusyPanel(null);
-    }
-  }
-
-  async function handleClearAllLocalData() {
-    setBusyPanel("localCleanup");
-    setError("");
-    setMessage("");
-    try {
-      await clearAllLocalData();
-      setSettings(defaultSettings);
-      setSavedRows([]);
-      setVoicePreview(null);
-      setVoicePreviewSrc(null);
-      setCallTurnResult(null);
-      setCallReplyAudioSrc(null);
-      setSpeechStream(null);
-        await Promise.all([
-          refreshDiagnostics(),
-          refreshNorthStarSnapshot(),
-          refreshVoiceSnapshot(),
-          refreshSnapshot(),
-        refreshPassiveSnapshot(),
-        refreshPhaseThreeSnapshot(),
-        refreshDecisionSnapshot(),
-        refreshCallSessionSnapshot(),
-        refreshRealityCheckSnapshot(),
-        refreshMemoryGrowthSnapshot(),
-      ]);
-      setMessage("All local app data and voice assets were cleared.");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -5408,9 +5856,6 @@ async function playNorthStarReplyOverPeer(
   }
 
   async function handleResetRuntimeData() {
-    if (!window.confirm("Clear generated runtime and memory data while keeping settings and manual context?")) {
-      return;
-    }
     setBusyPanel("runtimeReset");
     setError("");
     setMessage("");
@@ -5439,7 +5884,118 @@ async function playNorthStarReplyOverPeer(
         refreshNorthStarSnapshot(),
         refreshDiagnostics(),
       ]);
-      setMessage("Generated runtime and memory data were cleared. Settings and manual context were kept.");
+      setShowMemoryWipeModal(false);
+      setMessage("Generated runtime memory was wiped while your settings, Home context, and My Places stayed in place.");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  function buildBackupFilename(kind: "memory-intel" | "system-settings") {
+    const stamp = new Date().toISOString().slice(0, 10);
+    return `neural-trainer-${kind}-${stamp}.json`;
+  }
+
+  function normalizeDialogPath(path: string | string[] | null): string | null {
+    if (typeof path === "string" && path.trim()) {
+      return path;
+    }
+    return null;
+  }
+
+  async function handleExportMemoryIntel() {
+    const destinationPath = normalizeDialogPath(await pickExportPath(buildBackupFilename("memory-intel"), [
+      { name: "JSON", extensions: ["json"] },
+    ]));
+    if (!destinationPath) return;
+    setBusyPanel("memoryIntelExport");
+    setError("");
+    setMessage("");
+    try {
+      const result = await exportMemoryIntel(destinationPath);
+      setLastMemoryIntelTransfer(result);
+      setMessage(result.detail);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleImportMemoryIntel() {
+    const sourcePath = normalizeDialogPath(await pickImportPath([
+      { name: "JSON", extensions: ["json"] },
+    ]));
+    if (!sourcePath) return;
+    setBusyPanel("memoryIntelImport");
+    setError("");
+    setMessage("");
+    try {
+      const result = await importMemoryIntel(sourcePath);
+      setLastMemoryIntelTransfer(result);
+      await Promise.all([
+        refreshSnapshot(),
+        refreshMemoryGrowthSnapshot(),
+        refreshMemorySystemSnapshot(),
+        refreshCompanionContextSnapshot(),
+        refreshCompanionHomeSnapshot(),
+        refreshPassiveSnapshot(),
+        refreshPhaseThreeSnapshot(),
+        refreshLivedMomentSnapshot(),
+        refreshRealWorldPresenceSnapshot(),
+        refreshDecisionSnapshot(),
+        refreshCallSessionSnapshot(),
+        refreshRealityCheckSnapshot(),
+        refreshDiagnostics(),
+      ]);
+      setMessage(result.detail);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleExportSystemSettings() {
+    const destinationPath = normalizeDialogPath(await pickExportPath(buildBackupFilename("system-settings"), [
+      { name: "JSON", extensions: ["json"] },
+    ]));
+    if (!destinationPath) return;
+    setBusyPanel("settingsExport");
+    setError("");
+    setMessage("");
+    try {
+      const result = await exportSystemSettings(destinationPath);
+      setLastSettingsTransfer(result);
+      setMessage(result.detail);
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setBusyPanel(null);
+    }
+  }
+
+  async function handleImportSystemSettings() {
+    const sourcePath = normalizeDialogPath(await pickImportPath([
+      { name: "JSON", extensions: ["json"] },
+    ]));
+    if (!sourcePath) return;
+    setBusyPanel("settingsImport");
+    setError("");
+    setMessage("");
+    try {
+      const result = await importSystemSettings(sourcePath);
+      const importedSettings = await loadSettings();
+      setSettings(importedSettings);
+      setLastSettingsTransfer(result);
+      await Promise.all([
+        refreshNorthStarSnapshot(),
+        refreshVoiceSnapshot(),
+        refreshDiagnostics(),
+      ]);
+      setMessage(result.detail);
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -5466,9 +6022,10 @@ async function playNorthStarReplyOverPeer(
     items: Array<{ id: T; label: ReactNode }>,
     current: T | string,
     onChange: (next: T) => void,
+    className?: string,
   ) {
     return (
-      <div className="section-tabs" role="tablist">
+      <div className={className ? `section-tabs ${className}` : "section-tabs"} role="tablist">
         {items.map((item) => (
           <button
             key={item.id}
@@ -5486,14 +6043,6 @@ async function playNorthStarReplyOverPeer(
   function renderSettingsTab() {
     return (
       <div className="content-stack">
-        {renderSectionTabs([
-          { id: "companion", label: "Companion" },
-          { id: "connections", label: "Connections" },
-          { id: "location", label: "Location" },
-          { id: "voice", label: "Voice" },
-          { id: "diagnostics", label: "Diagnostics" },
-        ], settingsSection, setSettingsSection)}
-
         {(settingsSection === "companion" || settingsSection === "core" || settingsSection === "connections" || settingsSection === "calls" || settingsSection === "location" || settingsSection === "voice") ? (
           <section className="panel">
             <form className="settings-form" onSubmit={handleSettingsSubmit}>
@@ -5675,7 +6224,38 @@ async function playNorthStarReplyOverPeer(
                   </div>
                   <div className="split">
                     <label><span>Sample rate</span><input type="number" min={8000} value={settings.ttsSampleRate} onChange={(event) => setSettings((current) => ({ ...current, ttsSampleRate: Number(event.target.value) || 24000 }))} /></label>
-                    <label><span>Default voice</span><input value={settings.ttsDefaultVoice} onChange={(event) => setSettings((current) => ({ ...current, ttsDefaultVoice: event.target.value }))} /></label>
+                    <label>
+                      <span>Primary voice</span>
+                      <select
+                        value={selectedVoiceBlend.primary}
+                        onChange={(event) =>
+                          setSettings((current) => ({
+                            ...current,
+                            ttsDefaultVoice: buildVoiceBlend(event.target.value, selectedVoiceBlend.secondary),
+                          }))
+                        }
+                      >
+                        {availableKokoroVoices.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="split">
+                    <label>
+                      <span>Secondary voice</span>
+                      <select
+                        value={selectedVoiceBlend.secondary}
+                        onChange={(event) =>
+                          setSettings((current) => ({
+                            ...current,
+                            ttsDefaultVoice: buildVoiceBlend(selectedVoiceBlend.primary, event.target.value),
+                          }))
+                        }
+                      >
+                        <option value="none">none</option>
+                        {availableKokoroVoices.map((voice) => <option key={voice} value={voice}>{voice}</option>)}
+                      </select>
+                    </label>
+                    <label><span>Resolved voice setting</span><input value={settings.ttsDefaultVoice} readOnly /></label>
                   </div>
                   <label><span>Model file path</span><input value={settings.ttsModelPath} onChange={(event) => setSettings((current) => ({ ...current, ttsModelPath: event.target.value }))} placeholder="Leave empty to use the app's Kokoro model path" /></label>
                   <label><span>Voices file path</span><input value={settings.ttsVoicesPath} onChange={(event) => setSettings((current) => ({ ...current, ttsVoicesPath: event.target.value }))} placeholder="Leave empty to use the app's Kokoro voices path" /></label>
@@ -5772,7 +6352,7 @@ async function playNorthStarReplyOverPeer(
                         ) : null}
                         {voiceSnapshot.exampleVoices.length ? (
                           <div className="saved-state">
-                            <h4>Example voices</h4>
+                            <h4>Available Kokoro voices</h4>
                             <ul>{voiceSnapshot.exampleVoices.map((entry) => <li key={entry}>{entry}</li>)}</ul>
                           </div>
                         ) : null}
@@ -5822,12 +6402,7 @@ async function playNorthStarReplyOverPeer(
 
                     <details className="advanced-block">
                       <summary>Cleanup</summary>
-                      <p>Remove only the voice files, or wipe all local app data and start fresh.</p>
-                      <div className="actions">
-                        <button type="button" className="ghost danger" onClick={handleClearAllLocalData} disabled={busyPanel === "localCleanup"}>
-                          {busyPanel === "localCleanup" ? "Clearing..." : "Delete all local data"}
-                        </button>
-                      </div>
+                      <p>Voice cleanup lives here now. Memory wiping and backup live in Settings - Memory - Safeguard.</p>
                     </details>
                   </div>
                 </>
@@ -5871,37 +6446,35 @@ async function playNorthStarReplyOverPeer(
           { id: "overview", label: "Overview" },
           { id: "growth", label: "Growth" },
           { id: "tectonics", label: "Tectonics" },
-        ], memorySection, setMemorySection)}
+          { id: "safeguard", label: "Safeguard" },
+        ], memorySection, setMemorySection, "section-tabs-subtle")}
 
         {memorySection === "places" ? (
-          <section className="panel">
-            <div className="panel-header"><h2>Meaningful places</h2><p>Named places with significance and protection.</p></div>
-            <form className="settings-form" onSubmit={handlePlaceSubmit}>
-              <label><span>Label</span><input value={placeForm.label} onChange={(event) => setPlaceForm((current) => ({ ...current, label: event.target.value }))} /></label>
-              <div className="split">
-                <label><span>Latitude</span><input type="number" step="any" value={placeForm.latitude ?? ""} onChange={(event) => setPlaceForm((current) => ({ ...current, latitude: event.target.value ? Number(event.target.value) : null }))} /></label>
-                <label><span>Longitude</span><input type="number" step="any" value={placeForm.longitude ?? ""} onChange={(event) => setPlaceForm((current) => ({ ...current, longitude: event.target.value ? Number(event.target.value) : null }))} /></label>
+          <div className="grid two-up">
+            <section className="panel">
+              <div className="panel-header"><h2>Meaningful places</h2><p>This legacy section now points to the dedicated My Places workspace.</p></div>
+              <div className="saved-state">
+                <p className="memory-detail-lead">Use the main <strong>My Places</strong> tab to drop markers on the map and save them as meaningful places.</p>
+                <code>{meaningfulPlaces.length} saved place{meaningfulPlaces.length === 1 ? "" : "s"} / map focused on {meaningfulPlacesMapRegionLabel}</code>
               </div>
-              <div className="split">
-                <label><span>Radius meters</span><input type="number" min={1} value={placeForm.radiusMeters} onChange={(event) => setPlaceForm((current) => ({ ...current, radiusMeters: Number(event.target.value) }))} /></label>
-                <label><span>Place kind</span><input value={placeForm.placeKind} onChange={(event) => setPlaceForm((current) => ({ ...current, placeKind: event.target.value }))} /></label>
+              <div className="button-row">
+                <button type="button" onClick={() => setActiveTab("places")}>Open My Places</button>
               </div>
-              <label>
-                <span>Meaning kind</span>
-                <select value={placeForm.meaningKind} onChange={(event) => setPlaceForm((current) => ({ ...current, meaningKind: event.target.value }))}>
-                  <option value="uncertain">Uncertain</option>
-                  <option value="belonging">Belonging</option>
-                  <option value="reflection">Reflection</option>
-                  <option value="discovery">Discovery</option>
-                  <option value="return">Return</option>
-                  <option value="mixed">Mixed</option>
-                </select>
-              </label>
-              <label className="checkbox"><input type="checkbox" checked={placeForm.isProtected} onChange={(event) => setPlaceForm((current) => ({ ...current, isProtected: event.target.checked }))} /><span>Protected place</span></label>
-              <label><span>Notes</span><textarea rows={4} value={placeForm.notes} onChange={(event) => setPlaceForm((current) => ({ ...current, notes: event.target.value }))} /></label>
-              <button type="submit" disabled={busyPanel === "place"}>{busyPanel === "place" ? "Saving..." : "Add place"}</button>
-            </form>
-          </section>
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Saved place list</h2><p>The currently stored meaningful places still appear here for quick inspection.</p></div>
+              <div className="saved-state">
+                <ul>{meaningfulPlaces.length ? meaningfulPlaces.map((place) => (
+                  <li key={place.id}>
+                    <strong>{place.label}</strong>
+                    <code>{place.meaningKind} / {place.placeKind}</code>
+                    {place.latitude != null && place.longitude != null ? <code>{place.latitude.toFixed(5)}, {place.longitude.toFixed(5)}</code> : null}
+                  </li>
+                )) : <li>No places yet.</li>}</ul>
+              </div>
+            </section>
+          </div>
         ) : null}
 
         {memorySection === "rules" ? (
@@ -6066,11 +6639,8 @@ async function playNorthStarReplyOverPeer(
                 <button type="button" className="ghost" onClick={() => void handleSeedContextMemoryExample("contradiction")} disabled={busyPanel === "contextMemorySeed"}>
                   {busyPanel === "contextMemorySeed" ? "Seeding..." : "Seed contradiction example"}
                 </button>
-                <button type="button" className="ghost danger" onClick={() => void handleResetRuntimeData()} disabled={busyPanel === "runtimeReset"}>
-                  {busyPanel === "runtimeReset" ? "Clearing..." : "Clear generated data"}
-                </button>
               </div>
-              <p className="memory-explanation">Clears derived memory, tectonic snapshots, passive/runtime traces, and call or outreach history while keeping settings and manual context.</p>
+              <p className="memory-explanation">This pass turns manual context into interpreted memory, detector movement, and tectonic snapshots.</p>
               <p className="memory-explanation">The seed buttons create or refresh a clearly named manual entry, `[Seed] Akai MPC`, add matching lived call and review evidence, and run the pass for you.</p>
               {contextMemorySummary.length ? (
                 <div className="saved-state">
@@ -6180,6 +6750,61 @@ async function playNorthStarReplyOverPeer(
                     <code>{prettyJson(snapshot.summaryJson)}</code>
                   </li>
                 )) : <li>No tectonic snapshots yet.</li>}</ul>
+              </div>
+            </section>
+          </div>
+        ) : null}
+
+        {memorySection === "safeguard" ? (
+          <div className="grid two-up">
+            <section className="panel">
+              <div className="panel-header"><h2>Memory wipe</h2><p>Reset generated runtime memory so real-world testing starts fresh without deleting your taught context.</p></div>
+              <div className="saved-state">
+                <p className="memory-detail-lead">Keeps your Home context, My Places, manual reflections, rules, and system settings.</p>
+                <p className="memory-explanation">Removes generated memory items, detector records, tectonic snapshots, passive traces, call and outreach history, saved moments, and raw location/runtime history.</p>
+              </div>
+              <div className="actions">
+                <button type="button" className="ghost danger" onClick={() => setShowMemoryWipeModal(true)} disabled={busyPanel === "runtimeReset"}>
+                  {busyPanel === "runtimeReset" ? "Wiping..." : "Wipe generated memory"}
+                </button>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>Memory intel backup</h2><p>Export or restore the manual intel you taught the companion.</p></div>
+              <div className="saved-state">
+                <ul>
+                  <li><strong>Included</strong><code>Home context, manual context categories, My Places, rules, manual reflections</code></li>
+                  <li><strong>Not included</strong><code>generated runtime memory, call history, passive traces, saved moments</code></li>
+                </ul>
+                {lastMemoryIntelTransfer ? <code>{lastMemoryIntelTransfer.path}</code> : null}
+              </div>
+              <div className="actions">
+                <button type="button" onClick={() => void handleExportMemoryIntel()} disabled={busyPanel === "memoryIntelExport"}>
+                  {busyPanel === "memoryIntelExport" ? "Exporting..." : "Export memory intel"}
+                </button>
+                <button type="button" className="ghost" onClick={() => void handleImportMemoryIntel()} disabled={busyPanel === "memoryIntelImport"}>
+                  {busyPanel === "memoryIntelImport" ? "Importing..." : "Import memory intel"}
+                </button>
+              </div>
+            </section>
+
+            <section className="panel">
+              <div className="panel-header"><h2>System settings backup</h2><p>Export or restore the app’s operating configuration and prompt settings.</p></div>
+              <div className="saved-state">
+                <ul>
+                  <li><strong>Included</strong><code>connection settings, speech settings, prompt settings, thresholds, runtime preferences</code></li>
+                  <li><strong>Use case</strong><code>restore the system behavior without overwriting manual intel</code></li>
+                </ul>
+                {lastSettingsTransfer ? <code>{lastSettingsTransfer.path}</code> : null}
+              </div>
+              <div className="actions">
+                <button type="button" onClick={() => void handleExportSystemSettings()} disabled={busyPanel === "settingsExport"}>
+                  {busyPanel === "settingsExport" ? "Exporting..." : "Export system settings"}
+                </button>
+                <button type="button" className="ghost" onClick={() => void handleImportSystemSettings()} disabled={busyPanel === "settingsImport"}>
+                  {busyPanel === "settingsImport" ? "Importing..." : "Import system settings"}
+                </button>
               </div>
             </section>
           </div>
@@ -6697,9 +7322,6 @@ async function playNorthStarReplyOverPeer(
             <button type="button" className="ghost" onClick={() => void handleRunSimulationSuite()} disabled={busyPanel === "simulationSuite"}>
               {busyPanel === "simulationSuite" ? "Running suite..." : "Run automated suite"}
             </button>
-            <button type="button" className="ghost" onClick={() => void handleResetRuntimeData()} disabled={busyPanel === "runtimeReset"}>
-              {busyPanel === "runtimeReset" ? "Clearing..." : "Clear generated data"}
-            </button>
           </div>
           {simulationResult ? (
             <div className="saved-state">
@@ -7051,7 +7673,7 @@ async function playNorthStarReplyOverPeer(
         {reviewSection === "places" ? (
           <section className="panel">
             <div className="panel-header"><h2>Place significance review</h2><p>Correct meaning, significance, protection, and notes.</p></div>
-            <div className="saved-state"><ul>{snapshot?.places.length ? snapshot.places.map((place) => <li key={place.id}><strong>{place.label}</strong><code>meaning {place.meaningKind} / significance {place.significanceScore.toFixed(2)}</code><button type="button" className="ghost" onClick={() => setReviewPlace({ id: place.id, meaningKind: place.meaningKind, significanceScore: place.significanceScore, isProtected: place.isProtected, notes: place.notes })}>Review place</button></li>) : <li>No places to review yet.</li>}</ul></div>
+                <div className="saved-state"><ul>{snapshot?.places.length ? snapshot.places.map((place) => <li key={place.id}><strong>{place.label}</strong><code>meaning {place.meaningKind} / significance {place.significanceScore.toFixed(2)}</code><button type="button" className="ghost" onClick={() => setReviewPlace({ id: place.id, label: place.label, latitude: place.latitude, longitude: place.longitude, radiusMeters: place.radiusMeters, placeKind: place.placeKind, meaningKind: place.meaningKind, significanceScore: place.significanceScore, isProtected: place.isProtected, notes: place.notes })}>Review place</button></li>) : <li>No places to review yet.</li>}</ul></div>
             {reviewPlace ? (
               <form className="settings-form" onSubmit={handlePlaceReviewSubmit}>
                 <h3>Place correction</h3>
@@ -7511,6 +8133,123 @@ async function playNorthStarReplyOverPeer(
     );
   }
 
+  function renderMyPlacesTab() {
+    const draftMarkerReady = placeForm.latitude != null && placeForm.longitude != null;
+
+    return (
+      <div className="screen-stack">
+        <section className="screen-panel screen-panel-hero screen-panel-hero-compact">
+          <div className="screen-panel-copy">
+            <p className="eyebrow">My Places</p>
+            <h2>Mark the places that matter in your life</h2>
+            <p>Click the map to drop a marker, name it directly, and let it become a grounded place the companion can remember.</p>
+          </div>
+          <div className="screen-kpis">
+            <div className="screen-kpi"><span>Saved places</span><strong>{meaningfulPlaces.length}</strong></div>
+            <div className="screen-kpi"><span>Repeated places seen</span><strong>{repeatedPlaces.length}</strong></div>
+            <div className="screen-kpi"><span>Map focus</span><strong>{meaningfulPlacesMapRegionLabel}</strong></div>
+          </div>
+        </section>
+
+        <div className="grid two-up">
+          <section className="panel literal-shell-panel">
+            <div className="panel-header">
+              <h2>OpenStreetMap</h2>
+              <p>Centered on {meaningfulPlacesMapRegionLabel}. Left click places the active marker. Right mouse drag pans the map.</p>
+            </div>
+            <div className="meaningful-places-map-shell">
+              <div className="meaningful-places-map-overlay-hint">
+                {editingPlaceId != null ? "Editing mode: left click moves this place marker. Right drag pans the map." : "Left click places a marker. Right drag pans the map."}
+              </div>
+              <MeaningfulPlacesMap
+                bounds={meaningfulPlacesMapBounds}
+                places={meaningfulPlaces}
+                draftPlace={{
+                  label: placeForm.label,
+                  latitude: placeForm.latitude,
+                  longitude: placeForm.longitude,
+                }}
+                onDropMarker={handleMyPlacesMapClick}
+              />
+            </div>
+            <div className="button-row">
+              <button type="button" className="ghost" onClick={seedPlaceFromCurrentLocation} disabled={realWorldPresenceSnapshot?.latitude == null || realWorldPresenceSnapshot.longitude == null}>
+                Use current location
+              </button>
+              <button type="button" className="ghost" onClick={resetPlaceForm}>
+                Clear marker
+              </button>
+            </div>
+            <div className="saved-state">
+              <h3>Map note</h3>
+              <p className="memory-explanation">Markers become meaningful places once you save them. The overlay markers are ours; the map underneath is OpenStreetMap.</p>
+              <code>Draft coordinates: {placeForm.latitude != null && placeForm.longitude != null ? `${placeForm.latitude.toFixed(6)}, ${placeForm.longitude.toFixed(6)}` : "Click the map to choose a location."}</code>
+            </div>
+          </section>
+
+          <section className="panel literal-shell-panel">
+            <div className="panel-header">
+              <h2>{editingPlaceId != null ? "Edit my place" : "Add my place"}</h2>
+              <p>{editingPlaceId != null ? "Update the label, marker, radius, and meaning for this place." : "This is the direct creation surface for meaningful places."}</p>
+            </div>
+            <form className="settings-form" onSubmit={handlePlaceSubmit}>
+              <label><span>Label</span><input value={placeForm.label} onChange={(event) => setPlaceForm((current) => ({ ...current, label: event.target.value }))} placeholder="Home, fishing spot, favorite bench..." /></label>
+              <div className="split">
+                <label><span>Latitude</span><input type="number" step="any" value={placeForm.latitude ?? ""} onChange={(event) => setPlaceForm((current) => ({ ...current, latitude: event.target.value ? Number(event.target.value) : null }))} /></label>
+                <label><span>Longitude</span><input type="number" step="any" value={placeForm.longitude ?? ""} onChange={(event) => setPlaceForm((current) => ({ ...current, longitude: event.target.value ? Number(event.target.value) : null }))} /></label>
+              </div>
+              <div className="split">
+                <label><span>Radius meters</span><input type="number" min={1} value={placeForm.radiusMeters} onChange={(event) => setPlaceForm((current) => ({ ...current, radiusMeters: Number(event.target.value) }))} /></label>
+                <label><span>Place kind</span><input value={placeForm.placeKind} onChange={(event) => setPlaceForm((current) => ({ ...current, placeKind: event.target.value }))} placeholder="home, park, fishing spot..." /></label>
+              </div>
+              <label>
+                <span>Meaning kind</span>
+                <select value={placeMeaningUsesCustomValue ? "__custom__" : placeForm.meaningKind} onChange={(event) => setPlaceForm((current) => ({ ...current, meaningKind: event.target.value === "__custom__" ? current.meaningKind : event.target.value }))}>
+                  {meaningKindOptions.map((meaningKind) => (
+                    <option key={meaningKind} value={meaningKind}>{meaningKind.charAt(0).toUpperCase()}{meaningKind.slice(1)}</option>
+                  ))}
+                  <option value="__custom__">Custom...</option>
+                </select>
+              </label>
+              <label>
+                <span>Custom meaning</span>
+                <input
+                  value={placeMeaningUsesCustomValue ? placeForm.meaningKind : ""}
+                  onChange={(event) => setPlaceForm((current) => ({ ...current, meaningKind: event.target.value }))}
+                  placeholder="friend's home, shared anchor, family place..."
+                />
+              </label>
+              <label className="checkbox"><input type="checkbox" checked={placeForm.isProtected} onChange={(event) => setPlaceForm((current) => ({ ...current, isProtected: event.target.checked }))} /><span>Protected place</span></label>
+              <label><span>Notes</span><textarea rows={4} value={placeForm.notes} onChange={(event) => setPlaceForm((current) => ({ ...current, notes: event.target.value }))} placeholder="Why this place matters, what it means, or what should be respected here." /></label>
+              <div className="button-row">
+                <button type="submit" disabled={busyPanel === "place"}>{busyPanel === "place" ? "Saving..." : editingPlaceId != null ? "Save place changes" : "Save my place"}</button>
+                <button type="button" className="ghost" onClick={resetPlaceForm}>Clear form</button>
+              </div>
+            </form>
+          </section>
+        </div>
+
+        <section className="panel literal-shell-panel">
+          <div className="panel-header">
+            <h2>Saved meaningful places</h2>
+            <p>The places already anchored into memory.</p>
+          </div>
+          <div className="saved-state">
+            <ul>{meaningfulPlaces.length ? meaningfulPlaces.map((place) => (
+              <li key={place.id}>
+                <strong>{place.label}</strong>
+                <code>{place.meaningKind} / {place.placeKind} / radius {place.radiusMeters}m</code>
+                {place.latitude != null && place.longitude != null ? <code>{place.latitude.toFixed(5)}, {place.longitude.toFixed(5)}</code> : <code>No coordinates saved.</code>}
+                {place.notes ? <code>{place.notes}</code> : null}
+                <button type="button" className="ghost" onClick={() => beginEditingPlace(place)}>Edit place</button>
+              </li>
+            )) : <li>No meaningful places saved yet.</li>}</ul>
+          </div>
+        </section>
+      </div>
+    );
+  }
+
   function renderSettingsExperience() {
     return (
       <div className="screen-stack">
@@ -7580,6 +8319,7 @@ async function playNorthStarReplyOverPeer(
     switch (activeTab) {
       case "home": return renderHomeTab();
       case "context": return renderCompanionContextTab();
+      case "places": return renderMyPlacesTab();
       case "tectonics": return renderTectonicsTab();
       case "settings": return renderSettingsExperience();
       default: return null;
@@ -7606,7 +8346,7 @@ async function playNorthStarReplyOverPeer(
                   className={tab.id === activeTab ? "literal-rail-item active" : "literal-rail-item"}
                   onClick={() => setActiveTab(tab.id)}
                 >
-                  <span className="literal-rail-icon">{tab.id === "home" ? "HM" : tab.id === "context" ? "CX" : tab.id === "tectonics" ? "TC" : "ST"}</span>
+                  <span className="literal-rail-icon">{tab.id === "home" ? "HM" : tab.id === "context" ? "CX" : tab.id === "places" ? "MP" : tab.id === "tectonics" ? "TC" : "ST"}</span>
                   <span className="literal-rail-label">{tab.label}</span>
                 </button>
               ))}
@@ -7624,6 +8364,25 @@ async function playNorthStarReplyOverPeer(
             {loading ? <section className="panel literal-shell-panel"><p>Loading workspace...</p></section> : renderActiveTab()}
           </section>
         </div>
+
+        {showMemoryWipeModal ? (
+          <div className="app-modal-backdrop" role="presentation" onClick={() => busyPanel === "runtimeReset" ? null : setShowMemoryWipeModal(false)}>
+            <div className="app-modal-card" role="dialog" aria-modal="true" aria-labelledby="memory-wipe-title" onClick={(event) => event.stopPropagation()}>
+              <h2 id="memory-wipe-title">Wipe generated memory?</h2>
+              <p>This clears generated runtime memory so you can start fresh for real-world testing.</p>
+              <ul>
+                <li><strong>Kept</strong><code>Home context, My Places, manual reflections, rules, system settings</code></li>
+                <li><strong>Removed</strong><code>generated memory, detector records, tectonic snapshots, passive traces, calls, outreach history, saved moments, raw location history</code></li>
+              </ul>
+              <div className="actions">
+                <button type="button" className="ghost" onClick={() => setShowMemoryWipeModal(false)} disabled={busyPanel === "runtimeReset"}>Cancel</button>
+                <button type="button" className="danger" onClick={() => void handleResetRuntimeData()} disabled={busyPanel === "runtimeReset"}>
+                  {busyPanel === "runtimeReset" ? "Wiping..." : "Yes, wipe generated memory"}
+                </button>
+              </div>
+            </div>
+          </div>
+        ) : null}
       </section>
     </main>
   );

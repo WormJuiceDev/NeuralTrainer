@@ -96,6 +96,39 @@ button.danger {
   background: linear-gradient(180deg, rgba(100, 29, 29, 0.9), rgba(67, 19, 19, 0.95));
 }
 
+.app-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2rem;
+  background: rgba(3, 9, 18, 0.7);
+  backdrop-filter: blur(10px);
+}
+
+.app-modal-card {
+  width: min(36rem, 100%);
+  border-radius: 1.2rem;
+  border: 1px solid rgba(109, 177, 255, 0.22);
+  background: linear-gradient(180deg, rgba(20, 42, 75, 0.98), rgba(10, 23, 42, 0.98));
+  box-shadow: 0 24px 72px rgba(0, 0, 0, 0.45);
+  padding: 1.5rem;
+}
+
+.app-modal-card h2 {
+  margin: 0 0 0.75rem;
+}
+
+.app-modal-card p {
+  margin: 0 0 1rem;
+}
+
+.app-modal-card ul {
+  margin: 0 0 1rem;
+}
+
 input,
 select,
 textarea {
@@ -385,9 +418,28 @@ code {
   gap: 0.65rem;
 }
 
+.section-tabs-subtle {
+  margin-top: -0.1rem;
+  padding-top: 0.35rem;
+  border-top: 1px solid rgba(109, 177, 255, 0.08);
+}
+
+.section-tabs-subtle .section-tab {
+  border-color: rgba(109, 177, 255, 0.14);
+  background: linear-gradient(180deg, rgba(9, 20, 35, 0.82), rgba(6, 14, 25, 0.92));
+  color: #acc8e6;
+}
+
 .section-tab.active {
   border-color: rgba(143, 221, 255, 0.54);
   box-shadow: 0 0 18px rgba(109, 201, 255, 0.16);
+}
+
+.section-tabs-subtle .section-tab.active {
+  border-color: rgba(102, 209, 171, 0.46);
+  box-shadow: 0 0 16px rgba(70, 170, 136, 0.14);
+  background: linear-gradient(180deg, rgba(18, 56, 53, 0.92), rgba(10, 33, 32, 0.97));
+  color: #e1f9ef;
 }
 
 .grid {
@@ -415,6 +467,65 @@ code {
   display: flex;
   flex-direction: column;
   gap: 0.95rem;
+}
+
+.meaningful-places-map-shell {
+  position: relative;
+  overflow: hidden;
+  min-height: 34rem;
+  border-radius: 22px;
+  border: 1px solid rgba(114, 191, 255, 0.18);
+  background: rgba(6, 15, 28, 0.9);
+}
+
+.meaningful-places-leaflet-map {
+  width: 100%;
+  min-height: 34rem;
+  display: block;
+}
+
+.meaningful-places-map-overlay-hint {
+  position: absolute;
+  top: 1rem;
+  left: 1rem;
+  padding: 0.55rem 0.8rem;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 216, 150, 0.48);
+  background: rgba(138, 78, 20, 0.92);
+  color: #fff3dc;
+  font-size: 0.82rem;
+  font-weight: 600;
+  z-index: 500;
+}
+
+.meaningful-places-map-shell .leaflet-container {
+  background: #dce8d2;
+  color: #132138;
+  font: inherit;
+}
+
+.meaningful-places-map-shell .leaflet-control-zoom a {
+  color: #132138;
+}
+
+.meaningful-places-leaflet-label {
+  border: 1px solid rgba(147, 218, 255, 0.8);
+  border-radius: 999px;
+  background: linear-gradient(180deg, rgba(37, 109, 196, 0.96), rgba(23, 68, 136, 0.96));
+  color: #f6fbff;
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.3);
+  font-size: 0.78rem;
+  font-weight: 700;
+  padding: 0.35rem 0.55rem;
+}
+
+.meaningful-places-leaflet-label::before {
+  display: none;
+}
+
+.meaningful-places-leaflet-label.draft {
+  border-style: dashed;
+  background: linear-gradient(180deg, rgba(230, 152, 63, 0.98), rgba(173, 98, 29, 0.98));
 }
 
 .settings-form label {
@@ -952,7 +1063,9 @@ code {
   }
 
   .companion-map-panel,
-  .companion-map {
+  .companion-map,
+  .meaningful-places-map-shell,
+  .meaningful-places-leaflet-map {
     min-height: auto;
   }
 
@@ -960,6 +1073,11 @@ code {
     display: grid;
     gap: 1rem;
     padding: 1rem;
+  }
+
+  .meaningful-places-map-shell,
+  .meaningful-places-leaflet-map {
+    min-height: 24rem;
   }
 
   .companion-map-orbit {

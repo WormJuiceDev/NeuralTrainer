@@ -1,7 +1,9 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import type {
   AppSettings,
+  BackupTransferResult,
   CallSessionSnapshot,
   CallTurnRecord,
   CallTurnResult,
@@ -233,8 +235,30 @@ export const runCallTurn = (payload: RunCallTurnInput) =>
 export const clearVoiceAssets = () =>
   invoke<VoiceSnapshot>("clear_voice_assets");
 
-export const clearAllLocalData = () =>
-  invoke<void>("clear_all_local_data");
+export const pickExportPath = (defaultPath: string, filters: { name: string; extensions: string[] }[]) =>
+  save({
+    defaultPath,
+    filters,
+  });
+
+export const pickImportPath = (filters: { name: string; extensions: string[] }[]) =>
+  open({
+    multiple: false,
+    directory: false,
+    filters,
+  });
+
+export const exportMemoryIntel = (destinationPath: string) =>
+  invoke<BackupTransferResult>("export_memory_intel", { destinationPath });
+
+export const importMemoryIntel = (sourcePath: string) =>
+  invoke<BackupTransferResult>("import_memory_intel", { sourcePath });
+
+export const exportSystemSettings = (destinationPath: string) =>
+  invoke<BackupTransferResult>("export_system_settings", { destinationPath });
+
+export const importSystemSettings = (sourcePath: string) =>
+  invoke<BackupTransferResult>("import_system_settings", { sourcePath });
 
 export const getPhaseOneSnapshot = () =>
   invoke<PhaseOneSnapshot>("get_phase_one_snapshot");

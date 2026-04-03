@@ -4,6 +4,8 @@
   "description": "Default capability set for the MVP shell.",
   "windows": ["main"],
   "permissions": [
-    "core:default"
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save"
   ]
 }

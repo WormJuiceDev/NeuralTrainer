@@ -26,6 +26,7 @@ import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
+import androidx.core.view.doOnLayout
 import androidx.lifecycle.lifecycleScope
 import app.youworld.northstar.databinding.ActivityMainBinding
 import android.view.animation.AccelerateDecelerateInterpolator
@@ -177,10 +178,14 @@ class MainActivity : AppCompatActivity() {
   private fun applyWindowInsets() {
     ViewCompat.setOnApplyWindowInsetsListener(binding.appShell) { _, insets ->
       val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+      val imeInsets = insets.getInsets(WindowInsetsCompat.Type.ime())
+      val keyboardBottom = maxOf(imeInsets.bottom - systemBars.bottom, 0)
       binding.topbar.updatePadding(top = systemBars.top)
-      binding.composerBar.updatePadding(bottom = dp(12) + systemBars.bottom)
+      binding.composerBar.updatePadding(bottom = dp(12) + systemBars.bottom + keyboardBottom)
+      binding.messageThreadScroll.updatePadding(bottom = dp(8))
       binding.connectionSection.updatePadding(bottom = dp(16) + systemBars.bottom)
       binding.callOverlayPanel.updatePadding(top = dp(24) + systemBars.top, bottom = dp(24) + systemBars.bottom)
+      binding.messageThreadScroll.doOnLayout { syncMessageThreadToComposer() }
       insets
     }
   }
@@ -196,9 +201,15 @@ class MainActivity : AppCompatActivity() {
     styleCallCircleButton(binding.callDeclineButton, "#D94A4A")
     styleCallCircleButton(binding.callEndButton, "#D94A4A")
     styleCallCircleButton(binding.callMicButton, "#1D9BF0")
-    binding.topbarAvatar.background = roundedDrawable("#21C7B7", radiusDp = 22)
-    binding.callOverlayAvatar.background = roundedDrawable("#21C7B7", radiusDp = 36)
-    binding.messageDraftInput.background = roundedDrawable("#1F2C34", radiusDp = 20)
+    binding.topbar.setBackgroundColor(Color.parseColor("#202C33"))
+    binding.tabBar.setBackgroundColor(Color.parseColor("#111B21"))
+    binding.composerBar.setBackgroundColor(Color.parseColor("#202C33"))
+    binding.companionSection.setBackgroundColor(Color.parseColor("#0B141A"))
+    binding.connectionSection.setBackgroundColor(Color.parseColor("#0B141A"))
+    binding.messageThreadScroll.setBackgroundColor(Color.parseColor("#0B141A"))
+    binding.topbarAvatar.background = roundedDrawable("#00A884", radiusDp = 22)
+    binding.callOverlayAvatar.background = roundedDrawable("#00A884", radiusDp = 36)
+    binding.messageDraftInput.background = roundedDrawable("#202C33", radiusDp = 24)
     listOf(
       binding.callVisualizerBar1,
       binding.callVisualizerBar2,
@@ -631,8 +642,8 @@ class MainActivity : AppCompatActivity() {
   }
 
   private fun styleTab(button: Button, active: Boolean) {
-    button.background = roundedDrawable(if (active) "#202C33" else "#111B21", radiusDp = 18)
-    button.setTextColor(Color.parseColor("#E9EDEF"))
+    button.background = roundedDrawable(if (active) "#00A884" else "#111B21", radiusDp = 18)
+    button.setTextColor(Color.parseColor(if (active) "#081318" else "#E9EDEF"))
     button.setPadding(dp(18), dp(10), dp(18), dp(10))
   }
 
@@ -673,7 +684,10 @@ class MainActivity : AppCompatActivity() {
       }
     }
 
-    binding.messageThreadScroll.post { binding.messageThreadScroll.fullScroll(View.FOCUS_DOWN) }
+    binding.messageThreadScroll.post {
+      syncMessageThreadToComposer()
+      binding.messageThreadScroll.fullScroll(View.FOCUS_DOWN)
+    }
   }
 
   private fun messageBubble(text: String, incoming: Boolean, secondary: String): View {
@@ -702,6 +716,16 @@ class MainActivity : AppCompatActivity() {
       }
       layoutParams = params
     }
+  }
+
+  private fun syncMessageThreadToComposer() {
+    val viewportHeight = binding.messageThreadScroll.height - binding.messageThreadScroll.paddingTop - binding.messageThreadScroll.paddingBottom
+    if (viewportHeight <= 0) return
+    val targetMinimumHeight = maxOf(0, viewportHeight)
+    if (binding.messageThreadContainer.minimumHeight != targetMinimumHeight) {
+      binding.messageThreadContainer.minimumHeight = targetMinimumHeight
+    }
+    binding.messageThreadContainer.gravity = Gravity.BOTTOM
   }
 
   private fun renderCallOverlay() {
@@ -976,25 +1000,25 @@ class MainActivity : AppCompatActivity() {
   }
 
   private fun styleTopActionButton(button: Button) {
-    button.background = roundedDrawable("#0F5D7A", radiusDp = 10)
+    button.background = roundedDrawable("#111B21", radiusDp = 10)
     button.setTextColor(Color.WHITE)
     button.setPadding(dp(16), dp(10), dp(16), dp(10))
   }
 
   private fun stylePrimaryButton(button: Button) {
-    button.background = roundedDrawable("#0F5D7A", radiusDp = 14)
-    button.setTextColor(Color.WHITE)
+    button.background = roundedDrawable("#00A884", radiusDp = 14)
+    button.setTextColor(Color.parseColor("#081318"))
     button.setPadding(dp(18), dp(12), dp(18), dp(12))
   }
 
   private fun styleSecondaryButton(button: Button) {
-    button.background = roundedDrawable("#1F2C34", radiusDp = 14)
+    button.background = roundedDrawable("#202C33", radiusDp = 14)
     button.setTextColor(Color.parseColor("#E9EDEF"))
     button.setPadding(dp(18), dp(12), dp(18), dp(12))
   }
 
   private fun styleSendButton(button: Button) {
-    button.background = roundedDrawable("#00A884", radiusDp = 18)
+    button.background = roundedDrawable("#00A884", radiusDp = 22)
     button.setTextColor(Color.parseColor("#081318"))
     button.setPadding(dp(18), dp(12), dp(18), dp(12))
   }

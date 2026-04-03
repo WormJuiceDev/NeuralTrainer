@@ -169,6 +169,11 @@ export type SettingsEntry = {
   updatedAt: string;
 };
 
+export type BackupTransferResult = {
+  path: string;
+  detail: string;
+};
+
 export type DiagnosticStatus = {
   appDataDir: string;
   dbPath: string;
@@ -209,6 +214,11 @@ export type CreatePlaceInput = {
 
 export type UpdatePlaceInput = {
   id: number;
+  label: string;
+  latitude: number | null;
+  longitude: number | null;
+  radiusMeters: number;
+  placeKind: string;
   meaningKind: string;
   significanceScore: number;
   isProtected: boolean;
